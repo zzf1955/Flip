@@ -1,0 +1,1562 @@
+{
+  "id": "f29c4017-2f94-4e2c-a2a1-7c0eb6fd3ed7",
+  "revision": 0,
+  "last_node_id": 21,
+  "last_link_id": 29,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "UnetLoaderGGUF",
+      "pos": [
+        50,
+        50
+      ],
+      "size": [
+        315,
+        58
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "unet_name",
+          "name": "unet_name",
+          "type": "COMBO",
+          "widget": {
+            "name": "unet_name"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "\u6a21\u578b",
+          "name": "MODEL",
+          "type": "MODEL",
+          "links": [
+            1
+          ]
+        }
+      ],
+      "title": "Load Flux Fill (GGUF)",
+      "properties": {
+        "Node name for S&R": "UnetLoaderGGUF"
+      },
+      "widgets_values": [
+        "flux1-fill-dev-Q8_0.gguf"
+      ]
+    },
+    {
+      "id": 2,
+      "type": "DualCLIPLoader",
+      "pos": [
+        50,
+        180
+      ],
+      "size": [
+        315,
+        130
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "CLIP\u540d\u79f01",
+          "name": "clip_name1",
+          "type": "COMBO",
+          "widget": {
+            "name": "clip_name1"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "CLIP\u540d\u79f02",
+          "name": "clip_name2",
+          "type": "COMBO",
+          "widget": {
+            "name": "clip_name2"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "\u7c7b\u578b",
+          "name": "type",
+          "type": "COMBO",
+          "widget": {
+            "name": "type"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "\u8bbe\u5907",
+          "name": "device",
+          "shape": 7,
+          "type": "COMBO",
+          "widget": {
+            "name": "device"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "CLIP",
+          "name": "CLIP",
+          "type": "CLIP",
+          "links": [
+            2,
+            3
+          ]
+        }
+      ],
+      "title": "Load CLIP",
+      "properties": {
+        "Node name for S&R": "DualCLIPLoader"
+      },
+      "widgets_values": [
+        "clip_l.safetensors",
+        "t5xxl_fp8_e4m3fn.safetensors",
+        "flux",
+        "default"
+      ]
+    },
+    {
+      "id": 3,
+      "type": "VAELoader",
+      "pos": [
+        50,
+        380
+      ],
+      "size": [
+        315,
+        58
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "vae\u540d\u79f0",
+          "name": "vae_name",
+          "type": "COMBO",
+          "widget": {
+            "name": "vae_name"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "VAE",
+          "name": "VAE",
+          "type": "VAE",
+          "links": [
+            4,
+            18,
+            29
+          ]
+        }
+      ],
+      "title": "Load VAE",
+      "properties": {
+        "Node name for S&R": "VAELoader"
+      },
+      "widgets_values": [
+        "ae.safetensors"
+      ]
+    },
+    {
+      "id": 4,
+      "type": "ControlNetLoader",
+      "pos": [
+        50,
+        510
+      ],
+      "size": [
+        315,
+        58
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "ControlNet\u540d\u79f0",
+          "name": "control_net_name",
+          "type": "COMBO",
+          "widget": {
+            "name": "control_net_name"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "ControlNet",
+          "name": "CONTROL_NET",
+          "type": "CONTROL_NET",
+          "links": [
+            5
+          ]
+        }
+      ],
+      "title": "Load ControlNet Union",
+      "properties": {
+        "Node name for S&R": "ControlNetLoader"
+      },
+      "widgets_values": [
+        "flux-controlnet-union-pro/diffusion_pytorch_model.safetensors"
+      ]
+    },
+    {
+      "id": 5,
+      "type": "SetUnionControlNetType",
+      "pos": [
+        450,
+        510
+      ],
+      "size": [
+        260,
+        58
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "ControlNet",
+          "name": "control_net",
+          "type": "CONTROL_NET",
+          "link": 5
+        },
+        {
+          "localized_name": "\u7c7b\u578b",
+          "name": "type",
+          "type": "COMBO",
+          "widget": {
+            "name": "type"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "ControlNet",
+          "name": "CONTROL_NET",
+          "type": "CONTROL_NET",
+          "links": [
+            6
+          ]
+        }
+      ],
+      "title": "Set Type: OpenPose",
+      "properties": {
+        "Node name for S&R": "SetUnionControlNetType"
+      },
+      "widgets_values": [
+        "openpose"
+      ]
+    },
+    {
+      "id": 6,
+      "type": "CLIPTextEncodeFlux",
+      "pos": [
+        450,
+        50
+      ],
+      "size": [
+        400,
+        166
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "clip",
+          "name": "clip",
+          "type": "CLIP",
+          "link": 2
+        },
+        {
+          "localized_name": "clip_l",
+          "name": "clip_l",
+          "type": "STRING",
+          "widget": {
+            "name": "clip_l"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "t5xxl",
+          "name": "t5xxl",
+          "type": "STRING",
+          "widget": {
+            "name": "t5xxl"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "\u5f15\u5bfc",
+          "name": "guidance",
+          "type": "FLOAT",
+          "widget": {
+            "name": "guidance"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "\u6761\u4ef6",
+          "name": "CONDITIONING",
+          "type": "CONDITIONING",
+          "links": [
+            7
+          ]
+        }
+      ],
+      "title": "Positive Prompt",
+      "properties": {
+        "Node name for S&R": "CLIPTextEncodeFlux"
+      },
+      "widgets_values": [
+        "a human performing the same action, realistic,",
+        "a human performing the same action, realistic,",
+        30
+      ]
+    },
+    {
+      "id": 7,
+      "type": "CLIPTextEncodeFlux",
+      "pos": [
+        450,
+        280
+      ],
+      "size": [
+        400,
+        166
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "clip",
+          "name": "clip",
+          "type": "CLIP",
+          "link": 3
+        },
+        {
+          "localized_name": "clip_l",
+          "name": "clip_l",
+          "type": "STRING",
+          "widget": {
+            "name": "clip_l"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "t5xxl",
+          "name": "t5xxl",
+          "type": "STRING",
+          "widget": {
+            "name": "t5xxl"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "\u5f15\u5bfc",
+          "name": "guidance",
+          "type": "FLOAT",
+          "widget": {
+            "name": "guidance"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "\u6761\u4ef6",
+          "name": "CONDITIONING",
+          "type": "CONDITIONING",
+          "links": [
+            8
+          ]
+        }
+      ],
+      "title": "Negative (empty)",
+      "properties": {
+        "Node name for S&R": "CLIPTextEncodeFlux"
+      },
+      "widgets_values": [
+        "",
+        "",
+        30
+      ]
+    },
+    {
+      "id": 8,
+      "type": "LoadImage",
+      "pos": [
+        50,
+        640
+      ],
+      "size": [
+        315,
+        314
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "\u56fe\u50cf",
+          "name": "image",
+          "type": "COMBO",
+          "widget": {
+            "name": "image"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "\u9009\u62e9\u6587\u4ef6\u4e0a\u4f20",
+          "name": "upload",
+          "type": "IMAGEUPLOAD",
+          "widget": {
+            "name": "upload"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "\u56fe\u50cf",
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            9,
+            20
+          ]
+        },
+        {
+          "localized_name": "\u906e\u7f69",
+          "name": "MASK",
+          "type": "MASK",
+          "links": null
+        }
+      ],
+      "title": "Source Image (Robot)",
+      "properties": {
+        "Node name for S&R": "LoadImage"
+      },
+      "widgets_values": [
+        "episode_002027_fmid.png",
+        "image"
+      ]
+    },
+    {
+      "id": 9,
+      "type": "LoadImage",
+      "pos": [
+        50,
+        1020
+      ],
+      "size": [
+        315,
+        314
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "\u56fe\u50cf",
+          "name": "image",
+          "type": "COMBO",
+          "widget": {
+            "name": "image"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "\u9009\u62e9\u6587\u4ef6\u4e0a\u4f20",
+          "name": "upload",
+          "type": "IMAGEUPLOAD",
+          "widget": {
+            "name": "upload"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "\u56fe\u50cf",
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": null
+        },
+        {
+          "localized_name": "\u906e\u7f69",
+          "name": "MASK",
+          "type": "MASK",
+          "links": [
+            10
+          ]
+        }
+      ],
+      "title": "Mask Image (RGBA, paint in ComfyUI)",
+      "properties": {
+        "Node name for S&R": "LoadImage",
+        "image": "clipspace/clipspace-painted-masked-1774857577920.png [input]"
+      },
+      "widgets_values": [
+        "clipspace/clipspace-painted-masked-1774857577920.png [input]",
+        "image"
+      ]
+    },
+    {
+      "id": 10,
+      "type": "SDPoseKeypointExtractor",
+      "pos": [
+        450,
+        700
+      ],
+      "size": [
+        300,
+        120
+      ],
+      "flags": {},
+      "order": 12,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "model",
+          "name": "model",
+          "type": "MODEL",
+          "link": 27
+        },
+        {
+          "localized_name": "vae",
+          "name": "vae",
+          "type": "VAE",
+          "link": 28
+        },
+        {
+          "localized_name": "image",
+          "name": "image",
+          "type": "IMAGE",
+          "link": 20
+        },
+        {
+          "localized_name": "bboxes",
+          "name": "bboxes",
+          "shape": 7,
+          "type": "BOUNDING_BOX",
+          "link": null
+        },
+        {
+          "localized_name": "batch_size",
+          "name": "batch_size",
+          "type": "INT",
+          "widget": {
+            "name": "batch_size"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "keypoints",
+          "name": "keypoints",
+          "type": "POSE_KEYPOINT",
+          "links": [
+            21
+          ]
+        }
+      ],
+      "title": "Extract Pose from Robot",
+      "properties": {
+        "Node name for S&R": "SDPoseKeypointExtractor"
+      },
+      "widgets_values": [
+        16
+      ]
+    },
+    {
+      "id": 11,
+      "type": "SDPoseDrawKeypoints",
+      "pos": [
+        450,
+        880
+      ],
+      "size": [
+        300,
+        202
+      ],
+      "flags": {},
+      "order": 13,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "keypoints",
+          "name": "keypoints",
+          "type": "POSE_KEYPOINT",
+          "link": 21
+        },
+        {
+          "localized_name": "draw_body",
+          "name": "draw_body",
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "draw_body"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "draw_hands",
+          "name": "draw_hands",
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "draw_hands"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "draw_face",
+          "name": "draw_face",
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "draw_face"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "draw_feet",
+          "name": "draw_feet",
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "draw_feet"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "stick_width",
+          "name": "stick_width",
+          "type": "INT",
+          "widget": {
+            "name": "stick_width"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "face_point_size",
+          "name": "face_point_size",
+          "type": "INT",
+          "widget": {
+            "name": "face_point_size"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "score_threshold",
+          "name": "score_threshold",
+          "type": "FLOAT",
+          "widget": {
+            "name": "score_threshold"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "\u56fe\u50cf",
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            22,
+            26
+          ]
+        }
+      ],
+      "title": "Draw Pose",
+      "properties": {
+        "Node name for S&R": "SDPoseDrawKeypoints"
+      },
+      "widgets_values": [
+        true,
+        true,
+        true,
+        false,
+        4,
+        3,
+        0.3
+      ]
+    },
+    {
+      "id": 12,
+      "type": "ControlNetApplyAdvanced",
+      "pos": [
+        900,
+        380
+      ],
+      "size": [
+        320,
+        186
+      ],
+      "flags": {},
+      "order": 14,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "\u6b63\u9762\u6761\u4ef6",
+          "name": "positive",
+          "type": "CONDITIONING",
+          "link": 7
+        },
+        {
+          "localized_name": "\u8d1f\u9762\u6761\u4ef6",
+          "name": "negative",
+          "type": "CONDITIONING",
+          "link": 8
+        },
+        {
+          "localized_name": "ControlNet",
+          "name": "control_net",
+          "type": "CONTROL_NET",
+          "link": 6
+        },
+        {
+          "localized_name": "\u56fe\u50cf",
+          "name": "image",
+          "type": "IMAGE",
+          "link": 22
+        },
+        {
+          "localized_name": "vae",
+          "name": "vae",
+          "shape": 7,
+          "type": "VAE",
+          "link": 29
+        },
+        {
+          "localized_name": "\u5f3a\u5ea6",
+          "name": "strength",
+          "type": "FLOAT",
+          "widget": {
+            "name": "strength"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "\u5f00\u59cb\u767e\u5206\u6bd4",
+          "name": "start_percent",
+          "type": "FLOAT",
+          "widget": {
+            "name": "start_percent"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "\u7ed3\u675f\u767e\u5206\u6bd4",
+          "name": "end_percent",
+          "type": "FLOAT",
+          "widget": {
+            "name": "end_percent"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "\u6b63\u9762\u6761\u4ef6",
+          "name": "positive",
+          "type": "CONDITIONING",
+          "links": [
+            11
+          ]
+        },
+        {
+          "localized_name": "\u8d1f\u9762\u6761\u4ef6",
+          "name": "negative",
+          "type": "CONDITIONING",
+          "links": [
+            12
+          ]
+        }
+      ],
+      "title": "Apply ControlNet (pose, strength=0.8)",
+      "properties": {
+        "Node name for S&R": "ControlNetApplyAdvanced"
+      },
+      "widgets_values": [
+        0.8,
+        0,
+        1
+      ]
+    },
+    {
+      "id": 13,
+      "type": "GrowMask",
+      "pos": [
+        450,
+        1120
+      ],
+      "size": [
+        210,
+        82
+      ],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "\u906e\u7f69",
+          "name": "mask",
+          "type": "MASK",
+          "link": 10
+        },
+        {
+          "localized_name": "\u6269\u5c55",
+          "name": "expand",
+          "type": "INT",
+          "widget": {
+            "name": "expand"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "\u5012\u89d2",
+          "name": "tapered_corners",
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "tapered_corners"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "\u906e\u7f69",
+          "name": "MASK",
+          "type": "MASK",
+          "links": [
+            13,
+            25
+          ]
+        }
+      ],
+      "title": "Grow Mask",
+      "properties": {
+        "Node name for S&R": "GrowMask"
+      },
+      "widgets_values": [
+        6,
+        true
+      ]
+    },
+    {
+      "id": 14,
+      "type": "InpaintModelConditioning",
+      "pos": [
+        1300,
+        450
+      ],
+      "size": [
+        320,
+        180
+      ],
+      "flags": {},
+      "order": 15,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "\u6b63\u9762\u6761\u4ef6",
+          "name": "positive",
+          "type": "CONDITIONING",
+          "link": 11
+        },
+        {
+          "localized_name": "\u8d1f\u9762\u6761\u4ef6",
+          "name": "negative",
+          "type": "CONDITIONING",
+          "link": 12
+        },
+        {
+          "localized_name": "vae",
+          "name": "vae",
+          "type": "VAE",
+          "link": 4
+        },
+        {
+          "localized_name": "\u50cf\u7d20",
+          "name": "pixels",
+          "type": "IMAGE",
+          "link": 9
+        },
+        {
+          "localized_name": "\u906e\u7f69",
+          "name": "mask",
+          "type": "MASK",
+          "link": 13
+        },
+        {
+          "localized_name": "\u566a\u6ce2\u906e\u7f69",
+          "name": "noise_mask",
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "noise_mask"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "\u6b63\u9762\u6761\u4ef6",
+          "name": "positive",
+          "type": "CONDITIONING",
+          "links": [
+            14
+          ]
+        },
+        {
+          "localized_name": "\u8d1f\u9762\u6761\u4ef6",
+          "name": "negative",
+          "type": "CONDITIONING",
+          "links": [
+            15
+          ]
+        },
+        {
+          "localized_name": "Latent",
+          "name": "latent",
+          "type": "LATENT",
+          "links": [
+            16
+          ]
+        }
+      ],
+      "title": "Inpaint Conditioning",
+      "properties": {
+        "Node name for S&R": "InpaintModelConditioning"
+      },
+      "widgets_values": [
+        true
+      ]
+    },
+    {
+      "id": 15,
+      "type": "DifferentialDiffusion",
+      "pos": [
+        1300,
+        300
+      ],
+      "size": [
+        260,
+        58
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "\u6a21\u578b",
+          "name": "model",
+          "type": "MODEL",
+          "link": 1
+        },
+        {
+          "localized_name": "\u5f3a\u5ea6",
+          "name": "strength",
+          "shape": 7,
+          "type": "FLOAT",
+          "widget": {
+            "name": "strength"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "\u6a21\u578b",
+          "name": "MODEL",
+          "type": "MODEL",
+          "links": [
+            17
+          ]
+        }
+      ],
+      "title": "Differential Diffusion",
+      "properties": {
+        "Node name for S&R": "DifferentialDiffusion"
+      },
+      "widgets_values": [
+        1
+      ]
+    },
+    {
+      "id": 16,
+      "type": "KSampler",
+      "pos": [
+        1700,
+        350
+      ],
+      "size": [
+        315,
+        262
+      ],
+      "flags": {},
+      "order": 16,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "\u6a21\u578b",
+          "name": "model",
+          "type": "MODEL",
+          "link": 17
+        },
+        {
+          "localized_name": "\u6b63\u9762\u6761\u4ef6",
+          "name": "positive",
+          "type": "CONDITIONING",
+          "link": 14
+        },
+        {
+          "localized_name": "\u8d1f\u9762\u6761\u4ef6",
+          "name": "negative",
+          "type": "CONDITIONING",
+          "link": 15
+        },
+        {
+          "localized_name": "Latent\u56fe\u50cf",
+          "name": "latent_image",
+          "type": "LATENT",
+          "link": 16
+        },
+        {
+          "localized_name": "\u79cd\u5b50",
+          "name": "seed",
+          "type": "INT",
+          "widget": {
+            "name": "seed"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "\u6b65\u6570",
+          "name": "steps",
+          "type": "INT",
+          "widget": {
+            "name": "steps"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "cfg",
+          "name": "cfg",
+          "type": "FLOAT",
+          "widget": {
+            "name": "cfg"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "\u91c7\u6837\u5668\u540d\u79f0",
+          "name": "sampler_name",
+          "type": "COMBO",
+          "widget": {
+            "name": "sampler_name"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "\u8c03\u5ea6\u5668",
+          "name": "scheduler",
+          "type": "COMBO",
+          "widget": {
+            "name": "scheduler"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "\u964d\u566a",
+          "name": "denoise",
+          "type": "FLOAT",
+          "widget": {
+            "name": "denoise"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "Latent",
+          "name": "LATENT",
+          "type": "LATENT",
+          "links": [
+            23
+          ]
+        }
+      ],
+      "title": "KSampler",
+      "properties": {
+        "Node name for S&R": "KSampler"
+      },
+      "widgets_values": [
+        42,
+        "fixed",
+        16,
+        1,
+        "ddim",
+        "ddim_uniform",
+        0.85
+      ]
+    },
+    {
+      "id": 17,
+      "type": "VAEDecode",
+      "pos": [
+        2100,
+        400
+      ],
+      "size": [
+        210,
+        46
+      ],
+      "flags": {},
+      "order": 17,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "Latent",
+          "name": "samples",
+          "type": "LATENT",
+          "link": 23
+        },
+        {
+          "localized_name": "vae",
+          "name": "vae",
+          "type": "VAE",
+          "link": 18
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "\u56fe\u50cf",
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            24
+          ]
+        }
+      ],
+      "title": "VAE Decode",
+      "properties": {
+        "Node name for S&R": "VAEDecode"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 18,
+      "type": "SaveImage",
+      "pos": [
+        2370,
+        300
+      ],
+      "size": [
+        315,
+        270
+      ],
+      "flags": {},
+      "order": 18,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "\u56fe\u7247",
+          "name": "images",
+          "type": "IMAGE",
+          "link": 24
+        },
+        {
+          "localized_name": "\u6587\u4ef6\u540d\u524d\u7f00",
+          "name": "filename_prefix",
+          "type": "STRING",
+          "widget": {
+            "name": "filename_prefix"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [],
+      "title": "Save Result",
+      "properties": {
+        "Node name for S&R": "SaveImage"
+      },
+      "widgets_values": [
+        "flux_cn_pose_robot2human"
+      ]
+    },
+    {
+      "id": 20,
+      "type": "SaveImage",
+      "pos": [
+        940.5750769218827,
+        1396.0924178967925
+      ],
+      "size": [
+        315,
+        270
+      ],
+      "flags": {},
+      "order": 19,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "\u56fe\u7247",
+          "name": "images",
+          "type": "IMAGE",
+          "link": 26
+        },
+        {
+          "localized_name": "\u6587\u4ef6\u540d\u524d\u7f00",
+          "name": "filename_prefix",
+          "type": "STRING",
+          "widget": {
+            "name": "filename_prefix"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [],
+      "title": "Pose Preview",
+      "properties": {
+        "Node name for S&R": "SaveImage"
+      },
+      "widgets_values": [
+        "pose_debug"
+      ]
+    },
+    {
+      "id": 19,
+      "type": "MaskPreview",
+      "pos": [
+        758.5392489672219,
+        1402.2954018439225
+      ],
+      "size": [
+        140,
+        246
+      ],
+      "flags": {},
+      "order": 11,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "\u906e\u7f69",
+          "name": "mask",
+          "type": "MASK",
+          "link": 25
+        }
+      ],
+      "outputs": [],
+      "title": "Mask Preview",
+      "properties": {
+        "Node name for S&R": "MaskPreview"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 21,
+      "type": "CheckpointLoaderSimple",
+      "pos": [
+        50,
+        1400
+      ],
+      "size": [
+        315,
+        98
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "ckpt_name",
+          "type": "COMBO",
+          "widget": {
+            "name": "ckpt_name"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "links": [
+            27
+          ]
+        },
+        {
+          "name": "CLIP",
+          "type": "CLIP",
+          "links": null
+        },
+        {
+          "name": "VAE",
+          "type": "VAE",
+          "links": [
+            28
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CheckpointLoaderSimple"
+      },
+      "widgets_values": [
+        "sdpose_wholebody_fp16.safetensors"
+      ],
+      "title": "Load SDPose Model"
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      0,
+      15,
+      0,
+      "MODEL"
+    ],
+    [
+      2,
+      2,
+      0,
+      6,
+      0,
+      "CLIP"
+    ],
+    [
+      3,
+      2,
+      0,
+      7,
+      0,
+      "CLIP"
+    ],
+    [
+      4,
+      3,
+      0,
+      14,
+      2,
+      "VAE"
+    ],
+    [
+      18,
+      3,
+      0,
+      17,
+      1,
+      "VAE"
+    ],
+    [
+      5,
+      4,
+      0,
+      5,
+      0,
+      "CONTROL_NET"
+    ],
+    [
+      6,
+      5,
+      0,
+      12,
+      2,
+      "CONTROL_NET"
+    ],
+    [
+      7,
+      6,
+      0,
+      12,
+      0,
+      "CONDITIONING"
+    ],
+    [
+      8,
+      7,
+      0,
+      12,
+      1,
+      "CONDITIONING"
+    ],
+    [
+      9,
+      8,
+      0,
+      14,
+      3,
+      "IMAGE"
+    ],
+    [
+      20,
+      8,
+      0,
+      10,
+      2,
+      "IMAGE"
+    ],
+    [
+      10,
+      9,
+      1,
+      13,
+      0,
+      "MASK"
+    ],
+    [
+      11,
+      12,
+      0,
+      14,
+      0,
+      "CONDITIONING"
+    ],
+    [
+      12,
+      12,
+      1,
+      14,
+      1,
+      "CONDITIONING"
+    ],
+    [
+      13,
+      13,
+      0,
+      14,
+      4,
+      "MASK"
+    ],
+    [
+      25,
+      13,
+      0,
+      19,
+      0,
+      "MASK"
+    ],
+    [
+      14,
+      14,
+      0,
+      16,
+      1,
+      "CONDITIONING"
+    ],
+    [
+      15,
+      14,
+      1,
+      16,
+      2,
+      "CONDITIONING"
+    ],
+    [
+      16,
+      14,
+      2,
+      16,
+      3,
+      "LATENT"
+    ],
+    [
+      17,
+      15,
+      0,
+      16,
+      0,
+      "MODEL"
+    ],
+    [
+      21,
+      10,
+      0,
+      11,
+      0,
+      "POSE_KEYPOINT"
+    ],
+    [
+      22,
+      11,
+      0,
+      12,
+      3,
+      "IMAGE"
+    ],
+    [
+      26,
+      11,
+      0,
+      20,
+      0,
+      "IMAGE"
+    ],
+    [
+      23,
+      16,
+      0,
+      17,
+      0,
+      "LATENT"
+    ],
+    [
+      24,
+      17,
+      0,
+      18,
+      0,
+      "IMAGE"
+    ],
+    [
+      27,
+      21,
+      0,
+      10,
+      0,
+      "MODEL"
+    ],
+    [
+      28,
+      21,
+      2,
+      10,
+      1,
+      "VAE"
+    ],
+    [
+      29,
+      3,
+      0,
+      12,
+      4,
+      "VAE"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 0.5073339934266805,
+      "offset": [
+        973.6515511552293,
+        -649.3576536022165
+      ]
+    }
+  },
+  "version": 0.4
+}
