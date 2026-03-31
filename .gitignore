@@ -1,0 +1,52 @@
+# === 大型数据/资源目录 ===
+data/
+archive/
+paper/
+ref-cosmos-transfer2.5/
+
+# === 二进制/大文件 ===
+*.pptx
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+*.npy
+*.npz
+*.pkl
+*.pickle
+*.h5
+*.hdf5
+*.tfrecord*
+*.tar
+*.tar.gz
+*.zip
+*.rar
+*.mp4
+*.avi
+*.mov
+
+# === Python ===
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# === Jupyter ===
+.ipynb_checkpoints/
+
+# === OS ===
+.DS_Store
+Thumbs.db
+
+# === IDE ===
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# === 项目 ===
+.worktrees/
