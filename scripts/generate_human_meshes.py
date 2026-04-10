@@ -8,12 +8,17 @@ Usage:
   python scripts/generate_human_meshes.py
 """
 
+import sys
 import numpy as np
 from stl import mesh as stl_mesh
 import os
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-OUT_DIR = os.path.join(BASE_DIR, "data", "mesh", "meshes")
+sys.path.insert(0, os.path.join(BASE_DIR, "scripts"))
+
+from config import MESH_DIR
+
+OUT_DIR = MESH_DIR
 
 
 def create_capsule(start, end, radius, n_circ=16, n_cap=6):

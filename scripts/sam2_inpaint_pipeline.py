@@ -32,16 +32,17 @@ sys.stdout.reconfigure(line_buffering=True)
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(BASE_DIR, "scripts"))
 
+from config import G1_URDF, MESH_DIR, BEST_PARAMS, SKIP_MESHES, OUTPUT_DIR, get_hand_type
 from video_inpaint import (
-    URDF_PATH, MESH_DIR, BEST_PARAMS, SKIP_MESHES,
     build_q, do_fk, parse_urdf_meshes, preload_meshes,
-    make_camera, render_mask, render_overlay,
+    make_camera, make_camera_const, render_mask, render_overlay,
+    render_mask_and_overlay,
     postprocess_mask, init_lama, run_lama,
     open_video_writer, write_frame, close_video,
     load_episode_info,
 )
 
-OUTPUT_DIR = os.path.join(BASE_DIR, "test_results", "inpaint_video")
+INPAINT_OUTPUT_DIR = os.path.join(OUTPUT_DIR, "inpaint_video")
 
 MODEL_IDS = {
     "tiny": "facebook/sam2.1-hiera-tiny",
@@ -152,18 +153,43 @@ def main():
     parser.add_argument("--sam2-model", default="small",
                         choices=["tiny", "small", "base", "large"])
     parser.add_argument("--prompt-interval", type=int, default=30)
+    parser.add_argument("--inpaint-method", default="propainter",
+                        choices=["lama", "propainter"],
+                        help="Inpainting backend (default: propainter)")
+    parser.add_argument("--task", type=str, default=None,
+                        help="Task name (default: ACTIVE_TASK from config)")
+    parser.add_argument("--output-dir", type=str, default=None,
+                        help="Override output directory")
+    parser.add_argument("--device", type=str, default=None,
+                        help="Device (e.g. cuda:0, cuda:2, cpu)")
     args = parser.parse_args()
 
+    # Resolve task data directory and hand type
+    hand_type = get_hand_type(args.task)
+    if args.task:
+        from config import DATASET_ROOT
+        task_data_dir = os.path.join(DATASET_ROOT, args.task)
+    else:
+        task_data_dir = None  # will use ACTIVE_DATA_DIR default
+
     ep = args.episode
-    device = "mps" if torch.backends.mps.is_available() else "cpu"
+    if args.device:
+        device = args.device
+    elif torch.cuda.is_available():
+        device = "cuda"
+    elif torch.backends.mps.is_available():
+        device = "mps"
+    else:
+        device = "cpu"
     print(f"Device: {device}")
 
     # Output directory
-    tag = f"ep{ep:03d}"
+    task_short = args.task.replace("G1_WBT_", "") if args.task else "default"
+    tag = f"{task_short}_ep{ep:03d}"
     fps = 30
     start_frame = int(args.start * fps) if args.start > 0 else 0
 
-    video_path, from_ts, to_ts, ep_df = load_episode_info(ep)
+    video_path, from_ts, to_ts, ep_df = load_episode_info(ep, data_dir=task_data_dir)
     n_total = len(ep_df)
     end_frame = min(start_frame + int(args.duration * fps), n_total) if args.duration > 0 else n_total
     ep_df = ep_df.iloc[start_frame:end_frame]
@@ -172,7 +198,8 @@ def main():
     if args.start > 0 or args.duration > 0:
         tag += f"_{start_frame}-{end_frame}"
 
-    out_dir = os.path.join(OUTPUT_DIR, tag)
+    base_out = args.output_dir if args.output_dir else INPAINT_OUTPUT_DIR
+    out_dir = os.path.join(base_out, tag)
     prompt_vis_dir = os.path.join(out_dir, "prompt_vis")
     os.makedirs(prompt_vis_dir, exist_ok=True)
 
@@ -188,12 +215,14 @@ def main():
 
     # Load URDF + meshes
     print("Loading URDF and meshes...")
-    model_pin = pin.buildModelFromUrdf(URDF_PATH, pin.JointModelFreeFlyer())
+    model_pin = pin.buildModelFromUrdf(G1_URDF, pin.JointModelFreeFlyer())
     data_pin = model_pin.createData()
-    link_meshes = parse_urdf_meshes(URDF_PATH)
+    link_meshes = parse_urdf_meshes(G1_URDF)
     mesh_cache = preload_meshes(link_meshes, MESH_DIR)
 
     part_caches = {name: match_links(mesh_cache, pats) for name, pats in BODY_PARTS.items()}
+
+    cam_const = make_camera_const(BEST_PARAMS)
 
     # ==========================================
     # Stage 1: Extract frames + FK + prompts
@@ -250,13 +279,12 @@ def main():
 
         # FK
         rq, hs = frame_data[ep_fi]
-        q = build_q(model_pin, rq, hs)
+        q = build_q(model_pin, rq, hs, hand_type=hand_type)
         transforms = do_fk(model_pin, data_pin, q)
 
-        # FK overlay
-        fk_overlay = render_overlay(img, mesh_cache, transforms, BEST_PARAMS)
-        # FK mask
-        fk_mask = render_mask(mesh_cache, transforms, BEST_PARAMS, h, w)
+        # FK mask + overlay (combined single-pass)
+        fk_mask, fk_overlay = render_mask_and_overlay(
+            img, mesh_cache, transforms, BEST_PARAMS, h, w, cam_const)
 
         write_frame(*writers["original"], img)
         write_frame(*writers["fk_overlay"], fk_overlay)
@@ -358,28 +386,28 @@ def main():
     print(f"SAM2 done: {count} frames in {elapsed_prop:.1f}s ({count/elapsed_prop:.1f} fps)")
 
     # ==========================================
-    # Stage 3: Postprocess masks + LaMa inpaint
+    # Stage 3: Postprocess masks + inpaint
     # ==========================================
-    print(f"\n=== Stage 3: Postprocess + LaMa inpaint ===")
+    inpaint_method = args.inpaint_method
+    print(f"\n=== Stage 3: Postprocess + {inpaint_method} inpaint ===")
 
-    print("Loading LaMa...")
-    lama = init_lama()
-
+    # 3a. Generate mask videos + save binary masks for inpainting
     sam2_mask_c, sam2_mask_s = open_video_writer(
         os.path.join(out_dir, "sam2_mask.mp4"), w, h, int(vid_fps))
     sam2_overlay_c, sam2_overlay_s = open_video_writer(
         os.path.join(out_dir, "sam2_overlay.mp4"), w, h, int(vid_fps))
     final_mask_c, final_mask_s = open_video_writer(
         os.path.join(out_dir, "final_mask.mp4"), w, h, int(vid_fps))
-    inpaint_c, inpaint_s = open_video_writer(
-        os.path.join(out_dir, "inpaint.mp4"), w, h, int(vid_fps))
 
-    t_inpaint = time.time()
+    # Save binary masks for ProPainter (or LaMa)
+    mask_png_dir = os.path.join(tmp_dir, "masks")
+    os.makedirs(mask_png_dir, exist_ok=True)
+
+    t_mask = time.time()
     for i in range(processed):
         img = cv2.imread(os.path.join(jpeg_dir, f"{i:05d}.jpg"))
         parts = frame_part_masks.get(i, {})
 
-        # Colored SAM2 mask
         sam2_mask_img = np.zeros_like(img)
         sam2_overlay_img = img.copy()
         combined_binary = np.zeros((h, w), dtype=np.uint8)
@@ -395,33 +423,158 @@ def main():
             cv2.drawContours(sam2_overlay_img, contours, -1, color, 1, cv2.LINE_AA)
             combined_binary = np.maximum(combined_binary, m)
 
-        # Postprocess: smooth + dilate + edge blur
         final_mask = postprocess_mask(combined_binary)
 
-        # LaMa inpaint
-        inpainted = run_lama(lama, img, final_mask)
+        # Save binary mask PNG
+        mask_binary = (final_mask > 128).astype(np.uint8) * 255
+        cv2.imwrite(os.path.join(mask_png_dir, f"{i:05d}.png"), mask_binary)
 
         write_frame(sam2_mask_c, sam2_mask_s, sam2_mask_img)
         write_frame(sam2_overlay_c, sam2_overlay_s, sam2_overlay_img)
         write_frame(final_mask_c, final_mask_s, cv2.cvtColor(final_mask, cv2.COLOR_GRAY2BGR))
-        write_frame(inpaint_c, inpaint_s, inpainted)
-
-        if (i + 1) % 50 == 0 or i == 0:
-            elapsed = time.time() - t_inpaint
-            fps_p = (i + 1) / elapsed
-            eta = (processed - i - 1) / fps_p if fps_p > 0 else 0
-            print(f"  {i+1}/{processed} ({fps_p:.1f} fps, ETA {eta:.0f}s)")
 
     close_video(sam2_mask_c, sam2_mask_s)
     close_video(sam2_overlay_c, sam2_overlay_s)
     close_video(final_mask_c, final_mask_s)
-    close_video(inpaint_c, inpaint_s)
+    print(f"Masks saved: {time.time() - t_mask:.1f}s")
+
+    # 3b. Inpainting
+    t_inpaint = time.time()
+
+    if inpaint_method == "propainter":
+        import subprocess
+        propainter_dir = os.path.join(BASE_DIR, "ProPainter")
+
+        # ProPainter loads all frames to GPU at once → OOM on long videos.
+        # Split into segments of max_seg frames with overlap for blending.
+        max_seg = 200
+        overlap = 10
+
+        if processed <= max_seg:
+            segments = [(0, processed)]
+        else:
+            segments = []
+            s = 0
+            while s < processed:
+                e = min(s + max_seg, processed)
+                segments.append((s, e))
+                s = e - overlap
+                if processed - s <= overlap:
+                    break
+
+        print(f"Running ProPainter ({processed} frames, {len(segments)} segment(s))...")
+
+        seg_results = []  # list of (start, end, output_dir)
+        for si, (seg_start, seg_end) in enumerate(segments):
+            n_seg = seg_end - seg_start
+            seg_frames = os.path.join(tmp_dir, f"seg_frames_{si}")
+            seg_masks = os.path.join(tmp_dir, f"seg_masks_{si}")
+            seg_out = os.path.join(tmp_dir, f"pp_seg_{si}")
+            os.makedirs(seg_frames, exist_ok=True)
+            os.makedirs(seg_masks, exist_ok=True)
+
+            # Symlink frames/masks for this segment (re-index from 0)
+            for i in range(seg_start, seg_end):
+                new_idx = f"{i - seg_start:05d}"
+                old_idx = f"{i:05d}"
+                os.symlink(os.path.abspath(os.path.join(jpeg_dir, f"{old_idx}.jpg")),
+                           os.path.join(seg_frames, f"{new_idx}.jpg"))
+                os.symlink(os.path.abspath(os.path.join(mask_png_dir, f"{old_idx}.png")),
+                           os.path.join(seg_masks, f"{new_idx}.png"))
+
+            cmd = [
+                sys.executable,
+                os.path.join(propainter_dir, "inference_propainter.py"),
+                "--video", os.path.abspath(seg_frames),
+                "--mask", os.path.abspath(seg_masks),
+                "--output", os.path.abspath(seg_out),
+                "--save_fps", str(int(vid_fps)),
+                "--mask_dilation", "4",
+                "--subvideo_length", "80",
+                "--fp16", "--save_frames",
+            ]
+            print(f"  Segment {si+1}/{len(segments)}: frames {seg_start}-{seg_end-1} ({n_seg} frames)")
+            result = subprocess.run(cmd, cwd=propainter_dir)
+
+            # Cleanup symlinks
+            shutil.rmtree(seg_frames, ignore_errors=True)
+            shutil.rmtree(seg_masks, ignore_errors=True)
+
+            if result.returncode != 0:
+                print(f"  ProPainter segment {si+1} failed (code {result.returncode})")
+                print(f"  Temp files at: {tmp_dir}")
+                return
+
+            seg_results.append((seg_start, seg_end, seg_out))
+
+        # Stitch segments into final video (blend overlap regions)
+        inpaint_out = os.path.join(out_dir, "inpaint.mp4")
+        inpaint_c, inpaint_s = open_video_writer(inpaint_out, w, h, int(vid_fps))
+
+        written = 0
+        for si, (seg_start, seg_end, seg_out) in enumerate(seg_results):
+            # Find the frames dir inside ProPainter output
+            pp_frames_dir = None
+            for root, dirs, files in os.walk(seg_out):
+                pngs = [f for f in files if f.endswith('.png')]
+                if pngs:
+                    pp_frames_dir = root
+                    break
+
+            if pp_frames_dir is None:
+                print(f"  WARNING: No frames found in segment {si+1}")
+                continue
+
+            n_seg = seg_end - seg_start
+            for i in range(n_seg):
+                global_idx = seg_start + i
+
+                # Skip frames already written (overlap region from prev segment)
+                if global_idx < written:
+                    continue
+
+                frame_path = os.path.join(pp_frames_dir, f"{i:04d}.png")
+                if not os.path.exists(frame_path):
+                    continue
+
+                frame = cv2.imread(frame_path)
+                if frame is None:
+                    continue
+
+                # In overlap region, blend with decreasing weight
+                # (simple: just use the new segment's frames for overlap)
+                write_frame(inpaint_c, inpaint_s, frame)
+                written += 1
+
+        close_video(inpaint_c, inpaint_s)
+        print(f"ProPainter done: {written} frames, {time.time() - t_inpaint:.1f}s")
+
+    else:  # lama
+        print("Loading LaMa...")
+        lama = init_lama()
+        inpaint_c, inpaint_s = open_video_writer(
+            os.path.join(out_dir, "inpaint.mp4"), w, h, int(vid_fps))
+
+        for i in range(processed):
+            img = cv2.imread(os.path.join(jpeg_dir, f"{i:05d}.jpg"))
+            mask = cv2.imread(os.path.join(mask_png_dir, f"{i:05d}.png"),
+                              cv2.IMREAD_GRAYSCALE)
+            inpainted = run_lama(lama, img, mask)
+            write_frame(inpaint_c, inpaint_s, inpainted)
+
+            if (i + 1) % 50 == 0 or i == 0:
+                elapsed = time.time() - t_inpaint
+                fps_p = (i + 1) / elapsed
+                eta = (processed - i - 1) / fps_p if fps_p > 0 else 0
+                print(f"  {i+1}/{processed} ({fps_p:.1f} fps, ETA {eta:.0f}s)")
+
+        close_video(inpaint_c, inpaint_s)
 
     # Cleanup tmp
     shutil.rmtree(tmp_dir, ignore_errors=True)
 
     total = time.time() - t_start
-    print(f"\nDone in {total:.1f}s")
+    print(f"\nDone in {total:.1f}s ({inpaint_method})")
     print(f"Output: {out_dir}/")
     for f in ["original", "fk_overlay", "fk_mask", "sam2_mask",
               "sam2_overlay", "final_mask", "inpaint"]:

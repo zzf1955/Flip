@@ -25,25 +25,16 @@ from stl import mesh as stl_mesh
 
 sys.stdout.reconfigure(line_buffering=True)
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-URDF_PATH = os.path.join(BASE_DIR, "data", "mesh",
-                         "g1_29dof_rev_1_0_with_inspire_hand_FTP.urdf")
-MESH_DIR = os.path.join(BASE_DIR, "data", "mesh", "meshes")
-DATA_DIR = os.path.join(BASE_DIR, "data", "video", "G1_WBT_Brainco_Make_The_Bed")
-OUTPUT_DIR = os.path.join(BASE_DIR, "test_results", "inpaint_video")
+from config import (
+    BASE_DIR, G1_URDF, MESH_DIR, BEST_PARAMS, SKIP_MESHES,
+    ACTIVE_DATA_DIR, OUTPUT_DIR, get_hand_type,
+)
 
-SKIP_MESHES = {"head_link", "logo_link", "d435_link"}
-
-# Best params from PSO (IoU=0.8970)
-BEST_PARAMS = {
-    "dx": 0.039, "dy": 0.052, "dz": 0.536,
-    "pitch": -53.6, "yaw": 4.7, "roll": 3.0,
-    "fx": 315, "fy": 302, "cx": 334, "cy": 230,
-    "k1": 0.63, "k2": 0.17, "k3": 1.19, "k4": 0.25,
-}
+# Aliases for backward compatibility with importers
+URDF_PATH = G1_URDF
 
 
-def build_q(model, rq, hand_state=None):
+def build_q(model, rq, hand_state=None, hand_type="inspire"):
     """Map dataset rq (36) + hand_state (12) to Inspire FTP URDF q (60).
 
     Dataset rq layout:
@@ -57,6 +48,14 @@ def build_q(model, rq, hand_state=None):
       [4] left thumb close  [5] left thumb tilt
       [6] right index  [7] right middle  [8] right ring  [9] right little
       [10] right thumb close  [11] right thumb tilt
+
+    hand_state layout (BrainCo, 0=open 1=closed):
+      [0] left thumb close  [1] left thumb tilt
+      [2] left index  [3] left middle  [4] left ring  [5] left little
+      [6] right thumb close  [7] right thumb tilt
+      [8] right index  [9] right middle  [10] right ring  [11] right little
+
+    hand_type: "inspire" or "brainco" — controls hand_state index mapping.
 
     URDF q layout (nq=60):
       q[0:7]   freeflyer (pos + quat x,y,z,w)
@@ -73,6 +72,15 @@ def build_q(model, rq, hand_state=None):
 
     if hand_state is not None:
         hs = hand_state
+        if hand_type == "brainco":
+            # Remap BrainCo -> Inspire layout per hand (6 values each)
+            # BrainCo: [thumb_close, thumb_tilt, index, middle, ring, little]
+            # Inspire: [index, middle, ring, little, thumb_close, thumb_tilt]
+            hs = np.array(hs, dtype=np.float64)
+            hs = np.concatenate([
+                hs[2:6], hs[0:2],    # left: index,mid,ring,little,thumb_c,thumb_t
+                hs[8:12], hs[6:8],   # right: same reorder
+            ])
         # Finger joint limits: _1 max=1.4381, _2 mimics _1 * 1.0843
         # Thumb: _1 max=1.1641 (tilt), _2 max=0.5864 (close),
         #        _3 mimics _2 * 0.8024, _4 mimics _3 * 0.9487
@@ -140,11 +148,16 @@ def parse_urdf_meshes(urdf_path):
     return link_meshes
 
 
-def preload_meshes(link_meshes, mesh_dir):
-    """Load all STL meshes once. Returns dict of link_name -> (triangles, unique_verts)."""
+def preload_meshes(link_meshes, mesh_dir, skip_set=None, subsample=4):
+    """Load all STL meshes once. Returns dict of link_name -> (triangles, unique_verts).
+
+    subsample: keep every Nth triangle to reduce mesh complexity.
+    """
+    if skip_set is None:
+        skip_set = SKIP_MESHES
     cache = {}
     for link_name, filename in link_meshes.items():
-        if link_name in SKIP_MESHES:
+        if link_name in skip_set:
             continue
         path = os.path.join(mesh_dir, filename)
         if not os.path.exists(path):
@@ -155,15 +168,20 @@ def preload_meshes(link_meshes, mesh_dir):
         valid_per_vert = np.all(np.isfinite(flat), axis=1)
         valid_per_tri = valid_per_vert.reshape(-1, 3).all(axis=1)
         tris = verts[valid_per_tri]
+        if subsample > 1:
+            tris = tris[::subsample]
         flat_all = m.vectors.reshape(-1, 3)
         valid_all = np.all(np.isfinite(flat_all), axis=1)
         unique_verts = np.unique(flat_all[valid_all], axis=0)
+        if subsample > 1:
+            unique_verts = unique_verts[::subsample]
         if len(tris) > 0:
             cache[link_name] = (tris, unique_verts)
     return cache
 
 
-def make_camera(params, transforms):
+def make_camera_const(params):
+    """Precompute the camera rotation/intrinsics that are constant across frames."""
     p = params
     pitch = np.radians(p["pitch"])
     yaw = np.radians(p["yaw"])
@@ -187,55 +205,172 @@ def make_camera(params, transforms):
     R_body_to_cam = np.array([[0, -1, 0], [0, 0, -1], [1, 0, 0]], dtype=np.float64)
     R_cam = R_body_to_cam @ R_roll @ R_yaw @ R_pitch
 
-    ref_t, ref_R = transforms["torso_link"]
-    cam_pos = ref_t + ref_R @ np.array([p["dx"], p["dy"], p["dz"]])
-    R_w2c = (ref_R @ R_cam.T).T
-    t_w2c = R_w2c @ (-cam_pos)
-
     K = np.array([[p["fx"], 0, p["cx"]],
                    [0, p["fy"], p["cy"]],
                    [0, 0, 1]], dtype=np.float64)
     D = np.array([p["k1"], p["k2"], p["k3"], p["k4"]], dtype=np.float64).reshape(4, 1)
+    offset = np.array([p["dx"], p["dy"], p["dz"]], dtype=np.float64)
+    return {"R_cam": R_cam, "K": K, "D": D, "offset": offset}
+
+
+def make_camera(params, transforms, _const=None):
+    """Build camera from params + per-frame torso transform.
+
+    Optionally accepts precomputed constants from make_camera_const().
+    """
+    if _const is None:
+        _const = make_camera_const(params)
+
+    R_cam = _const["R_cam"]
+    K = _const["K"]
+    D = _const["D"]
+    offset = _const["offset"]
+
+    ref_t, ref_R = transforms["torso_link"]
+    cam_pos = ref_t + ref_R @ offset
+    R_w2c = (ref_R @ R_cam.T).T
+    t_w2c = R_w2c @ (-cam_pos)
+
     rvec, _ = cv2.Rodrigues(R_w2c)
     tvec = t_w2c.reshape(3, 1)
     return K, D, rvec, tvec, R_w2c, t_w2c
 
 
+def render_mask_and_overlay(img, mesh_cache, transforms, params, h, w, _cam_const=None):
+    """Render both mask and overlay in a single pass (shared FK transform + projection)."""
+    K, D, rvec, tvec, R_w2c, t_w2c = make_camera(params, transforms, _cam_const)
+    t_w2c_flat = t_w2c.flatten()
+
+    # --- Batch all triangle vertices from all links ---
+    all_world_tris = []
+    all_tri_counts = []
+    # --- Batch unique verts per link for overlay ---
+    overlay_links = []  # (link_name, world_verts)
+
+    for link_name, (tris, unique_verts) in mesh_cache.items():
+        if link_name not in transforms:
+            continue
+        t_link, R_link = transforms[link_name]
+
+        # Triangle vertices → world coords
+        flat = tris.reshape(-1, 3)
+        world = (R_link @ flat.T).T + t_link
+        all_world_tris.append(world)
+        all_tri_counts.append(len(tris))
+
+        # Unique verts for overlay
+        if len(unique_verts) > 0:
+            verts_w = (R_link @ unique_verts.T).T + t_link
+            overlay_links.append((link_name, verts_w))
+
+    # --- Mask: batched projection ---
+    mask = np.zeros((h, w), dtype=np.uint8)
+    if all_world_tris:
+        all_world = np.concatenate(all_world_tris, axis=0).astype(np.float64)
+        cam_pts = (R_w2c @ all_world.T).T + t_w2c_flat
+        z_all = cam_pts[:, 2]
+
+        pts2d, _ = cv2.fisheye.projectPoints(
+            all_world.reshape(-1, 1, 3), rvec, tvec, K, D)
+        pts2d = pts2d.reshape(-1, 2)
+
+        # Split back by link and filter/draw triangles
+        offset = 0
+        for n_tris in all_tri_counts:
+            n_pts = n_tris * 3
+            z_seg = z_all[offset:offset + n_pts].reshape(n_tris, 3)
+            pts_seg = pts2d[offset:offset + n_pts].reshape(n_tris, 3, 2)
+
+            valid = (z_seg > 0.01).all(axis=1)
+            pts_valid = pts_seg[valid]
+            if len(pts_valid) > 0:
+                finite = np.all(np.isfinite(pts_valid), axis=(1, 2))
+                pts_valid = pts_valid[finite]
+                if len(pts_valid) > 0:
+                    cv2.fillPoly(mask, pts_valid.astype(np.int32), 255)
+
+            offset += n_pts
+
+        kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close)
+
+    # --- Overlay: per-link convex hull (needs per-link color) ---
+    overlay = np.zeros_like(img)
+    result = img.copy()
+    for link_name, verts_w in overlay_links:
+        verts_f64 = verts_w.astype(np.float64)
+        depths = (R_w2c @ verts_f64.T).T + t_w2c_flat
+        in_front = depths[:, 2] > 0.01
+        if np.count_nonzero(in_front) < 3:
+            continue
+
+        pts2d_ov, _ = cv2.fisheye.projectPoints(
+            verts_f64[in_front].reshape(-1, 1, 3), rvec, tvec, K, D)
+        pts2d_ov = pts2d_ov.reshape(-1, 2)
+        finite = np.all(np.isfinite(pts2d_ov), axis=1)
+        pts2d_ov = pts2d_ov[finite]
+        if len(pts2d_ov) < 3:
+            continue
+
+        hull = cv2.convexHull(pts2d_ov.astype(np.float32))
+        if "left" in link_name:
+            color = (255, 180, 0)
+        elif "right" in link_name:
+            color = (0, 180, 255)
+        else:
+            color = (0, 255, 180)
+        cv2.fillConvexPoly(overlay, hull.astype(np.int32), color)
+        cv2.polylines(result, [hull.astype(np.int32)], True, color, 1, cv2.LINE_AA)
+
+    cv2.addWeighted(overlay, 0.35, result, 1.0, 0, result)
+    return mask, result
+
+
+# --- Backward-compatible wrappers (used by sam2_inpaint_pipeline, sam2_segment) ---
+
 def render_mask(mesh_cache, transforms, params, h, w):
     """Render per-triangle mask using preloaded meshes."""
     K, D, rvec, tvec, R_w2c, t_w2c = make_camera(params, transforms)
-    mask = np.zeros((h, w), dtype=np.uint8)
+    t_w2c_flat = t_w2c.flatten()
 
+    all_world_tris = []
+    all_tri_counts = []
     for link_name, (tris, _) in mesh_cache.items():
         if link_name not in transforms:
             continue
-
         t_link, R_link = transforms[link_name]
         flat = tris.reshape(-1, 3)
         world = (R_link @ flat.T).T + t_link
+        all_world_tris.append(world)
+        all_tri_counts.append(len(tris))
 
-        cam_pts = (R_w2c @ world.T).T + t_w2c.flatten()
-        z_cam = cam_pts[:, 2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+    if not all_world_tris:
+        return mask
 
-        pts2d, _ = cv2.fisheye.projectPoints(
-            world.reshape(-1, 1, 3), rvec, tvec, K, D)
-        pts2d = pts2d.reshape(-1, 2)
+    all_world = np.concatenate(all_world_tris, axis=0).astype(np.float64)
+    cam_pts = (R_w2c @ all_world.T).T + t_w2c_flat
+    z_all = cam_pts[:, 2]
 
-        n_tri = len(tris)
-        z_tri = z_cam.reshape(n_tri, 3)
-        pts_tri = pts2d.reshape(n_tri, 3, 2)
+    pts2d, _ = cv2.fisheye.projectPoints(
+        all_world.reshape(-1, 1, 3), rvec, tvec, K, D)
+    pts2d = pts2d.reshape(-1, 2)
 
-        valid = (z_tri > 0.01).all(axis=1)
-        pts_tri = pts_tri[valid]
-        if len(pts_tri) == 0:
-            continue
+    offset = 0
+    for n_tris in all_tri_counts:
+        n_pts = n_tris * 3
+        z_seg = z_all[offset:offset + n_pts].reshape(n_tris, 3)
+        pts_seg = pts2d[offset:offset + n_pts].reshape(n_tris, 3, 2)
 
-        finite = np.all(np.isfinite(pts_tri), axis=(1, 2))
-        pts_tri = pts_tri[finite]
-        tri_pts = pts_tri.astype(np.int32)
+        valid = (z_seg > 0.01).all(axis=1)
+        pts_valid = pts_seg[valid]
+        if len(pts_valid) > 0:
+            finite = np.all(np.isfinite(pts_valid), axis=(1, 2))
+            pts_valid = pts_valid[finite]
+            if len(pts_valid) > 0:
+                cv2.fillPoly(mask, pts_valid.astype(np.int32), 255)
 
-        if len(tri_pts) > 0:
-            cv2.fillPoly(mask, tri_pts, 255)
+        offset += n_pts
 
     kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close)
@@ -351,9 +486,11 @@ def close_video(container, stream):
     container.close()
 
 
-def load_episode_info(ep):
+def load_episode_info(ep, data_dir=None):
     """Load episode meta and return (video_path, from_ts, to_ts, ep_df)."""
-    meta = pd.read_parquet(os.path.join(DATA_DIR, "meta", "episodes",
+    if data_dir is None:
+        data_dir = ACTIVE_DATA_DIR
+    meta = pd.read_parquet(os.path.join(data_dir, "meta", "episodes",
                                          "chunk-000", "file-000.parquet"))
     ep_meta = meta[meta["episode_index"] == ep]
     if len(ep_meta) == 0:
@@ -364,13 +501,13 @@ def load_episode_info(ep):
     from_ts = float(ep_meta["videos/observation.images.head_stereo_left/from_timestamp"])
     to_ts = float(ep_meta["videos/observation.images.head_stereo_left/to_timestamp"])
 
-    video_path = os.path.join(DATA_DIR, "videos",
+    video_path = os.path.join(data_dir, "videos",
                                "observation.images.head_stereo_left",
                                "chunk-000", f"file-{file_idx:03d}.mp4")
 
     # Load parquet (determine which file)
     data_fi = int(ep_meta.get("data/file_index", 0))
-    parquet_path = os.path.join(DATA_DIR, "data", "chunk-000",
+    parquet_path = os.path.join(data_dir, "data", "chunk-000",
                                  f"file-{data_fi:03d}.parquet")
     df = pd.read_parquet(parquet_path)
     ep_df = df[df["episode_index"] == ep].sort_values("frame_index")
@@ -389,7 +526,8 @@ def main():
                         help="Duration in seconds (default 0 = entire episode)")
     args = parser.parse_args()
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    out_dir = os.path.join(OUTPUT_DIR, "inpaint_video")
+    os.makedirs(out_dir, exist_ok=True)
     ep = args.episode
 
     # Load episode info
@@ -426,9 +564,9 @@ def main():
 
     # Load URDF + meshes
     print("Loading URDF and meshes...")
-    model = pin.buildModelFromUrdf(URDF_PATH, pin.JointModelFreeFlyer())
+    model = pin.buildModelFromUrdf(G1_URDF, pin.JointModelFreeFlyer())
     data_pin = model.createData()
-    link_meshes = parse_urdf_meshes(URDF_PATH)
+    link_meshes = parse_urdf_meshes(G1_URDF)
     mesh_cache = preload_meshes(link_meshes, MESH_DIR)
     print(f"Loaded {len(mesh_cache)} link meshes")
 
@@ -480,7 +618,7 @@ def main():
         if not writers_ready:
             h, w = img.shape[:2]
             for vname in ["original", "mask", "overlay", "inpaint"]:
-                vpath = os.path.join(OUTPUT_DIR, f"{tag}_{vname}.mp4")
+                vpath = os.path.join(out_dir, f"{tag}_{vname}.mp4")
                 c, s = open_video_writer(vpath, w, h, fps=int(vid_fps))
                 writers[vname] = (c, s)
             writers_ready = True
@@ -488,7 +626,7 @@ def main():
         rq, hs = frame_data[ep_fi]
 
         # FK with hand state
-        q = build_q(model, rq, hs)
+        q = build_q(model, rq, hs, hand_type=get_hand_type())
         transforms = do_fk(model, data_pin, q)
 
         # Mask: raw → GrabCut → 平滑 → 膨胀 → 边缘模糊
@@ -535,7 +673,7 @@ def main():
     elapsed = time.time() - t_start
     print(f"\nDone: {processed} frames in {elapsed:.1f}s "
           f"({processed/elapsed:.1f} fps)")
-    print(f"Output: {OUTPUT_DIR}/{tag}_*.mp4")
+    print(f"Output: {out_dir}/{tag}_*.mp4")
 
 
 if __name__ == "__main__":

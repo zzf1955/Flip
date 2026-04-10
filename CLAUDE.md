@@ -1,57 +1,117 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+用中文回答
 
 ## 项目概述
 
-第一人称人形机器人视频生成研究项目。核心思路是**反向数据构造**：在真实机器人视频上合成人手，得到（合成human, 真实robot）配对数据，用于微调 video-to-video 模型（Wan 2.2 + LoRA）。目标机器人为宇树 G1。
+FLIP: Flipped-Direction Learning via Inpainting Pipeline for Cross-Embodiment Video Editing
 
-当前阶段聚焦于 pipeline 的**相机标定与 Mesh 渲染**：利用本体感知（关节编码器数据）和正向运动学，将 G1 的 3D Mesh 投影到自我视角相机帧上，生成精确的手臂分割 Mask。
+第一人称人形机器人视频生成研究项目。核心思路是**反向数据构造**：在真实机器人视频上合成人体，得到（合成human, 真实robot）配对数据，用于微调 video-to-video 模型（Wan 2.1 + LoRA）。目标机器人为宇树 G1。
+
+当前阶段聚焦于 **FK Mesh 渲染 → SAM2 分割 → LaMa 修复**，以及**人体叠加**。
 
 ## 环境
 
+### 基础
+- OS: Ubuntu 24.04.2 LTS
+- GPU: 4x NVIDIA RTX 4090 D (24 GB each)
+- CUDA: 12.8 (V12.8.61), Driver 570.133.07
+- Conda env: `flip` (`conda activate flip`)
+- Python: 3.10, PyTorch 2.11.0+cu128
+
+### 运行脚本
 ```bash
-conda activate videoedit
+LD_PRELOAD=/home/leadtek/miniconda3/envs/flip/lib/libjpeg.so.8 \
+  no_proxy=localhost,127.0.0.1 \
+  python scripts/<script>.py
 ```
+
+### 网络 / 代理
+- Clash 代理端口: 20171
+- `export http_proxy=http://127.0.0.1:20171`
+- `export https_proxy=http://127.0.0.1:20171`
+
+### GPU 分配
+- GPU 0: ComfyUI (端口 8001, `/disk_n/zzf/ComfyUI`)
+- GPU 1-3: 脚本使用 (`--device cuda:2` 等)
+
+### 缓存路径 (根分区仅 ~14GB, 所有缓存必须放 /disk_n/zzf/)
+- HuggingFace: `/disk_n/zzf/.cache/huggingface` (HF_HOME)
+- pip: `/disk_n/zzf/.pip_cache`
+- uv (Cosmos): `/disk_n/zzf/.cache/uv`
+
+### Git
+- committer: zzf621
 
 ## 关键依赖
 
-- **pinocchio** — 从 URDF + 关节角度做正向运动学
-- **numpy-stl** (`stl.mesh`) — 加载 STL 网格文件
-- **OpenCV** (`cv2`) — 图像处理、鱼眼投影、渲染
-- **pandas** — 读取 parquet 文件（LeRobot 数据集格式）
-- **PyAV** (`av`) — 视频帧提取（精确 seek，优于 cv2.VideoCapture）
+- **pinocchio** -- URDF + 正向运动学
+- **numpy-stl** (`stl.mesh`) -- STL mesh 加载
+- **OpenCV** (`cv2`) -- 图像处理、鱼眼投影
+- **pandas** -- parquet (LeRobot 数据集格式)
+- **PyAV** (`av`) -- 视频帧提取
+- **sam2** -- SAM2 视频分割
+- **simple_lama_inpainting** -- LaMa 修复
 
-## 运行脚本
+## 项目结构
 
-所有脚本独立运行，从项目根目录执行：
-```bash
-python scripts/render_g1_skeleton.py      # 俯视图骨骼 + Mesh 渲染
-python scripts/render_front_view.py       # 正视图彩色 Mesh（区分各 link）
-python scripts/interactive_calibrate.py   # GUI 滑动条交互标定（需要显示器）
-python scripts/auto_calibrate.py          # PSO 自动标定（多进程）
-python scripts/compare_render.py          # 凸包 vs 三角面片渲染对比
-python scripts/sample_render.py           # 多任务/多 episode 批量 overlay 验证
+### 核心脚本 (scripts/)
+
+| 脚本 | 功能 |
+|------|------|
+| `config.py` | 集中配置: 路径、相机参数、活跃任务/episodes |
+| `video_inpaint.py` | 核心工具模块: FK、渲染、mask、LaMa、视频 IO |
+| `sam2_inpaint_pipeline.py` | **主 pipeline**: FK -> SAM2 box prompt -> LaMa inpaint |
+| `sam2_segment.py` | SAM2 分割实验 (box/point 模式) |
+| `render_human_overlay.py` | 人手 mesh 叠加渲染 |
+| `generate_human_meshes.py` | 人手 STL capsule 生成 |
+| `auto_calibrate.py` | PSO 相机自动标定 (已完成, IoU=0.8970) |
+| `interactive_calibrate.py` | GUI 交互标定 (需要显示器) |
+| `download_g1_wbt.sh` | 数据集批量下载 (hf-mirror) |
+| `inspect_g1_datasets.py` | 数据集统计检查 |
+
+### 配置切换
+
+编辑 `scripts/config.py` 中的 `ACTIVE_TASK` 和 `ACTIVE_EPISODES`。
+
+### 数据布局
+
 ```
-
-输出到 `test_results/`。
-
-## 数据布局
-
-- `data/g1_urdf/` — G1 URDF（`g1_29dof_rev_1_0.urdf`）
-- `data/unitree_ros/robots/g1_description/meshes/` — 各 link 的 STL 网格
-- `data/unitree_model/` — 宇树官方模型仓库
-- `data/g1_wbt/`, `data/g1_wbt_task2/`, `data/g1_wbt_task3/` — LeRobot 格式数据集
-  - `videos/observation.images.head_stereo_left/chunk-*/file-*.mp4` — 自我视角视频
-  - `data/chunk-*/file-*.parquet` — 关节状态（29 自由度）
+data/
+├── mesh/                              # URDF + STL
+│   ├── g1_29dof_rev_1_0_with_inspire_hand_FTP.urdf
+│   ├── human_arm_overlay.urdf
+│   └── meshes/                        # STL files (51+)
+└── unitree_G1_WBT/                    # 8 个 LeRobot 格式任务数据集
+    └── <task_name>/
+        ├── meta/episodes/chunk-000/   # episode -> 视频文件映射
+        ├── data/chunk-000/            # parquet (关节状态 30Hz)
+        └── videos/observation.images.head_stereo_left/
+            └── chunk-000/             # MP4 视频 640x480@30fps
+```
 
 ## 代码架构
 
-各脚本共享同一模式：
+各脚本共享同一模式:
 1. `pinocchio.buildModelFromUrdf` 加载 URDF + 加载各 link 的 STL Mesh
-2. 从 parquet 读取目标帧的关节角度（29 DOF）
-3. 正向运动学（`pin.forwardKinematics` + `pin.updateFramePlacements`）得到各 link 位姿
+2. 从 parquet 读取目标帧的关节角度 (29 DOF body + 12 DOF hands)
+3. 正向运动学 (`pin.forwardKinematics` + `pin.updateFramePlacements`) 得到各 link 位姿
 4. 将 Mesh 顶点变换到世界坐标系，通过鱼眼相机模型投影到图像
 5. 在视频帧上渲染 Mask / Overlay
 
-相机模型使用 OpenCV 鱼眼（等距投影），参数包括：相对于 `head_link` 的外参偏移（dx, dy, dz, pitch, yaw, roll）和内参（fx, fy, cx, cy, k1-k4）。标定通过优化 Mask IoU 完成。
+相机模型使用 OpenCV 鱼眼 (等距投影), 参数包括: 相对于 `torso_link` 的外参偏移 (dx, dy, dz, pitch, yaw, roll) 和内参 (fx, fy, cx, cy, k1-k4)。
+
+## 运行示例
+
+```bash
+# 主 pipeline (FK -> SAM2 -> LaMa)
+python scripts/sam2_inpaint_pipeline.py --episode 4 --start 5 --duration 5
+
+# SAM2 分割实验
+python scripts/sam2_segment.py --episode 4 --start 5 --duration 5 --mode box
+
+# 人手叠加
+python scripts/render_human_overlay.py --episode 0 --frame 30 --side-by-side
+```
+
+输出到 `test_results/`。

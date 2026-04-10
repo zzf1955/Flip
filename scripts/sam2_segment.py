@@ -30,15 +30,15 @@ sys.stdout.reconfigure(line_buffering=True)
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(BASE_DIR, "scripts"))
 
+from config import G1_URDF, MESH_DIR, BEST_PARAMS, SKIP_MESHES, OUTPUT_DIR, get_hand_type
 from video_inpaint import (
-    URDF_PATH, MESH_DIR, BEST_PARAMS, SKIP_MESHES,
     build_q, do_fk, parse_urdf_meshes, preload_meshes,
     make_camera,
     open_video_writer, write_frame, close_video,
+    load_episode_info,
 )
-from video_inpaint import load_episode_info
 
-OUTPUT_DIR = os.path.join(BASE_DIR, "test_results", "sam2_segment")
+SAM2_OUTPUT_DIR = os.path.join(OUTPUT_DIR, "sam2_segment")
 
 MODEL_IDS = {
     "tiny": "facebook/sam2.1-hiera-tiny",
@@ -179,7 +179,7 @@ def main():
     print(f"Device: {device}, Mode: {args.mode}")
 
     # Output subdirectory per mode
-    out_dir = os.path.join(OUTPUT_DIR, f"ep{ep:03d}_{args.mode}")
+    out_dir = os.path.join(SAM2_OUTPUT_DIR, f"ep{ep:03d}_{args.mode}")
     prompt_vis_dir = os.path.join(out_dir, "prompt_vis")
     os.makedirs(prompt_vis_dir, exist_ok=True)
 
@@ -204,9 +204,9 @@ def main():
 
     # Load URDF + meshes
     print("Loading URDF and meshes...")
-    model_pin = pin.buildModelFromUrdf(URDF_PATH, pin.JointModelFreeFlyer())
+    model_pin = pin.buildModelFromUrdf(G1_URDF, pin.JointModelFreeFlyer())
     data_pin = model_pin.createData()
-    link_meshes = parse_urdf_meshes(URDF_PATH)
+    link_meshes = parse_urdf_meshes(G1_URDF)
     mesh_cache = preload_meshes(link_meshes, MESH_DIR)
 
     # Pre-filter mesh cache per body part
@@ -257,7 +257,7 @@ def main():
 
         # FK on every frame to track visibility
         rq, hs = frame_data[ep_fi]
-        q = build_q(model_pin, rq, hs)
+        q = build_q(model_pin, rq, hs, hand_type=get_hand_type())
         transforms = do_fk(model_pin, data_pin, q)
 
         cur_visible = set()
