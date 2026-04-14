@@ -18,6 +18,7 @@ Usage:
 import sys
 import os
 import argparse
+import json
 import time
 import shutil
 import fnmatch
@@ -32,7 +33,8 @@ sys.stdout.reconfigure(line_buffering=True)
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(BASE_DIR, "scripts"))
 
-from config import G1_URDF, MESH_DIR, BEST_PARAMS, SKIP_MESHES, OUTPUT_DIR, get_hand_type
+from config import G1_URDF, MESH_DIR, BEST_PARAMS, CAMERA_MODEL, SKIP_MESHES, OUTPUT_DIR, get_hand_type, get_skip_meshes
+from camera_models import project_points_cv
 from video_inpaint import (
     build_q, do_fk, parse_urdf_meshes, preload_meshes,
     make_camera, make_camera_const, render_mask, render_overlay,
@@ -77,9 +79,6 @@ PART_COLORS = {
     "torso":     (100, 200, 0),
 }
 
-MIN_VISIBLE_AREA = 50
-
-
 def match_links(mesh_cache, patterns):
     matched = {}
     for link_name, data in mesh_cache.items():
@@ -95,7 +94,7 @@ def match_links(mesh_cache, patterns):
 def render_mask_for_links(filtered_cache, transforms, params, h, w):
     if not filtered_cache:
         return np.zeros((h, w), dtype=np.uint8)
-    K, D, rvec, tvec, R_w2c, t_w2c = make_camera(params, transforms)
+    K, D, rvec, tvec, R_w2c, t_w2c, _fisheye = make_camera(params, transforms)
     mask = np.zeros((h, w), dtype=np.uint8)
     for link_name, (tris, _) in filtered_cache.items():
         if link_name not in transforms:
@@ -105,8 +104,8 @@ def render_mask_for_links(filtered_cache, transforms, params, h, w):
         world = (R_link @ flat.T).T + t_link
         cam_pts = (R_w2c @ world.T).T + t_w2c.flatten()
         z_cam = cam_pts[:, 2]
-        pts2d, _ = cv2.fisheye.projectPoints(
-            world.reshape(-1, 1, 3), rvec, tvec, K, D)
+        pts2d = project_points_cv(
+            world.reshape(-1, 1, 3), rvec, tvec, K, D, _fisheye)
         pts2d = pts2d.reshape(-1, 2)
         n_tri = len(tris)
         z_tri = z_cam.reshape(n_tri, 3)
@@ -122,7 +121,7 @@ def render_mask_for_links(filtered_cache, transforms, params, h, w):
     return mask
 
 
-def mask_to_bbox(mask, margin=20):
+def mask_to_bbox(mask, margin=0):
     ys, xs = np.nonzero(mask)
     if len(xs) == 0:
         return None
@@ -160,6 +159,14 @@ def main():
                         help="Task name (default: ACTIVE_TASK from config)")
     parser.add_argument("--output-dir", type=str, default=None,
                         help="Override output directory")
+    parser.add_argument("--camera-params", type=str, default=None,
+                        help="Path to best_params.json (overrides BEST_PARAMS from config)")
+    parser.add_argument("--bbox-margin", type=int, default=0,
+                        help="Pixels to expand each FK-derived part bbox on every side "
+                             "before sending as SAM2 prompt (default: 0)")
+    parser.add_argument("--min-visible-area", type=int, default=50,
+                        help="Minimum FK-rendered mask pixels for a body part to count "
+                             "as visible and get its own SAM2 prompt (default: 50)")
     parser.add_argument("--device", type=str, default=None,
                         help="Device (e.g. cuda:0, cuda:2, cpu)")
     args = parser.parse_args()
@@ -214,15 +221,33 @@ def main():
         frame_data[fi] = (rq, hs)
 
     # Load URDF + meshes
-    print("Loading URDF and meshes...")
+    skip_set = get_skip_meshes(hand_type)
+    print(f"Loading URDF and meshes... (hand_type={hand_type}, skipping {len(skip_set)} links)")
     model_pin = pin.buildModelFromUrdf(G1_URDF, pin.JointModelFreeFlyer())
     data_pin = model_pin.createData()
     link_meshes = parse_urdf_meshes(G1_URDF)
-    mesh_cache = preload_meshes(link_meshes, MESH_DIR)
+    mesh_cache = preload_meshes(link_meshes, MESH_DIR, skip_set=skip_set)
 
     part_caches = {name: match_links(mesh_cache, pats) for name, pats in BODY_PARTS.items()}
 
-    cam_const = make_camera_const(BEST_PARAMS)
+    cam_params = BEST_PARAMS
+    if args.camera_params:
+        with open(args.camera_params) as f:
+            payload = json.load(f)
+        loaded = payload.get("params", payload)
+        model_tag = payload.get("camera_model", None)
+        if model_tag and model_tag != CAMERA_MODEL:
+            print(f"[WARN] camera-params model={model_tag} "
+                  f"differs from config CAMERA_MODEL={CAMERA_MODEL}")
+        cam_params = {k: loaded[k] for k in BEST_PARAMS if k in loaded}
+        missing = set(BEST_PARAMS) - set(cam_params)
+        if missing:
+            print(f"[WARN] camera-params missing keys {missing}, "
+                  f"falling back to config for those")
+            for k in missing:
+                cam_params[k] = BEST_PARAMS[k]
+        print(f"Camera params loaded from {args.camera_params}: {cam_params}")
+    cam_const = make_camera_const(cam_params)
 
     # ==========================================
     # Stage 1: Extract frames + FK + prompts
@@ -297,7 +322,7 @@ def main():
             if not pcache:
                 continue
             m = render_mask_for_links(pcache, transforms, BEST_PARAMS, h, w)
-            if np.count_nonzero(m) >= MIN_VISIBLE_AREA:
+            if np.count_nonzero(m) >= args.min_visible_area:
                 cur_visible.add(part_name)
                 part_masks[part_name] = m
 
@@ -312,7 +337,7 @@ def main():
         if parts_to_prompt:
             vis_img = img.copy()
             for part_name in parts_to_prompt:
-                bbox = mask_to_bbox(part_masks[part_name])
+                bbox = mask_to_bbox(part_masks[part_name], margin=args.bbox_margin)
                 if bbox is not None:
                     all_prompts.append((processed, part_name, bbox))
                     draw_box_prompt(vis_img, part_name, bbox)
@@ -494,7 +519,14 @@ def main():
                 "--fp16", "--save_frames",
             ]
             print(f"  Segment {si+1}/{len(segments)}: frames {seg_start}-{seg_end-1} ({n_seg} frames)")
-            result = subprocess.run(cmd, cwd=propainter_dir)
+            # Propagate GPU selection to ProPainter subprocess.
+            # If parent already has CUDA_VISIBLE_DEVICES set (parallel launcher),
+            # inherit it so child sees the same physical GPU as slot 0.
+            # Otherwise fall back to pinning via --device.
+            sub_env = os.environ.copy()
+            if "CUDA_VISIBLE_DEVICES" not in sub_env and device.startswith("cuda:"):
+                sub_env["CUDA_VISIBLE_DEVICES"] = device.split(":", 1)[1]
+            result = subprocess.run(cmd, cwd=propainter_dir, env=sub_env)
 
             # Cleanup symlinks
             shutil.rmtree(seg_frames, ignore_errors=True)

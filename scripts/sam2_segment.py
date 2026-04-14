@@ -30,7 +30,8 @@ sys.stdout.reconfigure(line_buffering=True)
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(BASE_DIR, "scripts"))
 
-from config import G1_URDF, MESH_DIR, BEST_PARAMS, SKIP_MESHES, OUTPUT_DIR, get_hand_type
+from config import G1_URDF, MESH_DIR, BEST_PARAMS, SKIP_MESHES, OUTPUT_DIR, get_hand_type, get_skip_meshes
+from camera_models import project_points_cv
 from video_inpaint import (
     build_q, do_fk, parse_urdf_meshes, preload_meshes,
     make_camera,
@@ -96,7 +97,7 @@ def render_mask_for_links(filtered_cache, transforms, params, h, w):
     """Render triangle mask for a subset of links."""
     if not filtered_cache:
         return np.zeros((h, w), dtype=np.uint8)
-    K, D, rvec, tvec, R_w2c, t_w2c = make_camera(params, transforms)
+    K, D, rvec, tvec, R_w2c, t_w2c, _fisheye = make_camera(params, transforms)
     mask = np.zeros((h, w), dtype=np.uint8)
 
     for link_name, (tris, _) in filtered_cache.items():
@@ -107,8 +108,8 @@ def render_mask_for_links(filtered_cache, transforms, params, h, w):
         world = (R_link @ flat.T).T + t_link
         cam_pts = (R_w2c @ world.T).T + t_w2c.flatten()
         z_cam = cam_pts[:, 2]
-        pts2d, _ = cv2.fisheye.projectPoints(
-            world.reshape(-1, 1, 3), rvec, tvec, K, D)
+        pts2d = project_points_cv(
+            world.reshape(-1, 1, 3), rvec, tvec, K, D, _fisheye)
         pts2d = pts2d.reshape(-1, 2)
         n_tri = len(tris)
         z_tri = z_cam.reshape(n_tri, 3)
@@ -203,11 +204,13 @@ def main():
         frame_data[fi] = (rq, hs)
 
     # Load URDF + meshes
-    print("Loading URDF and meshes...")
+    hand_type = get_hand_type()
+    skip_set = get_skip_meshes(hand_type)
+    print(f"Loading URDF and meshes... (hand_type={hand_type})")
     model_pin = pin.buildModelFromUrdf(G1_URDF, pin.JointModelFreeFlyer())
     data_pin = model_pin.createData()
     link_meshes = parse_urdf_meshes(G1_URDF)
-    mesh_cache = preload_meshes(link_meshes, MESH_DIR)
+    mesh_cache = preload_meshes(link_meshes, MESH_DIR, skip_set=skip_set)
 
     # Pre-filter mesh cache per body part
     part_caches = {}

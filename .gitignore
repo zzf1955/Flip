@@ -48,7 +48,13 @@ Thumbs.db
 *.swp
 *.swo
 
+# === Claude Code ===
+.claude/
+
 # === 项目 ===
 .worktrees/
 test_results/
+output/
+weights/
 ProPainter/
+ref-cosmos-transfer1/

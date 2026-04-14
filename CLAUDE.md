@@ -2,6 +2,8 @@
 
 用中文回答
 
+除非用户要求，否则不要直接看看视频和图片。简单的视觉任务请使用 python 代码操作，而不是直接看
+
 ## 项目概述
 
 FLIP: Flipped-Direction Learning via Inpainting Pipeline for Cross-Embodiment Video Editing
@@ -100,6 +102,31 @@ data/
 5. 在视频帧上渲染 Mask / Overlay
 
 相机模型使用 OpenCV 鱼眼 (等距投影), 参数包括: 相对于 `torso_link` 的外参偏移 (dx, dy, dz, pitch, yaw, roll) 和内参 (fx, fy, cx, cy, k1-k4)。
+
+## hand_state 编码规则（重要）
+
+两种灵巧手的 hand_state（12维，每手6维）**编码方向相反**：
+
+| 手型 | 0.0 | 1.0 | 原因 |
+|------|-----|-----|------|
+| **Inspire RH56DFTP** | 闭合 (closed) | 张开 (open) | 硬件 ANGLE: 0=弯曲, 1000=张开, `hs=angle/1000` |
+| **BrainCo Revo2** | 张开 (open) | 闭合 (closed) | normalize 时多了 `1.0 -` 反转 |
+
+Inspire 手指原始顺序: `[小指, 无名指, 中指, 食指, 拇指闭合, 拇指侧摆]` × 左右，与 BrainCo 不同。
+
+`build_q()` 内部统一处理：先反转 Inspire 方向 (`1-hs`)，再重排两种手型到 URDF 顺序 `[index, middle, ring, little, thumb_c, thumb_t]`。详见 `doc/hand_data_mapping.md`。
+
+## 已知问题
+
+### 手部 Mesh 与数据集不匹配
+
+项目仅有 Inspire FTP 手部 URDF (`g1_29dof_rev_1_0_with_inspire_hand_FTP.urdf`)，但数据集包含两种手型：
+- **Inspire Hand** — 5 个任务，mesh 匹配
+- **BrainCo Hand** — 3 个任务，**无对应 mesh**
+
+当前处理方式：`config.py:get_skip_meshes()` 在 BrainCo 任务时跳过 Inspire 手部 link 的渲染，避免显示错误的手型。关节角度重排在 `video_inpaint.py:build_q()` 中处理。
+
+**待解决**：需从 `unitreerobotics/xr_teleoperate` 集成 BrainCo Revo2 手部 URDF + STL，创建对应 URDF 文件。详见 `doc/hand_data_mapping.md`。
 
 ## 运行示例
 

@@ -27,8 +27,10 @@ sys.stdout.reconfigure(line_buffering=True)
 
 from config import (
     BASE_DIR, G1_URDF, MESH_DIR, BEST_PARAMS, SKIP_MESHES,
-    ACTIVE_DATA_DIR, OUTPUT_DIR, get_hand_type,
+    ACTIVE_DATA_DIR, OUTPUT_DIR, get_hand_type, get_skip_meshes,
+    CAMERA_MODEL,
 )
+from camera_models import get_model, build_K, build_D, model_is_fisheye, project_points_cv
 
 # Aliases for backward compatibility with importers
 URDF_PATH = G1_URDF
@@ -43,13 +45,13 @@ def build_q(model, rq, hand_state=None, hand_type="inspire"):
       rq[7:29]  left leg(6) + right leg(6) + waist(3) + left arm(7)
       rq[29:36] right arm(7)
 
-    hand_state layout (Inspire Dex5, 0=open 1=closed):
-      [0] left index  [1] left middle  [2] left ring  [3] left little
+    hand_state layout (Inspire RH56DFTP, 0=closed 1=open):
+      [0] left little  [1] left ring  [2] left middle  [3] left index
       [4] left thumb close  [5] left thumb tilt
-      [6] right index  [7] right middle  [8] right ring  [9] right little
+      [6] right little  [7] right ring  [8] right middle  [9] right index
       [10] right thumb close  [11] right thumb tilt
 
-    hand_state layout (BrainCo, 0=open 1=closed):
+    hand_state layout (BrainCo Revo2, 0=open 1=closed):
       [0] left thumb close  [1] left thumb tilt
       [2] left index  [3] left middle  [4] left ring  [5] left little
       [6] right thumb close  [7] right thumb tilt
@@ -71,16 +73,27 @@ def build_q(model, rq, hand_state=None, hand_type="inspire"):
     q[41:48] = rq[29:36]  # right arm
 
     if hand_state is not None:
-        hs = hand_state
-        if hand_type == "brainco":
-            # Remap BrainCo -> Inspire layout per hand (6 values each)
-            # BrainCo: [thumb_close, thumb_tilt, index, middle, ring, little]
-            # Inspire: [index, middle, ring, little, thumb_close, thumb_tilt]
-            hs = np.array(hs, dtype=np.float64)
+        hs = np.array(hand_state, dtype=np.float64)
+        if hand_type == "inspire":
+            # Inspire raw: 0=closed, 1=open → invert to 0=open, 1=closed
+            hs = 1.0 - hs
+            # Inspire raw order: [little, ring, middle, index, thumb_c, thumb_t] x2
+            # Remap to URDF order: [index, middle, ring, little, thumb_c, thumb_t] x2
+            hs = np.concatenate([
+                hs[[3, 2, 1, 0, 4, 5]],   # left: index,mid,ring,little,thumb_c,thumb_t
+                hs[[9, 8, 7, 6, 10, 11]],  # right: same reorder
+            ])
+        elif hand_type == "brainco":
+            # BrainCo raw: 0=open, 1=closed (no inversion needed)
+            # BrainCo order: [thumb_close, thumb_tilt, index, middle, ring, little] x2
+            # Remap to URDF order: [index, middle, ring, little, thumb_c, thumb_t] x2
             hs = np.concatenate([
                 hs[2:6], hs[0:2],    # left: index,mid,ring,little,thumb_c,thumb_t
                 hs[8:12], hs[6:8],   # right: same reorder
             ])
+        # After remapping, hs is in unified URDF order (0=open, 1=closed):
+        #   [index, middle, ring, little, thumb_close, thumb_tilt] x2
+        #
         # Finger joint limits: _1 max=1.4381, _2 mimics _1 * 1.0843
         # Thumb: _1 max=1.1641 (tilt), _2 max=0.5864 (close),
         #        _3 mimics _2 * 0.8024, _4 mimics _3 * 0.9487
@@ -205,12 +218,12 @@ def make_camera_const(params):
     R_body_to_cam = np.array([[0, -1, 0], [0, 0, -1], [1, 0, 0]], dtype=np.float64)
     R_cam = R_body_to_cam @ R_roll @ R_yaw @ R_pitch
 
-    K = np.array([[p["fx"], 0, p["cx"]],
-                   [0, p["fy"], p["cy"]],
-                   [0, 0, 1]], dtype=np.float64)
-    D = np.array([p["k1"], p["k2"], p["k3"], p["k4"]], dtype=np.float64).reshape(4, 1)
+    model_cfg = get_model(CAMERA_MODEL)
+    K = build_K(p, model_cfg)
+    D = build_D(p, model_cfg)
+    fisheye = model_is_fisheye(model_cfg)
     offset = np.array([p["dx"], p["dy"], p["dz"]], dtype=np.float64)
-    return {"R_cam": R_cam, "K": K, "D": D, "offset": offset}
+    return {"R_cam": R_cam, "K": K, "D": D, "offset": offset, "fisheye": fisheye}
 
 
 def make_camera(params, transforms, _const=None):
@@ -231,14 +244,15 @@ def make_camera(params, transforms, _const=None):
     R_w2c = (ref_R @ R_cam.T).T
     t_w2c = R_w2c @ (-cam_pos)
 
+    fisheye = _const.get("fisheye", False)
     rvec, _ = cv2.Rodrigues(R_w2c)
     tvec = t_w2c.reshape(3, 1)
-    return K, D, rvec, tvec, R_w2c, t_w2c
+    return K, D, rvec, tvec, R_w2c, t_w2c, fisheye
 
 
 def render_mask_and_overlay(img, mesh_cache, transforms, params, h, w, _cam_const=None):
     """Render both mask and overlay in a single pass (shared FK transform + projection)."""
-    K, D, rvec, tvec, R_w2c, t_w2c = make_camera(params, transforms, _cam_const)
+    K, D, rvec, tvec, R_w2c, t_w2c, _fisheye = make_camera(params, transforms, _cam_const)
     t_w2c_flat = t_w2c.flatten()
 
     # --- Batch all triangle vertices from all links ---
@@ -270,8 +284,8 @@ def render_mask_and_overlay(img, mesh_cache, transforms, params, h, w, _cam_cons
         cam_pts = (R_w2c @ all_world.T).T + t_w2c_flat
         z_all = cam_pts[:, 2]
 
-        pts2d, _ = cv2.fisheye.projectPoints(
-            all_world.reshape(-1, 1, 3), rvec, tvec, K, D)
+        pts2d = project_points_cv(
+            all_world.reshape(-1, 1, 3), rvec, tvec, K, D, _fisheye)
         pts2d = pts2d.reshape(-1, 2)
 
         # Split back by link and filter/draw triangles
@@ -304,8 +318,8 @@ def render_mask_and_overlay(img, mesh_cache, transforms, params, h, w, _cam_cons
         if np.count_nonzero(in_front) < 3:
             continue
 
-        pts2d_ov, _ = cv2.fisheye.projectPoints(
-            verts_f64[in_front].reshape(-1, 1, 3), rvec, tvec, K, D)
+        pts2d_ov = project_points_cv(
+            verts_f64[in_front].reshape(-1, 1, 3), rvec, tvec, K, D, _fisheye)
         pts2d_ov = pts2d_ov.reshape(-1, 2)
         finite = np.all(np.isfinite(pts2d_ov), axis=1)
         pts2d_ov = pts2d_ov[finite]
@@ -330,7 +344,7 @@ def render_mask_and_overlay(img, mesh_cache, transforms, params, h, w, _cam_cons
 
 def render_mask(mesh_cache, transforms, params, h, w):
     """Render per-triangle mask using preloaded meshes."""
-    K, D, rvec, tvec, R_w2c, t_w2c = make_camera(params, transforms)
+    K, D, rvec, tvec, R_w2c, t_w2c, _fisheye = make_camera(params, transforms)
     t_w2c_flat = t_w2c.flatten()
 
     all_world_tris = []
@@ -352,8 +366,8 @@ def render_mask(mesh_cache, transforms, params, h, w):
     cam_pts = (R_w2c @ all_world.T).T + t_w2c_flat
     z_all = cam_pts[:, 2]
 
-    pts2d, _ = cv2.fisheye.projectPoints(
-        all_world.reshape(-1, 1, 3), rvec, tvec, K, D)
+    pts2d = project_points_cv(
+        all_world.reshape(-1, 1, 3), rvec, tvec, K, D, _fisheye)
     pts2d = pts2d.reshape(-1, 2)
 
     offset = 0
@@ -379,7 +393,7 @@ def render_mask(mesh_cache, transforms, params, h, w):
 
 def render_overlay(img, mesh_cache, transforms, params):
     """Semi-transparent convex hull overlay."""
-    K, D, rvec, tvec, R_w2c, t_w2c = make_camera(params, transforms)
+    K, D, rvec, tvec, R_w2c, t_w2c, _fisheye = make_camera(params, transforms)
     overlay = np.zeros_like(img)
     result = img.copy()
 
@@ -395,8 +409,8 @@ def render_overlay(img, mesh_cache, transforms, params):
         if np.count_nonzero(in_front) < 3:
             continue
 
-        pts2d, _ = cv2.fisheye.projectPoints(
-            verts3d[in_front].reshape(-1, 1, 3), rvec, tvec, K, D)
+        pts2d = project_points_cv(
+            verts3d[in_front].reshape(-1, 1, 3), rvec, tvec, K, D, _fisheye)
         pts2d = pts2d.reshape(-1, 2)
         finite = np.all(np.isfinite(pts2d), axis=1)
         pts2d = pts2d[finite]
@@ -497,12 +511,26 @@ def load_episode_info(ep, data_dir=None):
         raise ValueError(f"Episode {ep} not found in meta")
     ep_meta = ep_meta.iloc[0]
 
-    file_idx = int(ep_meta["videos/observation.images.head_stereo_left/file_index"])
-    from_ts = float(ep_meta["videos/observation.images.head_stereo_left/from_timestamp"])
-    to_ts = float(ep_meta["videos/observation.images.head_stereo_left/to_timestamp"])
+    # Auto-detect primary head camera key (varies by dataset variant):
+    #   - regular tasks:   observation.images.head_stereo_left
+    #   - MainCamOnly:     observation.images.cam_0
+    _CAM_KEY_CANDIDATES = ["head_stereo_left", "cam_0"]
+    cam_key = None
+    for cand in _CAM_KEY_CANDIDATES:
+        if f"videos/observation.images.{cand}/file_index" in ep_meta.index:
+            cam_key = cand
+            break
+    if cam_key is None:
+        raise ValueError(
+            f"No known head camera key found in meta for {data_dir}. "
+            f"Tried: {_CAM_KEY_CANDIDATES}")
+
+    file_idx = int(ep_meta[f"videos/observation.images.{cam_key}/file_index"])
+    from_ts = float(ep_meta[f"videos/observation.images.{cam_key}/from_timestamp"])
+    to_ts = float(ep_meta[f"videos/observation.images.{cam_key}/to_timestamp"])
 
     video_path = os.path.join(data_dir, "videos",
-                               "observation.images.head_stereo_left",
+                               f"observation.images.{cam_key}",
                                "chunk-000", f"file-{file_idx:03d}.mp4")
 
     # Load parquet (determine which file)
@@ -563,11 +591,13 @@ def main():
     vid_to_frame = int(round((from_ts + (end_frame - 1) / fps) * fps))
 
     # Load URDF + meshes
-    print("Loading URDF and meshes...")
+    hand_type = get_hand_type()
+    skip_set = get_skip_meshes(hand_type)
+    print(f"Loading URDF and meshes... (hand_type={hand_type})")
     model = pin.buildModelFromUrdf(G1_URDF, pin.JointModelFreeFlyer())
     data_pin = model.createData()
     link_meshes = parse_urdf_meshes(G1_URDF)
-    mesh_cache = preload_meshes(link_meshes, MESH_DIR)
+    mesh_cache = preload_meshes(link_meshes, MESH_DIR, skip_set=skip_set)
     print(f"Loaded {len(mesh_cache)} link meshes")
 
     # Init LaMa
