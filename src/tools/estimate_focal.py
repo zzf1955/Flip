@@ -26,10 +26,9 @@ from scipy import ndimage
 
 sys.stdout.reconfigure(line_buffering=True)
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 from src.core.config import (G1_URDF, MESH_DIR, BEST_PARAMS, SKIP_MESHES,
-                     DATASET_ROOT, OUTPUT_DIR, get_hand_type, get_skip_meshes,
+                     DATASET_ROOT, OUTPUT_DIR, CALIB_5POINT_DIR,
+                     MAIN_ROOT, get_hand_type, get_skip_meshes,
                      CAMERA_MODEL)
 from src.core.camera import get_model, build_K, build_D, model_is_fisheye
 from src.core.fk import (build_q, do_fk, parse_urdf_meshes)
@@ -207,7 +206,7 @@ def main():
     }
 
     for name, info in pso_results.items():
-        fpath = os.path.join(BASE_DIR, info["path"])
+        fpath = os.path.join(MAIN_ROOT, info["path"])
         if os.path.exists(fpath):
             with open(fpath) as f:
                 d = json.load(f)
@@ -263,7 +262,7 @@ def main():
     ]
 
     # Load full manifest with all 6 frames
-    manifest_path = os.path.join(BASE_DIR, "data/5point/manifest.json")
+    manifest_path = os.path.join(CALIB_5POINT_DIR, "manifest.json")
     with open(manifest_path) as f:
         manifest = json.load(f)
 

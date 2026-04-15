@@ -16,9 +16,9 @@ import pinocchio as pin
 
 sys.stdout.reconfigure(line_buffering=True)
 
-MESH_DIR = "/disk_n/zzf/flip/data/unitree_G1_WBT/mesh/meshes"
-URDF_PATH = "/disk_n/zzf/flip/data/unitree_G1_WBT/mesh/g1_29dof_rev_1_0_with_inspire_hand_FTP.urdf"
-URDF_DIR = "/disk_n/zzf/flip/data/unitree_G1_WBT/mesh"
+from src.core.config import MESH_DIR, G1_URDF as URDF_PATH, DATA_ROOT
+
+URDF_DIR = os.path.join(DATA_ROOT, "unitree_G1_WBT", "mesh")
 
 # ============================================================
 # Part 1: STL Bounding Box 分析
