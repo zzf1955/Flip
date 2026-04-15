@@ -57,3 +57,6 @@ output/
 weights/
 ProPainter/
 ref-cosmos-transfer1/
+
+# === 含敏感 token 的本地配置 ===
+notion_mcp_config.json
