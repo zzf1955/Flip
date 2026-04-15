@@ -2,21 +2,46 @@
 
 Edit ACTIVE_TASK and ACTIVE_EPISODES to control which data subset
 scripts process during small-scale testing.
+
+Path conventions (worktree-aware):
+- MAIN_ROOT points to the canonical main workspace. All read-only shared
+  resources (data, weights, third-party reference code) live there and are
+  accessed via absolute paths so worktrees don't duplicate them.
+- BASE_DIR points to the *current* workspace (main or a worktree) and is
+  used only for per-worktree writable outputs (OUTPUT_DIR).
+- Override MAIN_ROOT via the FLIP_MAIN_ROOT environment variable.
 """
 
 import os
 
-# Project root (two levels up from src/core/)
+# ── Current workspace root (main or worktree, derived from __file__) ──
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# ── Mesh / URDF paths ──
-_MESH_ROOT = os.path.join(BASE_DIR, "data", "unitree_G1_WBT", "mesh")
+# ── Canonical main workspace (shared across worktrees) ──
+MAIN_ROOT = os.environ.get("FLIP_MAIN_ROOT", "/disk_n/zzf/flip")
+
+# ── Shared read-only roots (absolute, point to MAIN_ROOT) ──
+DATA_ROOT = os.path.join(MAIN_ROOT, "data")
+WEIGHTS_ROOT = os.path.join(MAIN_ROOT, "weights")
+COSMOS1_ROOT = os.path.join(MAIN_ROOT, "ref-cosmos-transfer1")
+COSMOS25_ROOT = os.path.join(MAIN_ROOT, "ref-cosmos-transfer2.5")
+PROPAINTER_ROOT = os.path.join(MAIN_ROOT, "ProPainter")
+
+if not os.path.isdir(DATA_ROOT):
+    raise RuntimeError(
+        f"DATA_ROOT not found: {DATA_ROOT}\n"
+        f"Set FLIP_MAIN_ROOT to the main workspace path, or check that "
+        f"{MAIN_ROOT}/data exists."
+    )
+
+# ── Mesh / URDF paths (under shared DATA_ROOT) ──
+_MESH_ROOT = os.path.join(DATA_ROOT, "unitree_G1_WBT", "mesh")
 MESH_DIR = os.path.join(_MESH_ROOT, "meshes")
 G1_URDF = os.path.join(_MESH_ROOT,
                        "g1_29dof_rev_1_0_with_inspire_hand_FTP.urdf")
 HUMAN_URDF = os.path.join(_MESH_ROOT, "human_arm_overlay.urdf")
 
-# ── SMPLH model path ──
+# ── SMPLH model path (external, outside the repo) ──
 SMPLH_PATH = (
     "/disk_n/zzf/video-gen/MIMO/video_decomp/"
     "models--menyifang--MIMO_VidDecomp/snapshots/"
@@ -24,7 +49,12 @@ SMPLH_PATH = (
 )
 
 # ── Dataset root (LeRobot format, downloaded via download_g1_wbt.sh) ──
-DATASET_ROOT = os.path.join(BASE_DIR, "data", "unitree_G1_WBT")
+DATASET_ROOT = os.path.join(DATA_ROOT, "unitree_G1_WBT")
+
+# ── Calibration manifests (under shared DATA_ROOT) ──
+CALIB_5POINT_DIR = os.path.join(DATA_ROOT, "5point")
+CALIB_4POINT_DIR = os.path.join(DATA_ROOT, "4points")
+CALIB_MASK_DIR = os.path.join(DATA_ROOT, "mask")
 
 # ── Active task + episodes for small-scale testing ──
 # Change these when switching tasks. Scripts read ACTIVE_TASK / ACTIVE_EPISODES.
@@ -96,5 +126,7 @@ def get_skip_meshes(hand_type=None):
     return SKIP_MESHES
 
 
-# ── Output ──
+# ── Output (per-worktree writable products, NOT shared) ──
+# Intentionally uses BASE_DIR (current workspace) so different worktrees
+# don't overwrite each other's experiment results.
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
