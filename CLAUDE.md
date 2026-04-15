@@ -2,7 +2,9 @@
 
 用中文回答
 
-除非用户要求，否则不要直接看看视频和图片。简单的视觉任务请使用 python 代码操作，而不是直接看
+除非用户要求，否则不要直接看看视频和图片。简单的视觉任务请使用 python 代码操作，而不是直接看图片和视频。
+
+Notion MCP (`mcp__notion__API-*`) 是 Notion REST API 的透传，ToolSearch 返回的 schema 不必严格遵守；按 Notion 官方 API 的参数结构调用即可。
 
 ## 项目概述
 
@@ -10,7 +12,17 @@ FLIP: Flipped-Direction Learning via Inpainting Pipeline for Cross-Embodiment Vi
 
 第一人称人形机器人视频生成研究项目。核心思路是**反向数据构造**：在真实机器人视频上合成人体，得到（合成human, 真实robot）配对数据，用于微调 video-to-video 模型（Wan 2.1 + LoRA）。目标机器人为宇树 G1。
 
-当前阶段聚焦于 **FK Mesh 渲染 → SAM2 分割 → LaMa 修复**，以及**人体叠加**。
+### Pipeline 概览
+
+```
+G1 第一人称视频 + 关节编码器数据
+  │
+  ├─ Step 1  Pose 获取：精确本体感知 ✓
+  ├─ Step 2  Robot 分割+去除：FK → Mesh → SAM2 mask → 背景 inpaint ✓
+  ├─ Step 3  运动学映射：Robot → Human pose (关节拷贝 + IK 微调) ✓
+  ├─ Step 4  Human 渲染：SMPLH mesh → ControlNet 重绘 (进行中)
+  └─ Step 5  (合成 human, 真实 robot) → Wan 2.1 + LoRA
+```
 
 ## 环境
 
@@ -25,7 +37,7 @@ FLIP: Flipped-Direction Learning via Inpainting Pipeline for Cross-Embodiment Vi
 ```bash
 LD_PRELOAD=/home/leadtek/miniconda3/envs/flip/lib/libjpeg.so.8 \
   no_proxy=localhost,127.0.0.1 \
-  python scripts/<script>.py
+  python -m src.pipeline.<script>
 ```
 
 ### 网络 / 代理
@@ -49,59 +61,126 @@ LD_PRELOAD=/home/leadtek/miniconda3/envs/flip/lib/libjpeg.so.8 \
 
 - **pinocchio** -- URDF + 正向运动学
 - **numpy-stl** (`stl.mesh`) -- STL mesh 加载
-- **OpenCV** (`cv2`) -- 图像处理、鱼眼投影
+- **OpenCV** (`cv2`) -- 图像处理、投影
 - **pandas** -- parquet (LeRobot 数据集格式)
 - **PyAV** (`av`) -- 视频帧提取
 - **sam2** -- SAM2 视频分割
 - **simple_lama_inpainting** -- LaMa 修复
+- **torch** -- SMPLH IK 求解、可微标定
 
-## 项目结构
+## 代码结构
 
-### 核心脚本 (scripts/)
+### 目录布局
 
-| 脚本 | 功能 |
-|------|------|
-| `config.py` | 集中配置: 路径、相机参数、活跃任务/episodes |
-| `video_inpaint.py` | 核心工具模块: FK、渲染、mask、LaMa、视频 IO |
-| `sam2_inpaint_pipeline.py` | **主 pipeline**: FK -> SAM2 box prompt -> LaMa inpaint |
-| `sam2_segment.py` | SAM2 分割实验 (box/point 模式) |
-| `render_human_overlay.py` | 人手 mesh 叠加渲染 |
-| `generate_human_meshes.py` | 人手 STL capsule 生成 |
-| `auto_calibrate.py` | PSO 相机自动标定 (已完成, IoU=0.8970) |
-| `interactive_calibrate.py` | GUI 交互标定 (需要显示器) |
-| `download_g1_wbt.sh` | 数据集批量下载 (hf-mirror) |
-| `inspect_g1_datasets.py` | 数据集统计检查 |
+```
+src/
+├── core/                    # 基础库模块（不可直接运行）
+│   ├── config.py            # 集中配置：路径、相机参数、任务选择
+│   ├── data.py              # 数据加载：episode/parquet + 视频 IO
+│   ├── camera.py            # 相机模型 + OpenCV 投影 + make_camera
+│   ├── fk.py                # URDF/mesh 加载 + build_q + FK
+│   ├── render.py            # mask/overlay/Lambertian 渲染
+│   ├── mask.py              # mask 后处理 + LaMa/GrabCut
+│   ├── smplh.py             # SMPLH 模型 + IK 求解器
+│   └── retarget.py          # G1→SMPLH retarget 算法
+│
+├── pipeline/                # 可执行主 pipeline
+│   ├── sam2_inpaint.py      # FK → SAM2 → LaMa/ProPainter（主入口）
+│   ├── sam2_segment.py      # SAM2 多部位分割实验
+│   ├── batch_inpaint.py     # 多 GPU 批量调度
+│   ├── video_inpaint.py     # 逐帧 FK + GrabCut + LaMa
+│   └── retarget_video.py    # retarget 3-panel 视频渲染
+│
+└── tools/                   # 实验/调试/可视化工具
+    ├── calibrate_mask.py    # PSO mask Dice 标定
+    ├── calibrate_keypoints.py  # PSO/Adam 关键点标定
+    ├── estimate_focal.py    # 焦距解析估计
+    ├── distortion_analysis.py  # 畸变分析
+    ├── verify_extrinsics.py # URDF 外参验证
+    ├── verify_mesh.py       # STL/URDF 尺寸验证
+    ├── render_3view.py      # G1 三视图渲染
+    ├── render_overlay_check.py  # 多视频 overlay 泛化验证
+    ├── render_lit_overlay.py   # Lambertian overlay
+    ├── render_smplh_ik.py   # SMPLH IK overlay
+    ├── render_ik_debug.py   # 第三人称 IK 调试
+    ├── debug_keypoints.py   # 关键点可视化
+    ├── debug_retarget.py    # retarget 误差可视化
+    ├── retarget_diag.py     # retarget 9宫格诊断
+    ├── demo_mesh_scale.py   # mesh 缩放对比
+    └── svg2gif.py           # SVG→GIF 转换
+```
+
+旧代码保留在 `scripts/`（已归档，不再使用）。
+
+### 依赖关系
+
+```
+core/config.py
+  ├── core/data.py          (episode 加载, 视频 IO)
+  ├── core/camera.py        (相机模型, 投影, make_camera)
+  ├── core/fk.py            (URDF, mesh, build_q, do_fk)
+  ├── core/render.py        (mask, overlay, Lambertian)
+  ├── core/mask.py          (后处理, LaMa)
+  ├── core/smplh.py         (SMPLH + IK)
+  └── core/retarget.py      (G1→SMPLH 映射)
+```
 
 ### 配置切换
 
-编辑 `scripts/config.py` 中的 `ACTIVE_TASK` 和 `ACTIVE_EPISODES`。
+编辑 `src/core/config.py` 中的 `ACTIVE_TASK` 和 `ACTIVE_EPISODES`。
 
-### 数据布局
+## 输出目录规范
+
+所有实验输出到 `output/<stage>/<exp_name>/`：
+
+```
+output/
+├── calibration/             # 相机标定
+│   ├── kp_4points/          # 4关键点 PSO
+│   ├── kp_5points/          # 5关键点 PSO
+│   └── mask_dice/           # mask Dice PSO
+├── inpaint/                 # 修复 pipeline
+│   ├── sam2_propainter/     # SAM2 + ProPainter
+│   └── sam2_segment/        # SAM2 分割
+├── human/                   # 人体 retarget
+│   ├── retarget_video/      # 3-panel 视频
+│   ├── retarget_diag/       # 9宫格诊断
+│   ├── smplh_ik/            # IK overlay
+│   ├── ik_debug/            # 第三人称调试
+│   └── debug_retarget/      # 误差可视化
+└── tmp/                     # 一次性验证
+    ├── 3view/               # G1 三视图
+    ├── distortion/          # 畸变分析
+    ├── mesh_scale/          # mesh 缩放
+    └── urdf_verify/         # URDF 外参
+```
+
+## 数据布局
 
 ```
 data/
 ├── mesh/                              # URDF + STL
 │   ├── g1_29dof_rev_1_0_with_inspire_hand_FTP.urdf
 │   ├── human_arm_overlay.urdf
-│   └── meshes/                        # STL files (51+)
+│   └── meshes/                        # STL files (91+)
 └── unitree_G1_WBT/                    # 8 个 LeRobot 格式任务数据集
     └── <task_name>/
-        ├── meta/episodes/chunk-000/   # episode -> 视频文件映射
+        ├── meta/episodes/chunk-000/   # episode → 视频文件映射
         ├── data/chunk-000/            # parquet (关节状态 30Hz)
         └── videos/observation.images.head_stereo_left/
-            └── chunk-000/             # MP4 视频 640x480@30fps
+            └── chunk-000/             # MP4 视频 640x480@30fps（原始，勿用 16fps）
 ```
 
-## 代码架构
+**注意**：`videos_16fps/` 目录的降采样视频与 parquet state 的帧对应关系**全是错的**，所有脚本仅使用原始 30fps 视频。
 
-各脚本共享同一模式:
-1. `pinocchio.buildModelFromUrdf` 加载 URDF + 加载各 link 的 STL Mesh
-2. 从 parquet 读取目标帧的关节角度 (29 DOF body + 12 DOF hands)
-3. 正向运动学 (`pin.forwardKinematics` + `pin.updateFramePlacements`) 得到各 link 位姿
-4. 将 Mesh 顶点变换到世界坐标系，通过鱼眼相机模型投影到图像
-5. 在视频帧上渲染 Mask / Overlay
+## 相机模型
 
-相机模型使用 OpenCV 鱼眼 (等距投影), 参数包括: 相对于 `torso_link` 的外参偏移 (dx, dy, dz, pitch, yaw, roll) 和内参 (fx, fy, cx, cy, k1-k4)。
+使用 pinhole 模型（畸变已确认可忽略，k1-k4=0）。头部相机为外置 UVC 双目 RGB（非 D435i），125° FOV。
+
+当前最优参数（`config.py:BEST_PARAMS_BY_MODEL`）：
+- 外参：dx=0.0758, dy=0.0226, dz=0.4484, pitch=-61.59°, yaw=2.17°, roll=0.23°
+- 内参：fx=290.78, fy=287.35, cx≈320, cy≈314
+- 模型选择：`CAMERA_MODEL = "pinhole_fixed"`（7参数，固定 fx/fy/cx）
 
 ## hand_state 编码规则（重要）
 
@@ -109,36 +188,43 @@ data/
 
 | 手型 | 0.0 | 1.0 | 原因 |
 |------|-----|-----|------|
-| **Inspire RH56DFTP** | 闭合 (closed) | 张开 (open) | 硬件 ANGLE: 0=弯曲, 1000=张开, `hs=angle/1000` |
+| **Inspire RH56DFTP** | 闭合 (closed) | 张开 (open) | 硬件 ANGLE: 0=弯曲, 1000=张开 |
 | **BrainCo Revo2** | 张开 (open) | 闭合 (closed) | normalize 时多了 `1.0 -` 反转 |
 
-Inspire 手指原始顺序: `[小指, 无名指, 中指, 食指, 拇指闭合, 拇指侧摆]` × 左右，与 BrainCo 不同。
-
-`build_q()` 内部统一处理：先反转 Inspire 方向 (`1-hs`)，再重排两种手型到 URDF 顺序 `[index, middle, ring, little, thumb_c, thumb_t]`。详见 `doc/hand_data_mapping.md`。
+`core/fk.py:build_q()` 内部统一处理。详见 `doc/hand_data_mapping.md`。
 
 ## 已知问题
 
 ### 手部 Mesh 与数据集不匹配
 
-项目仅有 Inspire FTP 手部 URDF (`g1_29dof_rev_1_0_with_inspire_hand_FTP.urdf`)，但数据集包含两种手型：
-- **Inspire Hand** — 5 个任务，mesh 匹配
-- **BrainCo Hand** — 3 个任务，**无对应 mesh**
-
-当前处理方式：`config.py:get_skip_meshes()` 在 BrainCo 任务时跳过 Inspire 手部 link 的渲染，避免显示错误的手型。关节角度重排在 `video_inpaint.py:build_q()` 中处理。
-
-**待解决**：需从 `unitreerobotics/xr_teleoperate` 集成 BrainCo Revo2 手部 URDF + STL，创建对应 URDF 文件。详见 `doc/hand_data_mapping.md`。
+仅有 Inspire 手部 URDF，BrainCo 任务跳过手部渲染（`config.py:get_skip_meshes()`）。
+**待解决**：集成 BrainCo Revo2 URDF + STL。
 
 ## 运行示例
 
 ```bash
-# 主 pipeline (FK -> SAM2 -> LaMa)
-python scripts/sam2_inpaint_pipeline.py --episode 4 --start 5 --duration 5
+# 主 pipeline (FK → SAM2 → LaMa，5秒)
+python -m src.pipeline.sam2_inpaint --episode 0 --start 5 --duration 5 \
+  --task G1_WBT_Inspire_Pickup_Pillow_MainCamOnly --device cuda:1
 
 # SAM2 分割实验
-python scripts/sam2_segment.py --episode 4 --start 5 --duration 5 --mode box
+python -m src.pipeline.sam2_segment --episode 0 --start 5 --duration 5 --mode box
 
-# 人手叠加
-python scripts/render_human_overlay.py --episode 0 --frame 30 --side-by-side
+# 多 GPU 批量修复
+python -m src.pipeline.batch_inpaint --tasks G1_WBT_Inspire_Pickup_Pillow_MainCamOnly \
+  G1_WBT_Inspire_Put_Clothes_Into_Basket --gpus 1 2 3 --output-root output/inpaint/v1
+
+# Retarget 视频（3-panel：原始 | G1 | SMPLH）
+python -m src.pipeline.retarget_video --task G1_WBT_Inspire_Pickup_Pillow_MainCamOnly \
+  --episode 0 --duration 5 --device cuda:2
+
+# 相机标定（4关键点 PSO）
+python -m src.tools.calibrate_keypoints --optimizer pso --keypoints L_thumb,L_toe,R_toe,R_thumb \
+  --output-dir output/calibration/kp_4points
+
+# retarget 诊断（单帧 9宫格）
+python -m src.tools.retarget_diag --episode 0 --frame 30 \
+  --task G1_WBT_Inspire_Pickup_Pillow_MainCamOnly --device cuda:2
 ```
 
-输出到 `test_results/`。
+输出到 `output/<stage>/<exp_name>/`。
