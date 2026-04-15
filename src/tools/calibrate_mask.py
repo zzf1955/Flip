@@ -24,8 +24,9 @@ import pinocchio as pin
 sys.stdout.reconfigure(line_buffering=True)
 
 from src.core.config import (
-    BASE_DIR, G1_URDF, MESH_DIR, BEST_PARAMS_BY_MODEL, CAMERA_MODEL,
-    DATASET_ROOT, OUTPUT_DIR, get_hand_type, get_skip_meshes,
+    G1_URDF, MESH_DIR, BEST_PARAMS_BY_MODEL, CAMERA_MODEL,
+    DATASET_ROOT, OUTPUT_DIR, CALIB_MASK_DIR,
+    get_hand_type, get_skip_meshes,
 )
 from src.core.camera import get_model, build_K, build_D, model_is_fisheye
 from src.core.fk import (
@@ -39,7 +40,7 @@ import src.core.camera as video_inpaint_camera
 TASK_NAME = "G1_WBT_Inspire_Put_Clothes_into_Washing_Machine_MainCamOnly"
 CAMERA_NAME = "observation.images.cam_0"
 GT_MASK_PATH = os.path.join(
-    BASE_DIR, "data", "mask",
+    CALIB_MASK_DIR,
     "G1_WBT_Inspire_Put_Clothes_into_Washing_Machine_f001.png",
 )
 EPISODE = 0

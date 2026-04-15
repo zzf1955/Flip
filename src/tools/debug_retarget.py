@@ -31,7 +31,8 @@ import av
 sys.stdout.reconfigure(line_buffering=True)
 
 from src.core.config import (G1_URDF, MESH_DIR, DATASET_ROOT, OUTPUT_DIR,
-                    BEST_PARAMS, CAMERA_MODEL, get_hand_type, get_skip_meshes)
+                    BEST_PARAMS, CAMERA_MODEL, MAIN_ROOT,
+                    get_hand_type, get_skip_meshes)
 from src.core.fk import (build_q, do_fk, parse_urdf_meshes, preload_meshes)
 from src.core.camera import make_camera, make_camera_const, project_points_cv
 from src.core.smplh import SMPLHForIK, extract_g1_targets, R_SMPLH_TO_G1_NP
@@ -190,8 +191,10 @@ def main():
     ap.add_argument("--device", type=str, default="cpu")
     args = ap.parse_args()
 
-    png_name = os.path.basename(args.png)
-    entry = lookup_manifest(args.manifest, png_name)
+    png_path = args.png if os.path.isabs(args.png) else os.path.join(MAIN_ROOT, args.png)
+    manifest_path = args.manifest if os.path.isabs(args.manifest) else os.path.join(MAIN_ROOT, args.manifest)
+    png_name = os.path.basename(png_path)
+    entry = lookup_manifest(manifest_path, png_name)
     task = entry["task"]
     episode = int(entry["episode"])
     frame_idx = int(entry["frame"])
@@ -200,7 +203,7 @@ def main():
     hand_type = get_hand_type(task)
 
     # ── Detect annotated points ──
-    annotated = [np.array(pt, dtype=np.float64) for pt in detect_keypoints_from_alpha(args.png)]
+    annotated = [np.array(pt, dtype=np.float64) for pt in detect_keypoints_from_alpha(png_path)]
     print(f"  detected annotation px (L→R by X):")
     for name, pt in zip(KP_NAMES, annotated):
         print(f"    {name:8s}  ({pt[0]:7.1f}, {pt[1]:7.1f})")

@@ -28,10 +28,9 @@ import torch.nn as nn
 
 sys.stdout.reconfigure(line_buffering=True)
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 from src.core.config import (G1_URDF, MESH_DIR, BEST_PARAMS, SKIP_MESHES,
-                     DATASET_ROOT, OUTPUT_DIR, get_hand_type, get_skip_meshes,
+                     DATASET_ROOT, OUTPUT_DIR, MAIN_ROOT,
+                     get_hand_type, get_skip_meshes,
                      CAMERA_MODEL)
 from src.core.camera import get_model, model_is_fisheye, project_points_cv
 from src.core.fk import (build_q, do_fk, parse_urdf_meshes, preload_meshes)
@@ -1041,7 +1040,7 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
 
     # ── Load manifest ──
-    manifest_path = os.path.join(BASE_DIR, args.manifest)
+    manifest_path = os.path.join(MAIN_ROOT, args.manifest)
     with open(manifest_path) as f:
         manifest = json.load(f)
 

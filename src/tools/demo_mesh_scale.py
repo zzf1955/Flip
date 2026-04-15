@@ -9,9 +9,7 @@ import os, json
 import numpy as np
 import cv2
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from src.core.config import G1_URDF, MESH_DIR, SKIP_MESHES, DATASET_ROOT, OUTPUT_DIR, get_hand_type
+from src.core.config import G1_URDF, MESH_DIR, SKIP_MESHES, DATASET_ROOT, OUTPUT_DIR, CALIB_5POINT_DIR, get_hand_type
 from src.core.camera import project_points_cv
 from src.core.fk import build_q, do_fk, parse_urdf_meshes, preload_meshes
 from src.core.camera import make_camera
@@ -122,7 +120,7 @@ def main():
     print(f"Loaded params from {params_path}")
 
     # Load manifest for frame info
-    manifest_path = os.path.join(BASE_DIR, "data/5point/manifest_pillow.json")
+    manifest_path = os.path.join(CALIB_5POINT_DIR, "manifest_pillow.json")
     with open(manifest_path) as f:
         manifest = json.load(f)
     # Use f090 (second frame: frame 164)
@@ -132,7 +130,7 @@ def main():
     print(f"Frame: task={task}, ep={episode}, frame={frame_idx}, img={img_name}")
 
     # Load image
-    img_path = os.path.join(BASE_DIR, "data/5point", img_name)
+    img_path = os.path.join(CALIB_5POINT_DIR, img_name)
     img_bgr = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
     if img_bgr.shape[2] == 4:
         img_bgr = img_bgr[:, :, :3]

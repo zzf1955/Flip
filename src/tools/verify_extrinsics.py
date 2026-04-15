@@ -16,8 +16,6 @@ from scipy.spatial.transform import Rotation
 
 np.set_printoptions(precision=6, suppress=True)
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 from src.core.config import (G1_URDF, MESH_DIR, BEST_PARAMS, DATASET_ROOT,
                      OUTPUT_DIR, get_hand_type, get_skip_meshes, CAMERA_MODEL)
 from src.core.camera import get_model, build_K, build_D, model_is_fisheye, project_points_cv
