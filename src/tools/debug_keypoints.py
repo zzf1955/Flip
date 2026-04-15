@@ -23,10 +23,9 @@ from stl import mesh as stl_mesh
 from scipy import ndimage
 
 sys.stdout.reconfigure(line_buffering=True)
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.core.config import (G1_URDF, MESH_DIR, SKIP_MESHES, BEST_PARAMS, DATASET_ROOT,
-                     OUTPUT_DIR, get_hand_type, get_skip_meshes)
+                     OUTPUT_DIR, MAIN_ROOT, get_hand_type, get_skip_meshes)
 from src.core.fk import build_q, do_fk, parse_urdf_meshes
 from src.core.camera import make_camera
 
@@ -673,7 +672,7 @@ def main():
                           model, data_pin, link_meshes, out_dir)
         return
 
-    manifest_path = os.path.join(BASE_DIR, args.manifest)
+    manifest_path = os.path.join(MAIN_ROOT, args.manifest)
     with open(manifest_path) as f:
         manifest = json.load(f)
     frames = manifest["frames"]

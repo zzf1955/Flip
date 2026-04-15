@@ -129,6 +129,48 @@ core/config.py
 
 编辑 `src/core/config.py` 中的 `ACTIVE_TASK` 和 `ACTIVE_EPISODES`。
 
+## 路径规范（worktree 兼容）
+
+本仓库使用 git worktree 并行开发多个分支，大目录（数据集、权重、第三方参考代码）体量 ~109 GB，**必须共享指向 main 工作区**，不能在每个 worktree 里各自复制。
+
+### 目录归属
+
+| 类别 | 目录 | 规范 |
+|------|------|------|
+| **共享只读**（绝对路径指向 main） | `data/`、`weights/`、`ref-cosmos-transfer1/`、`ref-cosmos-transfer2.5/`、`ProPainter/` | 全部经 `config.*_ROOT` 访问，所有 worktree 共用一份 |
+| **per-worktree 可写** | `output/` | 用 `config.OUTPUT_DIR`（基于 `BASE_DIR`），每个 worktree 独立，避免实验产物互相覆盖 |
+| **仓库内追踪** | `src/`、`doc/`、`scripts/`、`paper/`、`CLAUDE.md` 等 | git 正常管理，worktree 各自 checkout |
+
+### config.py 常量
+
+所有涉及上述大目录的路径**必须**通过 `src/core/config.py` 的常量访问：
+
+```python
+from src.core.config import (
+    MAIN_ROOT,          # /disk_n/zzf/flip （main 工作区根）
+    DATA_ROOT,          # MAIN_ROOT/data
+    DATASET_ROOT,       # DATA_ROOT/unitree_G1_WBT
+    MESH_DIR, G1_URDF,  # DATA_ROOT/unitree_G1_WBT/mesh/...
+    CALIB_4POINT_DIR,   # DATA_ROOT/4points
+    CALIB_5POINT_DIR,   # DATA_ROOT/5point
+    CALIB_MASK_DIR,     # DATA_ROOT/mask
+    WEIGHTS_ROOT,       # MAIN_ROOT/weights
+    PROPAINTER_ROOT,    # MAIN_ROOT/ProPainter
+    COSMOS1_ROOT,       # MAIN_ROOT/ref-cosmos-transfer1
+    COSMOS25_ROOT,      # MAIN_ROOT/ref-cosmos-transfer2.5
+    OUTPUT_DIR,         # BASE_DIR/output (per-worktree)
+)
+```
+
+### 硬规则
+
+- **禁止** 在脚本里写 `os.path.join(BASE_DIR, "data", ...)` 或 `os.path.join(BASE_DIR, "ProPainter", ...)` 之类基于当前 workspace 拼 data/weights/ProPainter 的路径——在 worktree 下一定是空的。
+- **禁止** 把绝对路径 `/disk_n/zzf/flip/data/...` 直接写死在脚本里；改走 `config.DATA_ROOT`。
+- **禁止** 把实验产物写到 `MAIN_ROOT` 或 `DATA_ROOT` 下；产物永远写 `OUTPUT_DIR`。
+- 用户通过 `--manifest` 等参数传的**相对路径**，脚本内应用 `os.path.join(MAIN_ROOT, args.manifest)` 解析（`os.path.join` 对绝对路径会自动透传）。
+- 搬机器或临时切换 main 位置时，设置环境变量 `FLIP_MAIN_ROOT=/new/path`；config 会覆盖默认的 `/disk_n/zzf/flip`。
+- config 在 import 时会检查 `DATA_ROOT` 是否可达，不可达则直接 `RuntimeError` 带提示——这是规范落地的守门员。
+
 ## 输出目录规范
 
 所有实验输出到 `output/<stage>/<exp_name>/`：

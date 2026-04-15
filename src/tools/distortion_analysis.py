@@ -12,15 +12,14 @@ import os
 import sys
 
 # ── Paths ──
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from src.core.config import OUTPUT_DIR
+from src.core.config import OUTPUT_DIR, DATASET_ROOT
 DIST_DIR = os.path.join(OUTPUT_DIR, "tmp", "distortion")
 os.makedirs(DIST_DIR, exist_ok=True)
 
 # Try head_stereo_left first (Brainco), fallback to cam_0 (Inspire)
 VIDEO_CANDIDATES = [
-    os.path.join(BASE_DIR, "data/unitree_G1_WBT/G1_WBT_Brainco_Pickup_Pillow/videos/observation.images.head_stereo_left/chunk-000/file-000.mp4"),
-    os.path.join(BASE_DIR, "data/unitree_G1_WBT/G1_WBT_Inspire_Pickup_Pillow_MainCamOnly/videos/observation.images.cam_0/chunk-000/file-000.mp4"),
+    os.path.join(DATASET_ROOT, "G1_WBT_Brainco_Pickup_Pillow/videos/observation.images.head_stereo_left/chunk-000/file-000.mp4"),
+    os.path.join(DATASET_ROOT, "G1_WBT_Inspire_Pickup_Pillow_MainCamOnly/videos/observation.images.cam_0/chunk-000/file-000.mp4"),
 ]
 
 FRAME_IDX = 100
