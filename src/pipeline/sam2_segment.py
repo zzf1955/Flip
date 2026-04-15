@@ -27,8 +27,6 @@ import torch
 
 sys.stdout.reconfigure(line_buffering=True)
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 from src.core.config import G1_URDF, MESH_DIR, BEST_PARAMS, SKIP_MESHES, OUTPUT_DIR, get_hand_type, get_skip_meshes
 from src.core.camera import project_points_cv, make_camera
 from src.core.fk import build_q, do_fk, parse_urdf_meshes, preload_meshes

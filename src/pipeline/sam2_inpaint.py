@@ -30,9 +30,7 @@ import torch
 
 sys.stdout.reconfigure(line_buffering=True)
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from src.core.config import G1_URDF, MESH_DIR, BEST_PARAMS, CAMERA_MODEL, SKIP_MESHES, OUTPUT_DIR, get_hand_type, get_skip_meshes
+from src.core.config import G1_URDF, MESH_DIR, BEST_PARAMS, CAMERA_MODEL, SKIP_MESHES, OUTPUT_DIR, PROPAINTER_ROOT, get_hand_type, get_skip_meshes
 from src.core.camera import project_points_cv, make_camera, make_camera_const
 from src.core.fk import build_q, do_fk, parse_urdf_meshes, preload_meshes
 from src.core.render import render_mask, render_overlay, render_mask_and_overlay
@@ -463,7 +461,7 @@ def main():
 
     if inpaint_method == "propainter":
         import subprocess
-        propainter_dir = os.path.join(BASE_DIR, "ProPainter")
+        propainter_dir = PROPAINTER_ROOT
 
         # ProPainter loads all frames to GPU at once → OOM on long videos.
         # Split into segments of max_seg frames with overlap for blending.
