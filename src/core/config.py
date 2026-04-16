@@ -134,3 +134,7 @@ OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 # ── Cosmos pipeline output subdirectories ──
 COSMOS_PREPARE_DIR = os.path.join(OUTPUT_DIR, "human", "cosmos_prepare")
 COSMOS_REGEN_DIR = os.path.join(OUTPUT_DIR, "human", "cosmos_regen")
+
+# ── ComfyUI / Wan 2.1 ──
+COMFYUI_ROOT = "/disk_n/zzf/ComfyUI"
+WAN_REGEN_DIR = os.path.join(OUTPUT_DIR, "human", "wan_regen")
