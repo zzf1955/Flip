@@ -216,6 +216,61 @@ def render_mask_and_overlay(img, mesh_cache, transforms, params, h, w,
 SKIN_COLOR = (135, 165, 215)  # BGR: warm skin tone
 
 
+def render_smplh_mask(img_shape, v_world, faces, g1_transforms, params,
+                      cam_const=None):
+    """Render binary mask of SMPLH mesh projection.
+
+    Args:
+        img_shape: (h, w) or (h, w, c) — only h, w are used
+        v_world: (V, 3) vertex positions in world frame
+        faces: (F, 3) triangle face indices
+        g1_transforms: FK transforms dict (for camera)
+        params: camera parameter dict
+        cam_const: precomputed camera constants
+
+    Returns:
+        mask: (h, w) uint8, 255=human body
+    """
+    K, D, rvec, tvec, R_w2c, t_w2c, fisheye = make_camera(
+        params, g1_transforms, cam_const)
+    h, w = img_shape[:2]
+
+    tri_verts = v_world[faces]  # (F, 3, 3)
+    flat = tri_verts.reshape(-1, 3).astype(np.float64)
+
+    cam_pts = (R_w2c @ flat.T).T + t_w2c.flatten()
+    z_cam = cam_pts[:, 2]
+
+    pts2d = project_points_cv(
+        flat.reshape(-1, 1, 3), rvec, tvec, K, D, fisheye)
+    pts2d = pts2d.reshape(-1, 2)
+
+    n_tri = len(faces)
+    z_tri = z_cam.reshape(n_tri, 3)
+    pts_tri = pts2d.reshape(n_tri, 3, 2)
+
+    valid = (z_tri > 0.01).all(axis=1)
+    finite = np.all(np.isfinite(pts_tri), axis=(1, 2))
+    vis_mask = valid & finite
+
+    mask = np.zeros((h, w), dtype=np.uint8)
+    if vis_mask.sum() == 0:
+        return mask
+
+    pts_vis = pts_tri[vis_mask].astype(np.int32)
+    cv2.fillPoly(mask, pts_vis, 255)
+
+    # Close gaps between triangles (integer rounding artefacts)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    # Flood-fill to solidify: fill all contours
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(mask, contours, -1, 255, cv2.FILLED)
+
+    return mask
+
+
 def render_mesh_on_image(img, v_world, faces, g1_transforms, params,
                          color=SKIN_COLOR, cam_const=None):
     """Render triangle mesh onto image with Lambertian shading.
