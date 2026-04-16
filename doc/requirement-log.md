@@ -14,3 +14,17 @@
 
 **创建的任务：**
 - [001] 统一 data/权重/参考大目录定位，worktree 共享 main，output 隔离
+
+---
+
+**用户原始需求：**
+> 人体渲染基本跑通了，需要做深度图提取 + 人体区域深度模糊 + 重绘 mask + 按深度+mask 重新生成视频。先试 Cosmos Transfer 2.5，不行换 Wan 2.1。
+
+讨论要点：
+- 先完成了 cosmos_prepare.py（composite + depth + mask 生成）和 cosmos_regen.py（Cosmos 推理包装）
+- Cosmos Transfer 2.5 在共享机器上因 CPU RAM OOM（其他用户占 58GB）反复崩溃
+- 双卡勉强跑通但 guided generation 效果不理想，mask 外背景也被影响
+- 决定改用 Wan 2.1 VACE，单卡 4090 可跑，原生支持 depth + mask
+
+**创建的任务：**
+- [002] Wan 2.1 VACE depth+mask 人体重绘测试

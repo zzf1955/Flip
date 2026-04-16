@@ -130,3 +130,7 @@ def get_skip_meshes(hand_type=None):
 # Intentionally uses BASE_DIR (current workspace) so different worktrees
 # don't overwrite each other's experiment results.
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
+
+# ── Cosmos pipeline output subdirectories ──
+COSMOS_PREPARE_DIR = os.path.join(OUTPUT_DIR, "human", "cosmos_prepare")
+COSMOS_REGEN_DIR = os.path.join(OUTPUT_DIR, "human", "cosmos_regen")
