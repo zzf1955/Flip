@@ -83,12 +83,15 @@ retarget.py        ← config, smplh, fk
 |------|------|------|------|
 | `train_lora.py` | 自写 Wan 2.1 LoRA 训练（train/eval split + loss 日志 + eval 视频） | `output/data_cache_*/*.pth` | `training_data/log/<date>/` |
 
-### Cosmos 重生成（可选高级阶段）
+### 人体重绘（Step 4 本地方案）
 
 | 脚本 | 功能 | 输入 | 输出 |
 |------|------|------|------|
-| `cosmos_prepare.py` | Cosmos Transfer 2.5 输入准备：depth + mask + spec.json | overlay 视频 | `output/human/cosmos_prepare/` |
-| `cosmos_regen.py` | Cosmos Transfer 2.5 推理 | cosmos_prepare 输出 | `output/human/cosmos_regen/` |
+| `cosmos_prepare.py` | 前置：composite + depth + mask + spec.json（两种 regen 共用） | overlay 视频 | `output/human/cosmos_prepare/` |
+| `wan_regen.py` | **主方案**：ComfyUI + Wan 2.1 VACE 1.3B depth+mask 重绘 | cosmos_prepare 输出 | `output/human/wan_regen/` |
+| `cosmos_regen.py` | Cosmos Transfer 2.5 推理（**已弃用**，保留作对照存档） | cosmos_prepare 输出 | `output/human/cosmos_regen/` |
+
+详见 `doc/step_4_wan_vace_regen.md`。
 
 ### 运行方式
 
