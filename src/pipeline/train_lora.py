@@ -6,13 +6,14 @@ but adds a proper training loop with:
 - Train / Eval data split (deterministic, fixed seed)
 - Per-step train loss logging
 - Periodic eval loss computation
+- Eval video generation (ground truth + control + generated)
 - Organized output: ckpt/, eval/, train.log
 
 Usage:
   python -m src.pipeline.train_lora \
     --cache-dir output/data_cache_80 \
-    --device cuda:3 --epochs 1 --repeat 1 \
-    --save-steps 5 --eval-steps 5
+    --device cuda:0 --epochs 1 --repeat 1 \
+    --save-steps 5 --eval-steps 5 --eval-video-steps 50
 """
 
 import argparse
@@ -28,7 +29,10 @@ from datetime import datetime
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 sys.stdout.reconfigure(line_buffering=True)
 
+import cv2
+import numpy as np
 import torch
+from PIL import Image
 from safetensors.torch import save_file
 
 # Import WanTrainingModule from DiffSynth-Studio examples (not part of the
@@ -40,6 +44,7 @@ _DIFFSYNTH_TRAIN_DIR = os.path.join(
 sys.path.insert(0, _DIFFSYNTH_TRAIN_DIR)
 from train import WanTrainingModule  # noqa: E402
 
+from diffsynth.diffusion.flow_match import FlowMatchScheduler  # noqa: E402
 from src.core.config import MAIN_ROOT, TRAINING_DATA_ROOT  # noqa: E402
 
 # ── Defaults ──────────────────────────────────────────────────────────
@@ -50,9 +55,9 @@ _MODEL_HUB = os.path.join(
 )
 
 DEFAULT_DIT_PATH = os.path.join(_MODEL_HUB, "manual", "diffusion_pytorch_model.safetensors")
+DEFAULT_VAE_PATH = os.path.join(_MODEL_HUB, "manual", "Wan2.1_VAE.pth")
 
 # UMT5 tokenizer — already cached from data_process stage.
-# Passing this explicitly avoids a ~11GB re-download from ModelScope.
 DEFAULT_TOKENIZER_PATH = os.path.join(
     _MODEL_HUB, "snapshots",
     "d4d4513ee56cc9db003780fb1e63feb1b4e0c5d8",
@@ -107,6 +112,106 @@ def save_lora_ckpt(model, path: str) -> int:
     return len(sd)
 
 
+# ── Video helpers ─────────────────────────────────────────────────────
+
+def save_video(frames, path, fps=16):
+    """Save list of PIL.Image frames as MP4."""
+    h, w = frames[0].size[1], frames[0].size[0]
+    writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+    for f in frames:
+        writer.write(cv2.cvtColor(np.array(f), cv2.COLOR_RGB2BGR))
+    writer.release()
+
+
+def tensor_to_frames(video_tensor):
+    """Convert VAE output [B, 3, T, H, W] range [-1,1] to list of PIL.Image."""
+    video = video_tensor[0]  # [3, T, H, W]
+    video = (video.float().clamp(-1, 1) + 1) / 2 * 255
+    video = video.to(torch.uint8).cpu().numpy()  # [3, T, H, W]
+    video = video.transpose(1, 2, 3, 0)  # [T, H, W, 3]
+    return [Image.fromarray(frame) for frame in video]
+
+
+def generate_eval_videos(model, eval_files, eval_dir, step, device,
+                         num_samples=2, num_inference_steps=30, log=None):
+    """Generate eval videos: ground truth + control + model output.
+
+    Runs denoising loop with current LoRA weights, decodes with VAE.
+    """
+    vae = getattr(model.pipe, "vae", None)
+    if vae is None:
+        if log:
+            log.info("  EVAL VIDEO skipped (no VAE loaded)")
+        return
+
+    # Separate scheduler for inference (don't touch the training scheduler)
+    inf_scheduler = FlowMatchScheduler()
+    inf_scheduler.set_timesteps(
+        num_inference_steps=num_inference_steps,
+        denoising_strength=1.0,
+        shift=5.0,
+    )
+
+    step_dir = os.path.join(eval_dir, f"step-{step:04d}")
+    os.makedirs(step_dir, exist_ok=True)
+
+    n = min(num_samples, len(eval_files))
+    for idx in range(n):
+        t0 = time.time()
+        sample = load_sample(eval_files[idx])
+        inputs_shared, inputs_posi, inputs_nega = sample
+
+        # ── Save ground truth (from cached PIL images) ──
+        gt_frames = inputs_shared.get("input_video")
+        if gt_frames:
+            save_video(gt_frames, os.path.join(step_dir, f"gt_{idx:02d}.mp4"))
+
+        # ── Save control / condition ──
+        ctrl_frames = inputs_shared.get("control_video")
+        if ctrl_frames:
+            save_video(ctrl_frames, os.path.join(step_dir, f"ctrl_{idx:02d}.mp4"))
+
+        # ── Generate via denoising ──
+        context = inputs_posi["context"].to(device=device, dtype=torch.bfloat16)
+        clip_feature = inputs_shared.get("clip_feature")
+        if clip_feature is not None:
+            clip_feature = clip_feature.to(device=device, dtype=torch.bfloat16)
+        y = inputs_shared.get("y")
+        if y is not None:
+            y = y.to(device=device, dtype=torch.bfloat16)
+
+        latent_shape = inputs_shared["input_latents"].shape  # [1, 16, 5, 60, 80]
+        latents = torch.randn(latent_shape, device=device, dtype=torch.bfloat16)
+
+        with torch.no_grad():
+            for pid, ts in enumerate(inf_scheduler.timesteps):
+                t_tensor = ts.unsqueeze(0).to(device=device, dtype=torch.bfloat16)
+                noise_pred = model.pipe.model_fn(
+                    dit=model.pipe.dit,
+                    latents=latents,
+                    timestep=t_tensor,
+                    context=context,
+                    clip_feature=clip_feature,
+                    y=y,
+                    use_gradient_checkpointing=False,
+                )
+                latents = inf_scheduler.step(
+                    noise_pred, inf_scheduler.timesteps[pid], latents,
+                )
+
+            # VAE decode
+            video_tensor = vae.decode(latents, device=device, tiled=False)
+
+        gen_frames = tensor_to_frames(video_tensor)
+        save_video(gen_frames, os.path.join(step_dir, f"gen_{idx:02d}.mp4"))
+
+        if log:
+            log.info(
+                f"  EVAL VIDEO [{idx+1}/{n}] -> {step_dir} "
+                f"({time.time()-t0:.0f}s)"
+            )
+
+
 # ── Training ──────────────────────────────────────────────────────────
 
 def train(args):
@@ -127,11 +232,19 @@ def train(args):
     train_files, eval_files = split_train_eval(all_files, args.eval_ratio, args.seed)
     log.info(f"Data: {len(all_files)} total -> {len(train_files)} train, {len(eval_files)} eval")
 
-    # ── Model ──
+    # ── Model (DiT + optional VAE) ──
     log.info("Loading model...")
     t0 = time.time()
+
+    # Build model_paths JSON — DiT always, VAE if eval videos requested
+    if args.vae_path and args.eval_video_steps > 0:
+        model_paths = f'["{args.dit_path}", "{args.vae_path}"]'
+        log.info("VAE included for eval video generation")
+    else:
+        model_paths = f'["{args.dit_path}"]'
+
     model = WanTrainingModule(
-        model_paths=f'["{args.dit_path}"]',
+        model_paths=model_paths,
         fp8_models=args.dit_path,
         tokenizer_path=args.tokenizer_path,
         lora_base_model="dit",
@@ -151,7 +264,7 @@ def train(args):
     optimizer = torch.optim.AdamW(
         model.trainable_modules(), lr=args.lr, weight_decay=args.weight_decay,
     )
-    scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
+    lr_scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
 
     # ── Training loop ──
     total_steps = args.epochs * len(train_files) * args.repeat
@@ -159,7 +272,8 @@ def train(args):
         f"Plan: {args.epochs} ep x {len(train_files)} train x {args.repeat} repeat"
         f" = {total_steps} steps"
     )
-    log.info(f"Save every {args.save_steps} steps, eval every {args.eval_steps} steps")
+    log.info(f"Save every {args.save_steps}, eval loss every {args.eval_steps}"
+             f", eval video every {args.eval_video_steps} steps")
     log.info("=" * 60)
 
     step = 0
@@ -179,7 +293,7 @@ def train(args):
             loss = model({}, inputs=data)
             loss.backward()
             optimizer.step()
-            scheduler.step()
+            lr_scheduler.step()
 
             lr = optimizer.param_groups[0]["lr"]
             log.info(
@@ -193,7 +307,7 @@ def train(args):
                 n = save_lora_ckpt(model, p)
                 log.info(f"  SAVE {p} ({n} tensors)")
 
-            # Eval
+            # Eval loss
             if args.eval_steps and step % args.eval_steps == 0 and eval_files:
                 losses = []
                 with torch.no_grad():
@@ -204,11 +318,31 @@ def train(args):
                 avg = sum(losses) / len(losses)
                 log.info(f"  EVAL eval_loss={avg:.4f} ({len(losses)} samples)")
 
+            # Eval videos (separate, usually less frequent)
+            if (args.eval_video_steps and step % args.eval_video_steps == 0
+                    and eval_files):
+                generate_eval_videos(
+                    model, eval_files, eval_dir, step, args.device,
+                    num_samples=args.eval_video_samples,
+                    num_inference_steps=args.num_inference_steps,
+                    log=log,
+                )
+
     # Final checkpoint if not already saved at last step
     if args.save_steps and step > 0 and step % args.save_steps != 0:
         p = os.path.join(ckpt_dir, f"step-{step:04d}.safetensors")
         save_lora_ckpt(model, p)
         log.info(f"  SAVE (final) {p}")
+
+    # Final eval videos
+    if (args.eval_video_steps and step > 0
+            and step % args.eval_video_steps != 0 and eval_files):
+        generate_eval_videos(
+            model, eval_files, eval_dir, step, args.device,
+            num_samples=args.eval_video_samples,
+            num_inference_steps=args.num_inference_steps,
+            log=log,
+        )
 
     elapsed = time.time() - train_t0
     log.info("=" * 60)
@@ -234,6 +368,8 @@ def main():
     # Model
     ap.add_argument("--dit-path", default=DEFAULT_DIT_PATH,
                     help="Path to DiT safetensors")
+    ap.add_argument("--vae-path", default=DEFAULT_VAE_PATH,
+                    help="Path to VAE weights (for eval video generation)")
     ap.add_argument("--tokenizer-path", default=DEFAULT_TOKENIZER_PATH,
                     help="Path to UMT5 tokenizer (avoids re-download)")
     ap.add_argument("--device", default="cuda:3")
@@ -247,6 +383,14 @@ def main():
                     help="Repeat train set per epoch")
     ap.add_argument("--save-steps", type=int, default=50)
     ap.add_argument("--eval-steps", type=int, default=50)
+
+    # Eval video
+    ap.add_argument("--eval-video-steps", type=int, default=0,
+                    help="Generate eval videos every N steps (0=off, uses VAE)")
+    ap.add_argument("--eval-video-samples", type=int, default=2,
+                    help="Number of eval videos to generate per eval point")
+    ap.add_argument("--num-inference-steps", type=int, default=30,
+                    help="Denoising steps for eval video generation")
 
     args = ap.parse_args()
 
