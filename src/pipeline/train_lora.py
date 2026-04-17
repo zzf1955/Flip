@@ -29,8 +29,8 @@ from datetime import datetime
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 sys.stdout.reconfigure(line_buffering=True)
 
-import cv2
 import numpy as np
+import subprocess
 import torch
 from PIL import Image
 from safetensors.torch import save_file
@@ -114,13 +114,29 @@ def save_lora_ckpt(model, path: str) -> int:
 
 # ── Video helpers ─────────────────────────────────────────────────────
 
+FFMPEG = os.environ.get(
+    "FFMPEG_BIN",
+    "/home/leadtek/miniconda3/envs/flip/bin/ffmpeg",
+)
+
+
 def save_video(frames, path, fps=16):
-    """Save list of PIL.Image frames as MP4."""
+    """Save list of PIL.Image frames as H.264 MP4 via ffmpeg pipe."""
     h, w = frames[0].size[1], frames[0].size[0]
-    writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+    cmd = [
+        FFMPEG, "-y",
+        "-f", "rawvideo", "-pix_fmt", "rgb24",
+        "-s", f"{w}x{h}", "-r", str(fps),
+        "-i", "pipe:0",
+        "-c:v", "libx264", "-crf", "18", "-preset", "fast",
+        "-pix_fmt", "yuv420p", path,
+    ]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     for f in frames:
-        writer.write(cv2.cvtColor(np.array(f), cv2.COLOR_RGB2BGR))
-    writer.release()
+        proc.stdin.write(np.array(f).tobytes())
+    proc.stdin.close()
+    proc.wait()
 
 
 def tensor_to_frames(video_tensor):
