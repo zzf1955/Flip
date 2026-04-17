@@ -251,12 +251,13 @@ data/
 | `doc/progress.md` | 四阶段完成总结（详细版，含验证数据） |
 | `doc/task.md` | 阶段总结（概览版，含下一步计划） |
 | `doc/scripts_inventory.md` | 代码架构 + 模块依赖 + 数据流 + 输出目录 |
-| `doc/hand_data_mapping.md` | Inspire / BrainCo 灵巧手编码映射 |
-| `doc/camera_investigation.md` | 相机型号确认 + 内外参标定 + 退化分析 |
-| `doc/human_mesh_investigation.md` | SMPLH 集成 + 坐标变换 + 体型差异分析 |
-| `doc/g1_variants.md` | G1 机器人型号 / DOF / 手部选项 / URDF |
-| `doc/finetune_baseline.md` | Wan 2.1 FunControl LoRA 训练 baseline |
-| `doc/seedance_api.md` | Seedance 2.0 API 用法 + 输入输出限制 |
+| `doc/step_2_camera_investigation.md` | 相机型号确认 + 内外参标定 + 退化分析 |
+| `doc/step_2_g1_variants.md` | G1 机器人型号 / DOF / 手部选项 / URDF |
+| `doc/step_3_hand_data_mapping.md` | Inspire / BrainCo 灵巧手编码映射 |
+| `doc/step_3_human_mesh_investigation.md` | SMPLH 集成 + 坐标变换 + 体型差异分析 |
+| `doc/step_4_seedance_api.md` | Step 4 商业方案：Seedance 2.0 API 用法 + 输入输出限制 |
+| `doc/step_4_wan_vace_regen.md` | Step 4 本地方案：ComfyUI + Wan 2.1 VACE depth+mask 重绘（含 Cosmos 对照） |
+| `doc/step_5_finetune_baseline.md` | Wan 2.1 FunControl LoRA 训练 baseline |
 | `doc/requirement-log.md` | 需求跟踪日志（task 001-003） |
 
 归档文档在 `doc/archive/`。任务跟踪在 `doc/tasks/`。
