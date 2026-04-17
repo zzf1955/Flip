@@ -131,6 +131,17 @@ def get_skip_meshes(hand_type=None):
 # don't overwrite each other's experiment results.
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 
+# ── Training data root (per-worktree) ──
+TRAINING_DATA_ROOT = os.path.join(BASE_DIR, "training_data")
+SEGMENT_DIR = os.path.join(TRAINING_DATA_ROOT, "segment")
+SEEDANCE_DIRECT_DIR = os.path.join(TRAINING_DATA_ROOT, "seedance_direct")
+OVERLAY_DIR = os.path.join(TRAINING_DATA_ROOT, "overlay")
+OVERLAY_4S_DIR = os.path.join(OVERLAY_DIR, "4s")
+PAIR_DIR = os.path.join(TRAINING_DATA_ROOT, "pair")
+
+# ── Pipeline intermediate outputs ──
+SEGMENT_PIPELINE_DIR = os.path.join(OUTPUT_DIR, "segment_pipeline")
+
 # ── Cosmos pipeline output subdirectories ──
 COSMOS_PREPARE_DIR = os.path.join(OUTPUT_DIR, "human", "cosmos_prepare")
 COSMOS_REGEN_DIR = os.path.join(OUTPUT_DIR, "human", "cosmos_regen")
