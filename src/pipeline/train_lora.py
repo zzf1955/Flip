@@ -44,10 +44,19 @@ from src.core.config import MAIN_ROOT, TRAINING_DATA_ROOT  # noqa: E402
 
 # ── Defaults ──────────────────────────────────────────────────────────
 
-DEFAULT_DIT_PATH = os.path.join(
+_MODEL_HUB = os.path.join(
     "/disk_n/zzf/.cache/huggingface/hub",
     "models--alibaba-pai--Wan2.1-Fun-V1.1-14B-Control",
-    "manual", "diffusion_pytorch_model.safetensors",
+)
+
+DEFAULT_DIT_PATH = os.path.join(_MODEL_HUB, "manual", "diffusion_pytorch_model.safetensors")
+
+# UMT5 tokenizer — already cached from data_process stage.
+# Passing this explicitly avoids a ~11GB re-download from ModelScope.
+DEFAULT_TOKENIZER_PATH = os.path.join(
+    _MODEL_HUB, "snapshots",
+    "d4d4513ee56cc9db003780fb1e63feb1b4e0c5d8",
+    "google", "umt5-xxl",
 )
 
 
@@ -124,6 +133,7 @@ def train(args):
     model = WanTrainingModule(
         model_paths=f'["{args.dit_path}"]',
         fp8_models=args.dit_path,
+        tokenizer_path=args.tokenizer_path,
         lora_base_model="dit",
         lora_target_modules="q,k,v,o,ffn.0,ffn.2",
         lora_rank=args.lora_rank,
@@ -224,6 +234,8 @@ def main():
     # Model
     ap.add_argument("--dit-path", default=DEFAULT_DIT_PATH,
                     help="Path to DiT safetensors")
+    ap.add_argument("--tokenizer-path", default=DEFAULT_TOKENIZER_PATH,
+                    help="Path to UMT5 tokenizer (avoids re-download)")
     ap.add_argument("--device", default="cuda:3")
     ap.add_argument("--lora-rank", type=int, default=16)
 
