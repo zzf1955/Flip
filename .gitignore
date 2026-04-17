@@ -1,6 +1,6 @@
 # === 大型数据/资源目录 ===
 data/
-archive/
+/archive/
 ref-cosmos-transfer2.5/
 
 # === 二进制/大文件 ===
