@@ -149,10 +149,11 @@ def tensor_to_frames(video_tensor):
 
 
 def generate_eval_videos(model, eval_files, eval_dir, step, device,
-                         num_samples=2, num_inference_steps=30, log=None):
+                         num_samples=2, num_inference_steps=30,
+                         cfg_scale=5.0, log=None):
     """Generate eval videos: ground truth + control + model output.
 
-    Runs denoising loop with current LoRA weights, decodes with VAE.
+    Runs denoising loop with current LoRA weights + CFG, decodes with VAE.
     """
     vae = getattr(model.pipe, "vae", None)
     if vae is None:
@@ -160,8 +161,9 @@ def generate_eval_videos(model, eval_files, eval_dir, step, device,
             log.info("  EVAL VIDEO skipped (no VAE loaded)")
         return
 
-    # Separate scheduler for inference (don't touch the training scheduler)
-    inf_scheduler = FlowMatchScheduler()
+    # Separate scheduler for inference — must use "Wan" template
+    # (default is "FLUX.1" which has different sigma schedule and shift)
+    inf_scheduler = FlowMatchScheduler("Wan")
     inf_scheduler.set_timesteps(
         num_inference_steps=num_inference_steps,
         denoising_strength=1.0,
@@ -187,8 +189,9 @@ def generate_eval_videos(model, eval_files, eval_dir, step, device,
         if ctrl_frames:
             save_video(ctrl_frames, os.path.join(step_dir, f"ctrl_{idx:02d}.mp4"))
 
-        # ── Generate via denoising ──
-        context = inputs_posi["context"].to(device=device, dtype=torch.bfloat16)
+        # ── Generate via denoising with CFG ──
+        context_posi = inputs_posi["context"].to(device=device, dtype=torch.bfloat16)
+        context_nega = inputs_nega["context"].to(device=device, dtype=torch.bfloat16)
         clip_feature = inputs_shared.get("clip_feature")
         if clip_feature is not None:
             clip_feature = clip_feature.to(device=device, dtype=torch.bfloat16)
@@ -199,18 +202,33 @@ def generate_eval_videos(model, eval_files, eval_dir, step, device,
         latent_shape = inputs_shared["input_latents"].shape  # [1, 16, 5, 60, 80]
         latents = torch.randn(latent_shape, device=device, dtype=torch.bfloat16)
 
+        model_fn = model.pipe.model_fn
+        dit = model.pipe.dit
+        shared_kwargs = dict(
+            clip_feature=clip_feature, y=y,
+            use_gradient_checkpointing=False,
+        )
+
         with torch.no_grad():
             for pid, ts in enumerate(inf_scheduler.timesteps):
                 t_tensor = ts.unsqueeze(0).to(device=device, dtype=torch.bfloat16)
-                noise_pred = model.pipe.model_fn(
-                    dit=model.pipe.dit,
-                    latents=latents,
-                    timestep=t_tensor,
-                    context=context,
-                    clip_feature=clip_feature,
-                    y=y,
-                    use_gradient_checkpointing=False,
+
+                # Positive prediction
+                pred_posi = model_fn(
+                    dit=dit, latents=latents, timestep=t_tensor,
+                    context=context_posi, **shared_kwargs,
                 )
+
+                # CFG: blend positive and negative predictions
+                if cfg_scale != 1.0:
+                    pred_nega = model_fn(
+                        dit=dit, latents=latents, timestep=t_tensor,
+                        context=context_nega, **shared_kwargs,
+                    )
+                    noise_pred = pred_nega + cfg_scale * (pred_posi - pred_nega)
+                else:
+                    noise_pred = pred_posi
+
                 latents = inf_scheduler.step(
                     noise_pred, inf_scheduler.timesteps[pid], latents,
                 )
@@ -280,7 +298,7 @@ def train(args):
     optimizer = torch.optim.AdamW(
         model.trainable_modules(), lr=args.lr, weight_decay=args.weight_decay,
     )
-    lr_scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
+    lr_scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0)
 
     # ── Training loop ──
     total_steps = args.epochs * len(train_files) * args.repeat
