@@ -90,6 +90,8 @@ src/
 │   ├── batch_inpaint.py     # 多 GPU 批量调度
 │   ├── video_inpaint.py     # 逐帧 FK + GrabCut + LaMa
 │   └── retarget_video.py    # retarget 3-panel 视频渲染
+│   # ... 另有 11 个 pipeline（seedance_gen, train_lora 等）
+│   # 完整清单见 doc/scripts_inventory.md
 │
 └── tools/                   # 实验/调试/可视化工具
     ├── calibrate_mask.py    # PSO mask Dice 标定
@@ -241,6 +243,23 @@ data/
 
 仅有 Inspire 手部 URDF，BrainCo 任务跳过手部渲染（`config.py:get_skip_meshes()`）。
 **待解决**：集成 BrainCo Revo2 URDF + STL。
+
+## 文档索引
+
+| 文档 | 内容 |
+|------|------|
+| `doc/progress.md` | 四阶段完成总结（详细版，含验证数据） |
+| `doc/task.md` | 阶段总结（概览版，含下一步计划） |
+| `doc/scripts_inventory.md` | 代码架构 + 模块依赖 + 数据流 + 输出目录 |
+| `doc/hand_data_mapping.md` | Inspire / BrainCo 灵巧手编码映射 |
+| `doc/camera_investigation.md` | 相机型号确认 + 内外参标定 + 退化分析 |
+| `doc/human_mesh_investigation.md` | SMPLH 集成 + 坐标变换 + 体型差异分析 |
+| `doc/g1_variants.md` | G1 机器人型号 / DOF / 手部选项 / URDF |
+| `doc/finetune_baseline.md` | Wan 2.1 FunControl LoRA 训练 baseline |
+| `doc/seedance_api.md` | Seedance 2.0 API 用法 + 输入输出限制 |
+| `doc/requirement-log.md` | 需求跟踪日志（task 001-003） |
+
+归档文档在 `doc/archive/`。任务跟踪在 `doc/tasks/`。
 
 ## 运行示例
 

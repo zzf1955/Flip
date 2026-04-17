@@ -28,3 +28,19 @@
 
 **创建的任务：**
 - [002] Wan 2.1 VACE depth+mask 人体重绘测试
+
+---
+
+## 2026-04-17
+
+**用户原始需求：**
+> 在代码中自己写一个同样的 baseline 训练代码，需要支持 eval loss 等东西，数据先只输出 log，训练输出专门写到 training_data/log 中，按照日期标，里面存 ckpt、eval 的视频、日志文件
+
+讨论要点：
+- DiffSynth-Studio 训练框架不输出 train loss、无 train/eval 分割、无日志系统
+- 复用 DiffSynth 的 WanTrainingModule（模型加载 + LoRA + forward），自写训练循环
+- 单卡先跑通，不用 accelerate DDP
+- 输出目录 `training_data/log/<date>/` 下按 ckpt、eval、train.log 组织
+
+**创建的任务：**
+- [003] 自写 Wan 2.1 FunControl LoRA 训练脚本
