@@ -5,7 +5,7 @@
 ```
 src/
 ├── core/          8 个基础库模块（不可直接运行）
-├── pipeline/      5 个可执行 pipeline 入口
+├── pipeline/     16 个可执行 pipeline 入口
 └── tools/        17 个实验/调试/可视化工具
 ```
 
@@ -30,51 +30,89 @@ retarget.py        ← config, smplh, fk
 
 ### 模块说明
 
-| 模块 | 行数 | 功能 | 主要导出 |
-|------|------|------|----------|
-| `config.py` | ~100 | 集中配置 | `BASE_DIR`, `G1_URDF`, `BEST_PARAMS`, `get_hand_type()`, `get_skip_meshes()` |
-| `data.py` | ~120 | 数据加载 + 视频 IO | `load_episode_info()`, `open_video_writer()`, `write_frame()`, `close_video()`, `detect_keypoints_from_alpha()` |
-| `camera.py` | ~200 | 相机模型 + 投影 | `CAMERA_MODELS`, `get_model()`, `build_K()`, `project_points_cv()`, `make_camera_const()`, `make_camera()` |
-| `fk.py` | ~180 | URDF/mesh + FK | `parse_urdf_meshes()`, `preload_meshes()`, `load_robot()`, `build_q()`, `do_fk()` |
-| `render.py` | ~250 | 渲染 | `render_mask()`, `render_overlay()`, `render_mask_and_overlay()`, `render_mesh_on_image()` |
-| `mask.py` | ~80 | mask 后处理 + LaMa | `postprocess_mask()`, `grabcut_refine()`, `init_lama()`, `run_lama()` |
-| `smplh.py` | ~660 | SMPLH + IK | `SMPLHForIK`, `IKSolver`, `extract_g1_targets()`, `R_SMPLH_TO_G1_NP` |
-| `retarget.py` | ~430 | G1→SMPLH retarget | `retarget_frame()`, `refine_arms()`, `compute_g1_rest_transforms()`, `build_default_hand_pose()`, `scale_hands()` |
+| 模块 | 功能 | 主要导出 |
+|------|------|----------|
+| `config.py` | 集中配置：路径、相机参数、任务选择 | `MAIN_ROOT`, `DATA_ROOT`, `TRAINING_DATA_ROOT`, `PAIR_DIR`, `BEST_PARAMS` |
+| `data.py` | 数据加载 + 视频 IO | `load_episode_info()`, `open_video_writer()`, `write_frame()` |
+| `camera.py` | 相机模型 + 投影 | `make_camera()`, `project_points_cv()` |
+| `fk.py` | URDF/mesh + FK | `load_robot()`, `build_q()`, `do_fk()` |
+| `render.py` | mask/overlay/Lambertian 渲染 | `render_mask()`, `render_overlay()` |
+| `mask.py` | mask 后处理 + LaMa | `postprocess_mask()`, `init_lama()`, `run_lama()` |
+| `smplh.py` | SMPLH 模型 + IK 求解器 | `SMPLHForIK`, `IKSolver` |
+| `retarget.py` | G1→SMPLH retarget | `retarget_frame()`, `refine_arms()` |
 
 ---
 
 ## 二、pipeline/ — 可执行 pipeline
 
-| 脚本 | 功能 | 关键参数 | 输出路径 |
-|------|------|----------|----------|
-| `sam2_inpaint.py` | FK → SAM2 → LaMa/ProPainter | `--task`, `--episode`, `--duration`, `--device`, `--inpaint-method` | `output/inpaint/sam2_propainter/` |
-| `sam2_segment.py` | SAM2 多部位分割 | `--episode`, `--duration`, `--mode box/point` | `output/inpaint/sam2_segment/` |
-| `batch_inpaint.py` | 多 GPU 批量调度 | `--tasks`, `--gpus`, `--output-root` | 自定义 |
-| `video_inpaint.py` | 逐帧 FK + GrabCut + LaMa | `--episode`, `--duration` | `output/inpaint/per_frame_lama/` |
-| `retarget_video.py` | retarget 3-panel 视频 | `--task`, `--episode`, `--duration`, `--device` | `output/human/retarget_video/` |
+### 数据生成与预处理
+
+| 脚本 | 功能 | 输入 | 输出 |
+|------|------|------|------|
+| `segment_episodes.py` | 原始 episode 切分为 4s segment | LeRobot 数据集 | `training_data/segment/` |
+| `seedance_gen.py` | Volcengine Seedance 2.0 API 生成人体视频 | robot 视频 | `training_data/seedance_direct/4s/` |
+| `seedance_batch.py` | seedance_gen 的批量包装 | 多个 robot 视频 | 同上 |
+| `seedance_clip.py` | 4s Seedance 视频切成 1s/2s 片段 | `seedance_direct/4s/` | `seedance_direct/{1s,2s}/` |
+
+### 分割与修复
+
+| 脚本 | 功能 | 输入 | 输出 |
+|------|------|------|------|
+| `sam2_inpaint.py` | FK → SAM2 分割 → LaMa/ProPainter 修复 | episode 视频 | `output/inpaint/` |
+| `sam2_segment.py` | SAM2 多部位分割实验 | episode 视频 | `output/inpaint/sam2_segment/` |
+| `batch_inpaint.py` | 多 GPU 批量修复调度 | 多 task/episode | 自定义 |
+| `video_inpaint.py` | 逐帧 FK + GrabCut + LaMa | episode 视频 | `output/inpaint/per_frame_lama/` |
+
+### 渲染与 Overlay
+
+| 脚本 | 功能 | 输入 | 输出 |
+|------|------|------|------|
+| `segment_pipeline.py` | **主 pipeline**：FK→SAM2→inpaint→SMPLH retarget→overlay | segment 视频 | `training_data/overlay/4s/` |
+| `human_overlay.py` | SMPLH mesh 叠加到修复背景 | 修复视频 + retarget 数据 | overlay MP4 |
+| `retarget_video.py` | 3-panel 对比视频 [原始\|G1\|SMPLH] | episode 视频 | `output/human/retarget_video/` |
+
+### 训练数据配对
+
+| 脚本 | 功能 | 输入 | 输出 |
+|------|------|------|------|
+| `make_pair.py` | 匹配 robot+human 视频，重采样 16fps，4k+1 帧 | segment + seedance/overlay | `training_data/pair/{1s,2s,4s}/` |
+
+### LoRA 训练
+
+| 脚本 | 功能 | 输入 | 输出 |
+|------|------|------|------|
+| `train_lora.py` | 自写 Wan 2.1 LoRA 训练（train/eval split + loss 日志 + eval 视频） | `output/data_cache_*/*.pth` | `training_data/log/<date>/` |
+
+### Cosmos 重生成（可选高级阶段）
+
+| 脚本 | 功能 | 输入 | 输出 |
+|------|------|------|------|
+| `cosmos_prepare.py` | Cosmos Transfer 2.5 输入准备：depth + mask + spec.json | overlay 视频 | `output/human/cosmos_prepare/` |
+| `cosmos_regen.py` | Cosmos Transfer 2.5 推理 | cosmos_prepare 输出 | `output/human/cosmos_regen/` |
 
 ### 运行方式
 
 ```bash
-python -m src.pipeline.<script_name> [args]
+LD_PRELOAD=/home/leadtek/miniconda3/envs/flip/lib/libjpeg.so.8 \
+  python -m src.pipeline.<script_name> [args]
 ```
 
 ---
 
 ## 三、tools/ — 实验/调试工具
 
-### 相机标定 (calibration/)
+### 相机标定
 
 | 脚本 | 功能 | 输出路径 |
 |------|------|----------|
 | `calibrate_mask.py` | PSO mask Dice 标定 | `output/calibration/mask_dice/` |
-| `calibrate_keypoints.py` | PSO/Adam 关键点标定 | `output/calibration/kp_optim/` (可 `--output-dir` 覆盖) |
+| `calibrate_keypoints.py` | PSO/Adam 关键点标定 | `output/calibration/kp_optim/` |
 | `estimate_focal.py` | 焦距解析估计 | stdout |
 | `distortion_analysis.py` | 畸变分析 | `output/tmp/distortion/` |
 | `verify_extrinsics.py` | URDF 外参验证 | `output/tmp/urdf_verify/` |
 | `verify_mesh.py` | STL/URDF 尺寸验证 | stdout |
 
-### 人体 retarget (human/)
+### 人体 retarget
 
 | 脚本 | 功能 | 输出路径 |
 |------|------|----------|
@@ -83,7 +121,7 @@ python -m src.pipeline.<script_name> [args]
 | `render_ik_debug.py` | 第三人称 IK 调试 | `output/human/ik_debug/` |
 | `debug_retarget.py` | retarget 误差可视化 | `output/human/debug_retarget/` |
 
-### 渲染验证 (tmp/)
+### 渲染验证
 
 | 脚本 | 功能 | 输出路径 |
 |------|------|----------|
@@ -107,37 +145,85 @@ python -m src.tools.<script_name> [args]
 
 ---
 
-## 四、输出目录规范
+## 四、数据流
 
-所有输出统一到 `output/<stage>/<exp_name>/`：
+### 完整 Pipeline：原始视频 → 训练好的 LoRA
 
 ```
-output/
-├── calibration/          # 相机标定实验
-├── inpaint/              # 修复 pipeline
-├── human/                # 人体 retarget
-└── tmp/                  # 一次性验证
+G1 第一人称视频 (LeRobot dataset, 30fps)
+│
+├─ [segment_episodes.py]
+│   → training_data/segment/<task>/ep*/seg*_video.mp4  (4s@30fps, 28K 文件, 19GB)
+│
+├─ [segment_pipeline.py]  (FK → SAM2 → inpaint → SMPLH retarget → overlay)
+│   → training_data/overlay/4s/<task>/ep*/seg*_human.mp4
+│
+├─ [seedance_gen.py / seedance_batch.py]  (Volcengine API: robot → human)
+│   → training_data/seedance_direct/4s/<task>/ep*/seg*_human.mp4
+│   │
+│   └─ [seedance_clip.py]  (4s → 1s/2s clips)
+│       → training_data/seedance_direct/{1s,2s}/<task>/ep*/seg*_clip*.mp4
+│
+├─ [make_pair.py]  (匹配 robot+human, 重采样 16fps, 4k+1 帧, 统一编号)
+│   → training_data/pair/1s/
+│       ├── video/pair_NNNN.mp4        (robot, 17帧@16fps)
+│       ├── control_video/pair_NNNN.mp4 (human, 17帧@16fps)
+│       └── metadata.csv
+│
+├─ [DiffSynth data_process]  (阶段 1: T5+CLIP+VAE embedding 缓存)
+│   → output/data_cache_80/0/*.pth  (80 样本, ~50MB/个, 共 3.9GB)
+│
+└─ [train_lora.py]  (阶段 2: 自写训练循环)
+    → training_data/log/YYYY-MM-DD_HHMMSS/
+        ├── ckpt/step-NNNN.safetensors  (LoRA 权重, ~147MB)
+        ├── eval/step-NNNN/             (gt + ctrl + gen 视频)
+        └── train.log                   (每步 loss + eval)
 ```
+
+### 训练数据格式要求
+
+| 参数 | 要求 |
+|------|------|
+| 分辨率 | 640×480 |
+| 帧率 | 16 fps |
+| 帧数 | **4k+1**（1s=17帧, 2s=33帧, 4s=65帧） |
+| 编码 | H.264, yuv420p |
+| Prompt | `A first-person view robot arm performing household tasks flip_v2v` |
+
+### 当前数据规模
+
+| 阶段 | 数量 | 大小 |
+|------|------|------|
+| Segment (4s robot) | 28,548 | 19 GB |
+| Overlay (4s human) | 53 | 64 MB |
+| Seedance (1s human) | 80 | 15 MB |
+| Training pairs (1s) | 120 对 | 37 MB |
+| Cached embeddings | 80 | 3.9 GB |
 
 ---
 
-## 五、数据流
+## 五、输出目录规范
 
 ```
-parquet (30Hz)     video (30fps)     URDF + STL
-     │                  │                │
-     ▼                  ▼                ▼
-  build_q()      PyAV decode     parse_urdf_meshes()
-     │                  │         preload_meshes()
-     ▼                  │                │
-  do_fk()              │                │
-     │                  │                │
-     ▼                  ▼                ▼
- transforms ──→ render_mask/overlay ──→ SAM2 prompt
-                        │                │
-                        ▼                ▼
-                   postprocess      propagate
-                        │                │
-                        ▼                ▼
-                    LaMa/ProPainter  ──→ inpaint.mp4
+output/                          # per-worktree 实验产物
+├── calibration/                 # 相机标定
+├── inpaint/                     # SAM2 + 修复
+├── human/                       # retarget + overlay
+│   ├── retarget_video/
+│   ├── cosmos_prepare/
+│   └── cosmos_regen/
+├── segment_pipeline/            # 主 pipeline 中间产物
+├── data_cache_80/               # DiffSynth embedding 缓存
+├── lora_funcontrol_*/           # DiffSynth baseline 训练输出
+└── tmp/                         # 一次性验证
+
+training_data/                   # per-worktree 训练数据
+├── segment/                     # 4s robot segments
+├── seedance_direct/             # Seedance human videos
+├── overlay/                     # SMPLH overlay human videos
+├── pair/                        # 配对训练数据 (make_pair 输出)
+│   └── 1s/{video/, control_video/, metadata.csv}
+├── compare/                     # 对比视频
+└── log/                         # train_lora.py 训练输出
+    └── YYYY-MM-DD_HHMMSS/{ckpt/, eval/, train.log}
 ```
