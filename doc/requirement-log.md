@@ -44,3 +44,55 @@
 
 **创建的任务：**
 - [003] 自写 Wan 2.1 FunControl LoRA 训练脚本
+
+---
+
+**用户原始需求：**
+> 现在看一下整个视频微调的算法，现在要进行修改了。思路是模仿 Mitty（2512.Mitty.pdf），将序列拼接，加上 LoRA 微调。模型原打算用普通的 WAN 2.1。
+
+讨论要点：
+- Mitty 核心：human 视频 latent 保持 clean、robot 视频 latent 加噪，沿 temporal dim 拼接 → full self-attention，loss 只在 robot 段
+- Wan 2.1 能做但要改 RoPE + modality embedding + per-frame timestep（工作量中等）
+- 调研发现 **Wan 2.2 TI2V-5B 架构原生支持** Mitty 所需的 partial-noising：`seperated_timestep=True` + `fuse_vae_embedding_in_latents=True`，timestep 已经是 per-patch 构造（见 `diffsynth/pipelines/wan_video.py:1376-1380`）
+- Mitty 论文主实验也是 TI2V-5B dense（非 MoE），论文效果对齐我们需求
+- 5B 参数 FP8 约 5GB，4090 单卡宽松；Wan 2.2 14B 是 MoE 两个 branch，调试成本高，先不碰
+- Pipeline 完全重写，不复用 FunControl 的 ref_conv 路径；现有 `train_lora.py` 保留作为 baseline
+
+**创建的任务：**
+- [004] Wan 2.2 TI2V-5B 环境准备 + seperated_timestep 机制验证
+- [005] Mitty-style in-context 训练 pipeline (Wan 2.2 TI2V-5B)
+- [006] Mitty 方案推理 + 与 FunControl baseline 定量对比
+
+---
+
+**用户原始需求：**
+> task 内 1 条 eval 数据，剩下的训练；OOD task 为 pick up pillow，不参与训练；每次 eval 输出两种 eval 视频和 GT；bs=4 训练。
+
+讨论要点：
+- OOD 只含 Inspire_Pickup_Pillow_MainCamOnly（Brainco pillow 不参与）
+- 非 OOD 的 5 个 task 各抽 1 条做 in-task eval，共 5 条；pillow 8 条全 ood_eval；剩余 143 条 train
+- bs=4 用 torchrun 4 卡 DDP × bs=1 实现（复用 train_lora.py 的 DDP 基础设施，不做单卡 grad_accum）
+- 数据组织：`training_data/pair/1s/{train,eval,ood_eval}/` 三个独立子目录，各自编号 pair_NNNN 和 metadata.csv；`source_map.json` 记录反查
+- 改 `src/pipeline/make_pair.py`：加 `--ood-tasks`、`--per-task-eval`、`--split-seed`、`--clean` 参数，按 task 分 split
+- T005 同步更新：`mitty_cache.py` 按 split 跑三次；`train_mitty.py` 三个 cache 目录，eval 视频分 in_task/ood 子目录
+
+**完成改动（非新建 task，直接改 make_pair + 更新 T005 文档）：**
+- `src/pipeline/make_pair.py`：split-aware 重写
+- `training_data/pair/1s/{train,eval,ood_eval}/`：重新生成，共 156 条（train 143 / eval 5 / ood_eval 8）
+- `doc/tasks/pending/005.md`：CLI 参数和 eval 视频目录结构更新
+
+---
+
+## 2026-04-18
+
+**用户原始需求：**
+> 现在我要加强手部的准确率，做法是：1. 根据手部 Mesh overlay，框出手部的大致位置；2. 调高这部分 patch 的 loss 权重。详细看一下当前的数据 pipeline 改如何实现，patch 估算和训练 pipeline 分开，因为我可能会替换 patch pipeline。然后还中间结果可调试，比如你把视频中的 patch 也做一个 overlay。
+
+讨论要点：
+- 利用 FK 投影手部 mesh → 2D bbox → latent 空间 (30×40) 权重图
+- patch 生成和训练完全解耦：hand_patch.py 独立产出 .pth 权重文件，train_mitty.py 通过 --patch-dir 可选加载
+- MittyFlowMatchLoss 增加 patch_weights 分支，向后兼容
+- debug overlay 可视化：手部 mesh + latent grid + 高亮 cell
+
+**创建的任务：**
+- [007] 手部 patch 加权 loss：FK mesh 投影 → latent 权重图 → 训练加权
