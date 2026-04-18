@@ -104,3 +104,16 @@
 
 **创建的任务：**
 - [008] Inspire hand_state → SMPLH 手指姿态实时映射
+
+---
+
+**用户原始需求：**
+> 重建指标是不是主要看 FID? 如何对比两个视频的 FID? 你看一下当前的训练 pipeline，现在训练的 log 中有每次 eval 的视频，其中 Control, gen, ground Truth 都有，给一个计算重建指标的代码，多计算几个指标。
+
+讨论要点：
+- FID 需要大量样本才稳定，配对视频编辑任务更适合逐帧指标（LPIPS/SSIM/PSNR）
+- 环境无 lpips/torchmetrics 包，用 VGG16/InceptionV3 自实现 LPIPS/FID/FVD
+- 独立 CLI 工具，不集成到训练循环
+
+**创建的任务：**
+- [009] 训练 eval 视频重建指标计算工具
