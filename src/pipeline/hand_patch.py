@@ -43,8 +43,7 @@ import torch
 sys.stdout.reconfigure(line_buffering=True)
 
 from src.core.config import (
-    BEST_PARAMS, G1_URDF, MAIN_ROOT, MESH_DIR, SEGMENT_DIR,
-    TRAINING_DATA_ROOT, get_skip_meshes,
+    BEST_PARAMS, G1_URDF, MAIN_ROOT, MESH_DIR, get_skip_meshes,
 )
 from src.core.camera import make_camera_const
 from src.core.fk import build_q, do_fk, parse_urdf_meshes, preload_meshes
@@ -52,8 +51,10 @@ from src.pipeline.sam2_segment import (
     BODY_PARTS, mask_to_bbox, match_links, render_mask_for_links,
 )
 
-
-DEFAULT_SOURCE_MAP = os.path.join(TRAINING_DATA_ROOT, "pair", "1s", "source_map.json")
+# Use MAIN_ROOT (not BASE_DIR) so worktrees find shared training data
+_TRAINING_DATA = os.path.join(MAIN_ROOT, "training_data")
+_SEGMENT_DIR = os.path.join(_TRAINING_DATA, "segment")
+DEFAULT_SOURCE_MAP = os.path.join(_TRAINING_DATA, "pair", "1s", "source_map.json")
 SEGMENT_FPS = 30
 CLIP_FRAMES_1S = 30  # 1s at 30fps
 VIDEO_H, VIDEO_W = 480, 640
@@ -258,7 +259,7 @@ def process_pair(
         clip_idx = 0
 
     # Load segment parquet
-    parquet_path = os.path.join(SEGMENT_DIR, task, ep, f"{seg}_joints.parquet")
+    parquet_path = os.path.join(_SEGMENT_DIR, task, ep, f"{seg}_joints.parquet")
     if not os.path.isfile(parquet_path):
         print(f"  WARN: parquet not found: {parquet_path}")
         return None
@@ -285,7 +286,7 @@ def process_pair(
 
     # Debug overlay
     if debug_dir:
-        robot_video = os.path.join(SEGMENT_DIR, task, ep, f"{seg}_video.mp4")
+        robot_video = os.path.join(_SEGMENT_DIR, task, ep, f"{seg}_video.mp4")
         if os.path.isfile(robot_video):
             clip_start_sec = clip_idx * 1.0
             debug_path = os.path.join(debug_dir, f"{pair_name}.mp4")
