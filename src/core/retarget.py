@@ -137,6 +137,19 @@ FINGER_CURL_MAX_DEG = 40.0   # per segment, at fully-closed (v=0)
 FINGER_CURL_SIGN_L = -1.0    # left hand sign
 FINGER_CURL_SIGN_R = +1.0    # right hand sign
 
+# ── Inspire hand → SMPLH angle range (from URDF joint limits) ────────
+#
+# Non-thumb: MCP = 1.4381 rad, PIP = MCP * 1.0843 = 1.5593 rad
+#   total = 2.9974 rad (~172 deg), split across 3 SMPLH segments
+INSPIRE_FINGER_CURL_PER_SEG_RAD = (1.4381 + 1.4381 * 1.0843) / 3.0
+# Thumb close: 3 cascading joints = 0.5864 + 0.4704 + 0.4463 = 1.5031 rad
+#   split across SMPLH thumb2 + thumb3
+INSPIRE_THUMB_CLOSE_PER_SEG_RAD = (
+    0.5864 + 0.5864 * 0.8024 + 0.5864 * 0.8024 * 0.9487) / 2.0
+INSPIRE_THUMB_TILT_EXTRA_DEG = 15.0
+# G1 reordered finger indices → SMPLH FINGER_SLOTS keys
+G1_TO_SMPLH_FINGERS = ["index", "middle", "ring", "pinky"]
+
 # ── Thumb base opposition (default pose) ──────────────────────────────
 #
 # SMPLH T-pose thumb is splayed outward -- G1 Inspire's default thumb is
@@ -523,6 +536,58 @@ def build_finger_curl_pose(axis='z', angle_deg=40.0, fingers=None):
         for joint_offset in range(0, end - start, 3):
             pose[start + joint_offset:start + joint_offset + 3] = rot
     return pose.copy(), pose.copy()
+
+
+def apply_finger_curl_from_g1(hand_state, hand_type='inspire'):
+    """Map raw G1 hand_state (12-dim) to SMPLH hand_pose (45-dim per hand).
+
+    Copies Inspire hand angles and distributes them evenly across SMPLH
+    finger segments. Thumb opposition base is preserved from default pose.
+
+    Args:
+        hand_state: (12,) raw from dataset. Inspire: 0=closed, 1=open.
+        hand_type: 'inspire' only for now; others fall back to default.
+
+    Returns:
+        (left_hand_pose, right_hand_pose): each (45,) numpy float64
+    """
+    if hand_type != 'inspire':
+        return build_default_hand_pose()
+
+    hs = np.clip(1.0 - np.asarray(hand_state, dtype=np.float64), 0.0, 1.0)
+    L_hs = hs[[3, 2, 1, 0, 4, 5]]
+    R_hs = hs[[9, 8, 7, 6, 10, 11]]
+
+    L_pose, R_pose = build_default_hand_pose()
+    curl_axis = np.array([0.0, 0.0, 1.0])
+
+    for i, finger in enumerate(G1_TO_SMPLH_FINGERS):
+        start, end = FINGER_SLOTS[finger]
+        L_rot = curl_axis * (FINGER_CURL_SIGN_L * L_hs[i]
+                             * INSPIRE_FINGER_CURL_PER_SEG_RAD)
+        R_rot = curl_axis * (FINGER_CURL_SIGN_R * R_hs[i]
+                             * INSPIRE_FINGER_CURL_PER_SEG_RAD)
+        for j in range(0, end - start, 3):
+            L_pose[start + j:start + j + 3] = L_rot
+            R_pose[start + j:start + j + 3] = R_rot
+
+    # Thumb close → thumb2 (39:42) and thumb3 (42:45)
+    L_tc = curl_axis * (FINGER_CURL_SIGN_L * L_hs[4]
+                        * INSPIRE_THUMB_CLOSE_PER_SEG_RAD)
+    R_tc = curl_axis * (FINGER_CURL_SIGN_R * R_hs[4]
+                        * INSPIRE_THUMB_CLOSE_PER_SEG_RAD)
+    L_pose[39:42] = L_tc
+    L_pose[42:45] = L_tc
+    R_pose[39:42] = R_tc
+    R_pose[42:45] = R_tc
+
+    # Thumb tilt → additional opposition on thumb1 (36:39)
+    L_pose[36:39] += THUMB_DEFAULT_L_AXIS * np.radians(
+        L_hs[5] * INSPIRE_THUMB_TILT_EXTRA_DEG)
+    R_pose[36:39] += THUMB_DEFAULT_R_AXIS * np.radians(
+        R_hs[5] * INSPIRE_THUMB_TILT_EXTRA_DEG)
+
+    return L_pose, R_pose
 
 
 # ── IK refinement ────────────────────────────────────────────────────
