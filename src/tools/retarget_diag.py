@@ -36,6 +36,7 @@ from src.core.smplh import (SMPLHForIK, extract_g1_targets, G1_KEYPOINTS,
 from src.core.retarget import (retarget_frame, refine_arms, compute_g1_rest_transforms,
                                scale_hands, build_default_hand_pose,
                                build_thumb_base_pose, build_finger_curl_pose,
+                               apply_finger_curl_from_g1,
                                BONE_MAP, SPINE_JOINTS, DIRECT_ROT_MAP,
                                SHOULDER_TWIST_MAP, WRIST_LOCAL_CORRECTION_DEG,
                                FINGER_CURL_AXIS, FINGER_CURL_MAX_DEG,
@@ -214,6 +215,10 @@ def main():
                         help="Base-point offset in G1 +X (meters). Positive "
                              "= base point forward → mesh visually moves back. "
                              "Default -0.10 (base back → mesh forward 10cm).")
+    parser.add_argument("--live-hand", dest="live_hand", action="store_true",
+                        default=False,
+                        help="Use G1 hand_state from episode data to drive "
+                             "SMPLH finger pose (Inspire only)")
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--refine", action="store_true",
                         help="Enable arm IK refinement (default: off)")
@@ -583,6 +588,10 @@ def main():
         tag = f"thumb{axis}L{int(L_deg):+d}R{int(R_deg):+d}".replace('+', 'p').replace('-', 'm')
         for wrist_rot in variants:
             render_one(wrist_rot, hand_L=hL, hand_R=hR, finger_tag=tag)
+    elif args.live_hand and hand_type == 'inspire':
+        hL, hR = apply_finger_curl_from_g1(hs, hand_type=hand_type)
+        for wrist_rot in variants:
+            render_one(wrist_rot, hand_L=hL, hand_R=hR, finger_tag="live_hand")
     else:
         for wrist_rot in variants:
             render_one(wrist_rot)
