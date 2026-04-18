@@ -57,6 +57,10 @@ output/
 weights/
 ProPainter/
 ref-cosmos-transfer1/
+models/
+training_data/
+wandb/
+*.log
 
 # === 含敏感 token 的本地配置 ===
 notion_mcp_config.json
