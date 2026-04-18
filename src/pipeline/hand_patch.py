@@ -63,11 +63,11 @@ VAE_SPATIAL = 16  # VAE spatial downsampling factor
 
 # ── FK helpers ────────────────────────────────────────────────────────
 
-def load_fk_model():
+def load_fk_model(hand_type="inspire"):
     model = pin.buildModelFromUrdf(str(G1_URDF), pin.JointModelFreeFlyer())
     data = model.createData()
     link_meshes = parse_urdf_meshes(str(G1_URDF))
-    skip_set = get_skip_meshes("inspire")
+    skip_set = get_skip_meshes(hand_type)
     mesh_cache = preload_meshes(link_meshes, str(MESH_DIR), skip_set=skip_set)
     hand_caches = {
         "left_hand": match_links(mesh_cache, BODY_PARTS["left_hand"]),

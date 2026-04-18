@@ -137,6 +137,8 @@ SEGMENT_DIR = os.path.join(TRAINING_DATA_ROOT, "segment")
 SEEDANCE_DIRECT_DIR = os.path.join(TRAINING_DATA_ROOT, "seedance_direct")
 OVERLAY_DIR = os.path.join(TRAINING_DATA_ROOT, "overlay")
 OVERLAY_4S_DIR = os.path.join(OVERLAY_DIR, "4s")
+SEEDANCE_ADVANCE_DIR = os.path.join(TRAINING_DATA_ROOT, "seedance_advance")
+HAND_PATCH_4S_DIR = os.path.join(TRAINING_DATA_ROOT, "hand_patch", "4s")
 PAIR_DIR = os.path.join(TRAINING_DATA_ROOT, "pair")
 
 # ── Pipeline intermediate outputs ──
