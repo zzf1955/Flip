@@ -7,18 +7,23 @@ but adds a proper training loop with:
 - Per-step train loss logging
 - Periodic eval loss computation
 - Eval video generation (ground truth + control + generated)
+- Multi-GPU DDP support (torchrun)
 - Organized output: ckpt/, eval/, train.log
 
 Usage:
+  # Single GPU
   python -m src.pipeline.train_lora \
     --cache-dir output/data_cache_80 \
     --device cuda:0 --epochs 1 --repeat 1 \
     --save-steps 5 --eval-steps 5 --eval-video-steps 50
+
+  # Multi-GPU DDP (4 GPUs)
+  torchrun --nproc_per_node=4 -m src.pipeline.train_lora \
+    --cache-dir output/data_cache_80 --epochs 1 --repeat 20 \
+    --save-steps 50 --eval-steps 50 --eval-video-steps 50
 """
 
 import argparse
-import glob
-import logging
 import os
 import random
 import sys
@@ -29,11 +34,8 @@ from datetime import datetime
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 sys.stdout.reconfigure(line_buffering=True)
 
-import numpy as np
-import subprocess
 import torch
-from PIL import Image
-from safetensors.torch import save_file
+import torch.distributed as dist
 
 # Import WanTrainingModule from DiffSynth-Studio examples (not part of the
 # installed diffsynth package — it lives in the examples/ directory).
@@ -46,6 +48,22 @@ from train import WanTrainingModule  # noqa: E402
 
 from diffsynth.diffusion.flow_match import FlowMatchScheduler  # noqa: E402
 from src.core.config import MAIN_ROOT, TRAINING_DATA_ROOT  # noqa: E402
+from src.core.train_utils import (  # noqa: E402
+    CsvLogger,
+    WandbLogger,
+    cleanup_distributed,
+    load_cached_files,
+    load_sample,
+    log_step_eval_videos,
+    reduce_scalar,
+    save_lora_ckpt,
+    save_video,
+    setup_distributed,
+    setup_logging,
+    sync_gradients,
+    tensor_to_frames,
+)
+
 
 # ── Defaults ──────────────────────────────────────────────────────────
 
@@ -67,27 +85,6 @@ DEFAULT_TOKENIZER_PATH = os.path.join(
 
 # ── Helpers ───────────────────────────────────────────────────────────
 
-def setup_logging(log_path: str) -> logging.Logger:
-    logger = logging.getLogger("train_lora")
-    logger.setLevel(logging.INFO)
-    fmt = logging.Formatter("[%(asctime)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
-    fh = logging.FileHandler(log_path)
-    fh.setFormatter(fmt)
-    logger.addHandler(fh)
-    sh = logging.StreamHandler(sys.stdout)
-    sh.setFormatter(fmt)
-    logger.addHandler(sh)
-    return logger
-
-
-def load_cached_files(cache_dir: str) -> list[str]:
-    """Scan cache directory for .pth files (output of DiffSynth data_process)."""
-    files = sorted(glob.glob(os.path.join(cache_dir, "**", "*.pth"), recursive=True))
-    if not files:
-        raise FileNotFoundError(f"No .pth files in {cache_dir}")
-    return files
-
-
 def split_train_eval(files: list[str], eval_ratio: float, seed: int):
     """Deterministic split into train and eval sets."""
     if eval_ratio <= 0:
@@ -97,55 +94,6 @@ def split_train_eval(files: list[str], eval_ratio: float, seed: int):
     rng.shuffle(shuffled)
     n_eval = max(1, int(len(shuffled) * eval_ratio))
     return shuffled[n_eval:], shuffled[:n_eval]
-
-
-def load_sample(path: str):
-    """Load a cached .pth sample → (inputs_shared, inputs_posi, inputs_nega)."""
-    return torch.load(path, map_location="cpu", weights_only=False)
-
-
-def save_lora_ckpt(model, path: str) -> int:
-    """Extract LoRA params and save as safetensors. Returns number of tensors."""
-    sd = model.state_dict()
-    sd = model.export_trainable_state_dict(sd, remove_prefix="pipe.dit.")
-    save_file({k: v.contiguous() for k, v in sd.items()}, path)
-    return len(sd)
-
-
-# ── Video helpers ─────────────────────────────────────────────────────
-
-FFMPEG = os.environ.get(
-    "FFMPEG_BIN",
-    "/home/leadtek/miniconda3/envs/flip/bin/ffmpeg",
-)
-
-
-def save_video(frames, path, fps=16):
-    """Save list of PIL.Image frames as H.264 MP4 via ffmpeg pipe."""
-    h, w = frames[0].size[1], frames[0].size[0]
-    cmd = [
-        FFMPEG, "-y",
-        "-f", "rawvideo", "-pix_fmt", "rgb24",
-        "-s", f"{w}x{h}", "-r", str(fps),
-        "-i", "pipe:0",
-        "-c:v", "libx264", "-crf", "18", "-preset", "fast",
-        "-pix_fmt", "yuv420p", path,
-    ]
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    for f in frames:
-        proc.stdin.write(np.array(f).tobytes())
-    proc.stdin.close()
-    proc.wait()
-
-
-def tensor_to_frames(video_tensor):
-    """Convert VAE output [B, 3, T, H, W] range [-1,1] to list of PIL.Image."""
-    video = video_tensor[0]  # [3, T, H, W]
-    video = (video.float().clamp(-1, 1) + 1) / 2 * 255
-    video = video.to(torch.uint8).cpu().numpy()  # [3, T, H, W]
-    video = video.transpose(1, 2, 3, 0)  # [T, H, W, 3]
-    return [Image.fromarray(frame) for frame in video]
 
 
 def generate_eval_videos(model, eval_files, eval_dir, step, device,
@@ -249,31 +197,68 @@ def generate_eval_videos(model, eval_files, eval_dir, step, device,
 # ── Training ──────────────────────────────────────────────────────────
 
 def train(args):
-    # ── Output directory ──
+    # ── DDP setup ──
+    rank, world_size, ddp_device = setup_distributed()
+    is_main = (rank == 0)
+    if ddp_device is not None:
+        args.device = ddp_device  # override --device with LOCAL_RANK
+
+    # ── Output directory (rank 0 only) ──
     run_name = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     run_dir = os.path.join(args.output_dir, run_name)
     ckpt_dir = os.path.join(run_dir, "ckpt")
     eval_dir = os.path.join(run_dir, "eval")
-    os.makedirs(ckpt_dir, exist_ok=True)
-    os.makedirs(eval_dir, exist_ok=True)
+    if is_main:
+        os.makedirs(ckpt_dir, exist_ok=True)
+        os.makedirs(eval_dir, exist_ok=True)
+    if world_size > 1:
+        dist.barrier()
 
-    log = setup_logging(os.path.join(run_dir, "train.log"))
-    log.info(f"Run: {run_dir}")
-    log.info(f"Args: {vars(args)}")
+    log = setup_logging(os.path.join(run_dir, "train.log"),
+                        name="train_lora") if is_main else None
+
+    # ── CSV ──
+    csv_headers = [
+        "step", "train_loss", "lr", "time_s",
+        "eval_loss", "save_ckpt", "eval_video",
+    ]
+    csv_logger = CsvLogger(os.path.join(run_dir, "train.csv"),
+                           csv_headers) if is_main else None
+
+    # ── W&B (rank 0 only; no-op if --wandb-project not set) ──
+    wb = WandbLogger(
+        project=args.wandb_project if is_main else None,
+        run_name=args.wandb_run_name or run_name,
+        config=vars(args),
+        tags=(args.wandb_tags or []) + ["fun-control"],
+        dir=run_dir,
+    )
+
+    def info(msg):
+        if log:
+            log.info(msg)
+
+    def write_csv_row(**fields):
+        if csv_logger is not None:
+            csv_logger.write(**fields)
+
+    info(f"Run: {run_dir}")
+    info(f"Args: {vars(args)}")
+    info(f"DDP: rank={rank}, world_size={world_size}, device={args.device}")
 
     # ── Data ──
-    all_files = load_cached_files(args.cache_dir)
+    all_files = load_cached_files(args.cache_dir, recursive=True)
     train_files, eval_files = split_train_eval(all_files, args.eval_ratio, args.seed)
-    log.info(f"Data: {len(all_files)} total -> {len(train_files)} train, {len(eval_files)} eval")
+    info(f"Data: {len(all_files)} total -> {len(train_files)} train, {len(eval_files)} eval")
 
     # ── Model (DiT + optional VAE) ──
-    log.info("Loading model...")
+    info("Loading model...")
     t0 = time.time()
 
-    # Build model_paths JSON — DiT always, VAE if eval videos requested
-    if args.vae_path and args.eval_video_steps > 0:
+    # Build model_paths JSON — DiT always, VAE if eval videos requested (rank 0 only)
+    if args.vae_path and args.eval_video_steps > 0 and is_main:
         model_paths = f'["{args.dit_path}", "{args.vae_path}"]'
-        log.info("VAE included for eval video generation")
+        info("VAE included for eval video generation (rank 0 only)")
     else:
         model_paths = f'["{args.dit_path}"]'
 
@@ -288,11 +273,18 @@ def train(args):
         task="sft:train",
         device=args.device,
     )
-    log.info(f"Model loaded in {time.time() - t0:.1f}s")
+    info(f"Model loaded in {time.time() - t0:.1f}s")
 
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     n_total = sum(p.numel() for p in model.parameters())
-    log.info(f"Params: {n_total:,} total, {n_trainable:,} trainable ({n_trainable / 1e6:.1f}M)")
+    info(f"Params: {n_total:,} total, {n_trainable:,} trainable ({n_trainable / 1e6:.1f}M)")
+
+    # ── Sync initial LoRA weights across ranks ──
+    if world_size > 1:
+        for p in model.parameters():
+            if p.requires_grad:
+                dist.broadcast(p.data, src=0)
+        info("LoRA weights synced across ranks")
 
     # ── Optimizer ──
     optimizer = torch.optim.AdamW(
@@ -301,24 +293,34 @@ def train(args):
     lr_scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0)
 
     # ── Training loop ──
-    total_steps = args.epochs * len(train_files) * args.repeat
-    log.info(
+    # Each rank processes a shard of the data. Global step = per-rank step.
+    # Effective batch size = world_size (gradient averaging).
+    epoch_samples = len(train_files) * args.repeat
+    steps_per_epoch = epoch_samples // world_size
+    total_steps = args.epochs * steps_per_epoch
+    info(
         f"Plan: {args.epochs} ep x {len(train_files)} train x {args.repeat} repeat"
-        f" = {total_steps} steps"
+        f" = {epoch_samples} samples/ep"
     )
-    log.info(f"Save every {args.save_steps}, eval loss every {args.eval_steps}"
-             f", eval video every {args.eval_video_steps} steps")
-    log.info("=" * 60)
+    info(
+        f"DDP: {epoch_samples} samples / {world_size} ranks"
+        f" = {steps_per_epoch} steps/ep, {total_steps} total"
+    )
+    info(f"Save every {args.save_steps}, eval loss every {args.eval_steps}"
+         f", eval video every {args.eval_video_steps} steps")
+    info("=" * 60)
 
     step = 0
     train_t0 = time.time()
 
     for epoch in range(args.epochs):
+        # All ranks use same shuffle order, then each takes its shard
         rng = random.Random(args.seed + epoch)
         epoch_files = train_files * args.repeat
         rng.shuffle(epoch_files)
+        my_files = epoch_files[rank::world_size]
 
-        for fpath in epoch_files:
+        for fpath in my_files:
             step += 1
             st = time.time()
 
@@ -326,23 +328,53 @@ def train(args):
             optimizer.zero_grad()
             loss = model({}, inputs=data)
             loss.backward()
+
+            # All-reduce LoRA gradients across ranks
+            if world_size > 1:
+                sync_gradients(model)
+
             optimizer.step()
             lr_scheduler.step()
 
+            # All-reduce loss for logging
+            loss_val = loss.item()
+            if world_size > 1:
+                loss_val = reduce_scalar(loss_val, args.device)
+
+            step_time = time.time() - st
             lr = optimizer.param_groups[0]["lr"]
-            log.info(
-                f"step={step}/{total_steps} train_loss={loss.item():.4f}"
-                f" lr={lr:.1e} time={time.time() - st:.1f}s"
+            info(
+                f"step={step}/{total_steps} train_loss={loss_val:.4f}"
+                f" lr={lr:.1e} time={step_time:.1f}s"
             )
 
-            # Checkpoint
-            if args.save_steps and step % args.save_steps == 0:
+            row_fields = {
+                "step": step,
+                "train_loss": f"{loss_val:.4f}",
+                "lr": f"{lr:.3e}",
+                "time_s": f"{step_time:.2f}",
+            }
+            if is_main:
+                wb.log({
+                    "train/loss": loss_val,
+                    "train/lr": lr,
+                    "train/time_s": step_time,
+                }, step=step)
+
+            hit_eval = (args.eval_steps
+                        and step % args.eval_steps == 0 and eval_files)
+            hit_eval_video = (args.eval_video_steps
+                              and step % args.eval_video_steps == 0 and eval_files)
+
+            # Checkpoint (rank 0 only)
+            if args.save_steps and step % args.save_steps == 0 and is_main:
                 p = os.path.join(ckpt_dir, f"step-{step:04d}.safetensors")
                 n = save_lora_ckpt(model, p)
-                log.info(f"  SAVE {p} ({n} tensors)")
+                info(f"  SAVE {p} ({n} tensors)")
+                row_fields["save_ckpt"] = os.path.basename(p)
 
-            # Eval loss
-            if args.eval_steps and step % args.eval_steps == 0 and eval_files:
+            # Eval loss (rank 0 only)
+            if hit_eval and is_main:
                 losses = []
                 with torch.no_grad():
                     for ef in eval_files:
@@ -350,37 +382,59 @@ def train(args):
                         el = model({}, inputs=ed)
                         losses.append(el.item())
                 avg = sum(losses) / len(losses)
-                log.info(f"  EVAL eval_loss={avg:.4f} ({len(losses)} samples)")
+                info(f"  EVAL eval_loss={avg:.4f} ({len(losses)} samples)")
+                row_fields["eval_loss"] = f"{avg:.4f}"
+                wb.log({"train/eval_loss_in_task": avg}, step=step)
 
-            # Eval videos (separate, usually less frequent)
-            if (args.eval_video_steps and step % args.eval_video_steps == 0
-                    and eval_files):
+            # Eval videos (rank 0 only)
+            if hit_eval_video and is_main:
                 generate_eval_videos(
                     model, eval_files, eval_dir, step, args.device,
                     num_samples=args.eval_video_samples,
                     num_inference_steps=args.num_inference_steps,
                     log=log,
                 )
+                row_fields["eval_video"] = f"step-{step:04d}"
+                if args.wandb_log_videos:
+                    log_step_eval_videos(
+                        wb, os.path.join(eval_dir, f"step-{step:04d}"), step,
+                    )
+
+            write_csv_row(**row_fields)
+
+            # Barrier after eval to keep ranks in sync
+            if world_size > 1 and (hit_eval or hit_eval_video):
+                dist.barrier()
 
     # Final checkpoint if not already saved at last step
-    if args.save_steps and step > 0 and step % args.save_steps != 0:
+    if args.save_steps and step > 0 and step % args.save_steps != 0 and is_main:
         p = os.path.join(ckpt_dir, f"step-{step:04d}.safetensors")
         save_lora_ckpt(model, p)
-        log.info(f"  SAVE (final) {p}")
+        info(f"  SAVE (final) {p}")
 
-    # Final eval videos
+    # Final eval videos (rank 0 only)
     if (args.eval_video_steps and step > 0
-            and step % args.eval_video_steps != 0 and eval_files):
+            and step % args.eval_video_steps != 0 and eval_files and is_main):
         generate_eval_videos(
             model, eval_files, eval_dir, step, args.device,
             num_samples=args.eval_video_samples,
             num_inference_steps=args.num_inference_steps,
             log=log,
         )
+        if args.wandb_log_videos:
+            _log_step_videos(wb, "eval/video_in_task",
+                             os.path.join(eval_dir, f"step-{step:04d}"), step)
 
     elapsed = time.time() - train_t0
-    log.info("=" * 60)
-    log.info(f"Done. {step} steps in {elapsed:.0f}s ({elapsed / step:.1f}s/step)")
+    info("=" * 60)
+    if step > 0:
+        info(f"Done. {step} steps in {elapsed:.0f}s ({elapsed / step:.1f}s/step)")
+
+    if csv_logger is not None:
+        csv_logger.close()
+    wb.finish()
+
+    cleanup_distributed()
 
 
 # ── CLI ───────────────────────────────────────────────────────────────
@@ -425,6 +479,17 @@ def main():
                     help="Number of eval videos to generate per eval point")
     ap.add_argument("--num-inference-steps", type=int, default=30,
                     help="Denoising steps for eval video generation")
+
+    # W&B
+    ap.add_argument("--wandb-project", default=None,
+                    help="W&B project name; unset = disabled")
+    ap.add_argument("--wandb-run-name", default=None,
+                    help="W&B run name (default: timestamp)")
+    ap.add_argument("--wandb-tags", nargs="+", default=[],
+                    help="extra W&B tags (in addition to 'fun-control')")
+    ap.add_argument("--wandb-log-videos", action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help="upload eval videos to W&B (--no-wandb-log-videos to skip)")
 
     args = ap.parse_args()
 
