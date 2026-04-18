@@ -117,3 +117,18 @@
 
 **创建的任务：**
 - [009] 训练 eval 视频重建指标计算工具
+
+---
+
+## 2026-04-19
+
+**用户原始需求：**
+> 重构数据 pipeline。加一条新线：inpaint + 人体 Mesh overlay → Seedance 合成增强数据（seedance_advance）。加手部 patch 数据生成功能。make_pair 整合 hand patch，切片时不输出中间数据，直接输出 control、gt、hand patch。
+
+讨论要点：
+- seedance_advance 复用 seedance_gen API 函数，overlay 作为 Seedance 输入
+- 手部 patch 拆为两阶段：4s segment 级 per-frame bbox（parquet）+ make_pair 内联生成 latent weight map
+- Seedance prompt 采用 CG→真实增强风格
+
+**创建的任务：**
+- [010] 数据 Pipeline 重构: seedance_advance + 手部 patch + make_pair 整合
