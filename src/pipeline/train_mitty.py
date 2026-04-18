@@ -409,9 +409,10 @@ def train(args):
     patch_dir_eval = ""
     patch_dir_ood = ""
     if args.patch_dir:
-        patch_base = os.path.dirname(args.patch_dir)
-        patch_dir_eval = os.path.join(patch_base, "eval")
-        patch_dir_ood = os.path.join(patch_base, "ood_eval")
+        patch_leaf = os.path.basename(args.patch_dir)
+        patch_parent = os.path.dirname(os.path.dirname(args.patch_dir))
+        patch_dir_eval = os.path.join(patch_parent, "eval", patch_leaf)
+        patch_dir_ood = os.path.join(patch_parent, "ood_eval", patch_leaf)
         info(f"Patch weights: train={args.patch_dir}"
              f" eval={patch_dir_eval} ood={patch_dir_ood}")
     else:
