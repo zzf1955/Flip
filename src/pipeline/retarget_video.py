@@ -37,7 +37,8 @@ from src.core.camera import make_camera_const, make_camera, project_points_cv
 from src.core.render import render_mask_and_overlay, render_mesh_on_image
 from src.core.smplh import SMPLHForIK, extract_g1_targets, R_SMPLH_TO_G1_NP
 from src.core.retarget import (retarget_frame, refine_arms, compute_g1_rest_transforms,
-                            scale_hands, build_default_hand_pose)
+                            scale_hands, build_default_hand_pose,
+                            apply_finger_curl_from_g1)
 from src.core.data import (load_episode_info, open_video_writer,
                                    write_frame, close_video)
 
@@ -101,11 +102,6 @@ def main():
     params = BEST_PARAMS
     cam_const = make_camera_const(params)
     print(f"Camera model: {CAMERA_MODEL}")
-
-    # ── Default hand pose (thumb opposition + straight fingers) ──
-    hand_L_np, hand_R_np = build_default_hand_pose()
-    hand_L_t = torch.tensor(hand_L_np, dtype=torch.float64, device=args.device)
-    hand_R_t = torch.tensor(hand_R_np, dtype=torch.float64, device=args.device)
 
     # ── Face mask: drop neck/head triangles ──
     # SMPLH joints: 12 = neck, 15 = head. A face is considered "head" if
@@ -208,6 +204,11 @@ def main():
         q = build_q(model, rq, hs, hand_type=hand_type)
         transforms = do_fk(model, data_pin, q)
         targets = extract_g1_targets(transforms)
+
+        # ── Per-frame hand pose from G1 hand_state ──
+        hand_L_np, hand_R_np = apply_finger_curl_from_g1(hs, hand_type=hand_type)
+        hand_L_t = torch.tensor(hand_L_np, dtype=torch.float64, device=args.device)
+        hand_R_t = torch.tensor(hand_R_np, dtype=torch.float64, device=args.device)
 
         # ── Step 1: Retarget ──
         root_trans_np, root_orient_np, body_pose_np = retarget_frame(
