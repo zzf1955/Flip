@@ -1,0 +1,718 @@
+"""Mitty-style LoRA training for Wan 2.2 TI2V-5B.
+
+Uses `mitty_model_fn_wan_video` + `MittyFlowMatchLoss` for in-context training:
+  latents = cat([human_lat (clean), robot_noisy], dim=2)
+  loss = MSE only on the robot segment.
+
+Usage:
+  # Single GPU smoke
+  CUDA_VISIBLE_DEVICES=2 python -m src.pipeline.train_mitty \\
+    --cache-train output/mitty_cache_1s/train \\
+    --cache-eval  output/mitty_cache_1s/eval \\
+    --cache-ood   output/mitty_cache_1s/ood_eval \\
+    --epochs 1 --repeat 1 --save-steps 10 --eval-steps 10 --eval-video-steps 20
+
+  # DDP 4 GPUs (equivalent bs=4 for Mitty)
+  torchrun --nproc_per_node=4 -m src.pipeline.train_mitty \\
+    --cache-train output/mitty_cache_1s/train \\
+    --cache-eval  output/mitty_cache_1s/eval \\
+    --cache-ood   output/mitty_cache_1s/ood_eval \\
+    --epochs 3 --repeat 5 --save-steps 50 --eval-steps 50 --eval-video-steps 100
+"""
+
+import argparse
+import os
+import random
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+sys.stdout.reconfigure(line_buffering=True)
+
+import torch
+import torch.distributed as dist
+
+from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
+from diffsynth.diffusion.flow_match import FlowMatchScheduler
+from diffsynth.diffusion.training_module import DiffusionTrainingModule
+
+from src.core.config import MAIN_ROOT, TRAINING_DATA_ROOT
+from src.core.train_utils import (
+    CsvLogger,
+    WandbLogger,
+    cleanup_distributed,
+    load_cached_files,
+    load_sample,
+    log_step_eval_videos,
+    reduce_scalar,
+    save_lora_ckpt,
+    save_video,
+    setup_distributed,
+    setup_logging,
+    sync_gradients,
+    tensor_to_frames,
+)
+from src.pipeline.mitty_model_fn import (
+    mitty_model_fn_wan_video, MittyFlowMatchLoss,
+)
+
+
+# ── Defaults ────────────────────────────────────────────────────────────
+
+MANUAL_DIR = os.path.join(
+    "/disk_n/zzf/.cache/huggingface/hub",
+    "models--Wan-AI--Wan2.2-TI2V-5B", "manual",
+)
+DEFAULT_T5 = os.path.join(MANUAL_DIR, "models_t5_umt5-xxl-enc-bf16.pth")
+DEFAULT_DIT_DIR = MANUAL_DIR
+DEFAULT_VAE = os.path.join(MANUAL_DIR, "Wan2.2_VAE.pth")
+DEFAULT_TOKENIZER = os.path.join(MANUAL_DIR, "google", "umt5-xxl")
+
+
+# ── Model ──────────────────────────────────────────────────────────────
+
+def build_pipe(device: str, dit_dir: str, vae_path: str,
+               tokenizer_dir: str, load_vae: bool = True) -> WanVideoPipeline:
+    """Load TI2V-5B DiT (+VAE) with layered VRAM:
+    - DiT resident on GPU (bf16, ~10 GB)
+    - VAE CPU offload (eval-only)
+    - T5 is NOT loaded (text embeddings are pre-cached)
+    """
+    dit_shards = sorted(
+        os.path.join(dit_dir, f) for f in os.listdir(dit_dir)
+        if f.startswith("diffusion_pytorch_model-") and f.endswith(".safetensors")
+    )
+    assert dit_shards, f"No DiT shards in {dit_dir}"
+
+    dit_kwargs = {
+        "offload_dtype": torch.bfloat16,
+        "offload_device": device,
+        "onload_dtype": torch.bfloat16,
+        "onload_device": device,
+        "preparing_dtype": torch.bfloat16,
+        "preparing_device": device,
+        "computation_dtype": torch.bfloat16,
+        "computation_device": device,
+    }
+    vae_kwargs = {
+        "offload_dtype": torch.bfloat16,
+        "offload_device": "cpu",
+        "onload_dtype": torch.bfloat16,
+        "onload_device": "cpu",
+        "preparing_dtype": torch.bfloat16,
+        "preparing_device": device,
+        "computation_dtype": torch.bfloat16,
+        "computation_device": device,
+    }
+
+    model_configs = [ModelConfig(path=dit_shards, **dit_kwargs)]
+    if load_vae:
+        model_configs.append(ModelConfig(path=vae_path, **vae_kwargs))
+
+    pipe = WanVideoPipeline.from_pretrained(
+        torch_dtype=torch.bfloat16,
+        device=device,
+        model_configs=model_configs,
+        tokenizer_config=ModelConfig(path=tokenizer_dir),
+    )
+    return pipe
+
+
+class MittyTrainingModule(DiffusionTrainingModule):
+    """Training wrapper: loads pipe, injects LoRA on DiT, installs Mitty model_fn."""
+
+    def __init__(
+        self,
+        device: str,
+        dit_dir: str = DEFAULT_DIT_DIR,
+        vae_path: str = DEFAULT_VAE,
+        tokenizer_dir: str = DEFAULT_TOKENIZER,
+        lora_rank: int = 96,
+        lora_target_modules: str = "q,k,v,o",
+        use_gradient_checkpointing: bool = True,
+        load_vae: bool = True,
+    ):
+        super().__init__()
+        self.pipe = build_pipe(device, dit_dir, vae_path, tokenizer_dir,
+                               load_vae=load_vae)
+        self.pipe.scheduler.set_timesteps(1000, training=True)
+
+        # Freeze everything
+        for name, module in self.pipe.named_children():
+            for p in module.parameters():
+                p.requires_grad_(False)
+
+        # Inject LoRA into DiT
+        target_modules = [m.strip() for m in lora_target_modules.split(",")]
+        if len(target_modules) == 1:
+            target_modules = target_modules[0]
+        self.pipe.dit = self.add_lora_to_model(
+            self.pipe.dit,
+            target_modules=target_modules,
+            lora_rank=lora_rank,
+            upcast_dtype=torch.bfloat16,
+        )
+
+        # Install Mitty forward
+        self.pipe.model_fn = mitty_model_fn_wan_video
+
+        # Training mode + grad ckpt
+        self.pipe.dit.train()
+        self.use_gradient_checkpointing = use_gradient_checkpointing
+        self.device = device
+
+    def forward(self, sample: dict) -> torch.Tensor:
+        sample = dict(sample)  # shallow copy
+        sample["use_gradient_checkpointing"] = self.use_gradient_checkpointing
+        return MittyFlowMatchLoss(self.pipe, **sample)
+
+
+# ── Sample IO ──────────────────────────────────────────────────────────
+
+def _load_patch_weights(sample: dict, cache_path: str, patch_dir: str):
+    """Attach patch_weights from a companion .pth in patch_dir."""
+    patch_path = os.path.join(patch_dir, os.path.basename(cache_path))
+    if os.path.isfile(patch_path):
+        pd_ = torch.load(patch_path, map_location="cpu", weights_only=False)
+        sample["patch_weights"] = pd_["weights"]
+
+
+def prepare_sample(sample: dict, device: str,
+                   dtype=torch.bfloat16) -> dict:
+    """Move cached latents + context to device, keep PIL/str fields as-is."""
+    out = {}
+    for k, v in sample.items():
+        if isinstance(v, torch.Tensor):
+            out[k] = v.to(device=device, dtype=dtype if v.is_floating_point() else v.dtype)
+        else:
+            out[k] = v
+    # Rename robot_latent → input_latents for MittyFlowMatchLoss compatibility
+    if "robot_latent" in out:
+        out["input_latents"] = out.pop("robot_latent")
+    if "context_posi" in out and "context" not in out:
+        out["context"] = out["context_posi"]
+    return out
+
+
+def collate_batch(samples: list[dict], device: str,
+                  dtype=torch.bfloat16) -> dict:
+    """Stack multiple cached samples into a true batch.
+
+    WanModel supports batch>1 in DiTBlock: t_mod shape (1, N, 6, dim) broadcasts
+    to (B, N, dim) after squeeze(2). The whole batch shares one timestep (sampled
+    once per batch), consistent with Mitty's flow-match training.
+    """
+    batch = {
+        "human_latent": torch.cat([s["human_latent"] for s in samples], dim=0).to(device, dtype),
+        "input_latents": torch.cat([s["robot_latent"] for s in samples], dim=0).to(device, dtype),
+        "context": torch.cat([s["context_posi"] for s in samples], dim=0).to(device, dtype),
+    }
+    if any("patch_weights" in s for s in samples):
+        pw = []
+        for s in samples:
+            if "patch_weights" in s:
+                pw.append(s["patch_weights"])
+            else:
+                f_R = s["robot_latent"].shape[2]
+                h, w = s["robot_latent"].shape[3], s["robot_latent"].shape[4]
+                pw.append(torch.ones(f_R, h, w, dtype=dtype))
+        batch["patch_weights"] = torch.stack(pw, dim=0).to(device, dtype)
+    return batch
+
+
+# ── Eval ───────────────────────────────────────────────────────────────
+
+@torch.no_grad()
+def eval_loss(model: MittyTrainingModule, files: list[str], device: str,
+              num_t_samples: int = 5, seed_base: int = 12345,
+              patch_dir: str = "") -> float:
+    """Eval MSE loss averaged over every file × `num_t_samples` timesteps.
+
+    MittyFlowMatchLoss samples one random timestep + noise per call, so a single
+    eval pass on 5-8 samples has high variance. We call it `num_t_samples` times
+    per sample with deterministic seeds so the eval metric is both low-variance
+    and reproducible across checkpoints.
+
+    RNG state is saved and restored so this does not perturb training.
+    """
+    torch_state = torch.get_rng_state()
+    cuda_state = (torch.cuda.get_rng_state(device)
+                  if torch.cuda.is_available() else None)
+    try:
+        losses = []
+        for i, f in enumerate(files):
+            s = load_sample(f)
+            if patch_dir:
+                _load_patch_weights(s, f, patch_dir)
+            s = prepare_sample(s, device)
+            sub = []
+            for k in range(num_t_samples):
+                # Distinct seed per (sample, k) → spread across timesteps;
+                # deterministic across eval calls → comparable over training.
+                torch.manual_seed(seed_base + i * num_t_samples + k)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(seed_base + i * num_t_samples + k)
+                sub.append(model(s).item())
+            losses.append(sum(sub) / num_t_samples)
+        return sum(losses) / max(1, len(losses))
+    finally:
+        torch.set_rng_state(torch_state)
+        if cuda_state is not None:
+            torch.cuda.set_rng_state(cuda_state, device)
+
+
+@torch.no_grad()
+def generate_eval_videos(
+    model: MittyTrainingModule,
+    files: list[str],
+    out_dir: str,
+    step: int,
+    device: str,
+    num_samples: int = 2,
+    num_inference_steps: int = 30,
+    cfg_scale: float = 5.0,
+    log=None,
+):
+    """Mitty H2R zero-frame denoising: cat(clean_human, noise) → denoise robot only."""
+    pipe = model.pipe
+    vae = getattr(pipe, "vae", None)
+    if vae is None:
+        if log:
+            log.info("  EVAL VIDEO skipped (no VAE)")
+        return
+
+    sched = FlowMatchScheduler("Wan")
+    sched.set_timesteps(num_inference_steps=num_inference_steps,
+                        denoising_strength=1.0, shift=5.0)
+
+    step_dir = Path(out_dir) / f"step-{step:04d}"
+    step_dir.mkdir(parents=True, exist_ok=True)
+
+    # Set DiT to eval mode during inference (disable dropout, etc.)
+    was_training = pipe.dit.training
+    pipe.dit.eval()
+
+    n = min(num_samples, len(files))
+    for idx in range(n):
+        t0 = time.time()
+        s = load_sample(files[idx])
+        human_lat = s["human_latent"].to(device=device, dtype=torch.bfloat16)
+        robot_lat_shape = s["robot_latent"].shape
+        ctx_posi = s["context_posi"].to(device=device, dtype=torch.bfloat16)
+        ctx_nega = s["context_nega"].to(device=device, dtype=torch.bfloat16)
+        f_H = human_lat.shape[2]
+
+        # Save GT + human input
+        if s.get("robot_frames"):
+            save_video(s["robot_frames"], str(step_dir / f"gt_{idx:02d}.mp4"))
+        if s.get("human_frames"):
+            save_video(s["human_frames"], str(step_dir / f"ctrl_{idx:02d}.mp4"))
+
+        # Initialize robot latent as noise
+        robot_noisy = torch.randn(robot_lat_shape, device=device, dtype=torch.bfloat16)
+
+        for ts in sched.timesteps:
+            t_tensor = ts.unsqueeze(0).to(dtype=torch.bfloat16, device=device)
+            latents = torch.concat([human_lat, robot_noisy], dim=2)
+
+            pred_posi = pipe.model_fn(
+                dit=pipe.dit, latents=latents, timestep=t_tensor,
+                context=ctx_posi, mitty_human_frames=f_H,
+                use_gradient_checkpointing=False,
+            )
+            if cfg_scale != 1.0:
+                pred_nega = pipe.model_fn(
+                    dit=pipe.dit, latents=latents, timestep=t_tensor,
+                    context=ctx_nega, mitty_human_frames=f_H,
+                    use_gradient_checkpointing=False,
+                )
+                noise_pred = pred_nega + cfg_scale * (pred_posi - pred_nega)
+            else:
+                noise_pred = pred_posi
+
+            # Update only the robot segment
+            noise_pred_robot = noise_pred[:, :, f_H:]
+            robot_noisy = sched.step(noise_pred_robot, ts, robot_noisy)
+
+        # VAE decode robot latent
+        pipe.load_models_to_device(["vae"])
+        video = vae.decode(robot_noisy, device=device, tiled=False)
+        frames = tensor_to_frames(video)
+        save_video(frames, str(step_dir / f"gen_{idx:02d}.mp4"))
+
+        if log:
+            log.info(f"  EVAL VIDEO [{idx+1}/{n}] → {step_dir} ({time.time() - t0:.0f}s)")
+
+    pipe.dit.train(was_training)
+
+
+# ── Main training loop ─────────────────────────────────────────────────
+
+def train(args):
+    rank, world_size, ddp_device = setup_distributed()
+    is_main = rank == 0
+    if ddp_device is not None:
+        args.device = ddp_device
+
+    run_name = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    run_dir = Path(args.output_dir) / run_name
+    ckpt_dir = run_dir / "ckpt"
+    eval_dir = run_dir / "eval"
+    if is_main:
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        eval_dir.mkdir(parents=True, exist_ok=True)
+    if world_size > 1:
+        dist.barrier()
+
+    log = setup_logging(str(run_dir / "train.log"),
+                        name="train_mitty") if is_main else None
+
+    # ── CSV ──
+    csv_headers = [
+        "step", "train_loss", "lr", "time_s",
+        "eval_loss_in_task", "eval_loss_ood",
+        "save_ckpt", "eval_video",
+    ]
+    csv_logger = CsvLogger(str(run_dir / "train.csv"),
+                           csv_headers) if is_main else None
+
+    # ── W&B (rank 0 only; no-op if --wandb-project not set) ──
+    wb = WandbLogger(
+        project=args.wandb_project if is_main else None,
+        run_name=args.wandb_run_name or run_name,
+        config=vars(args),
+        tags=(args.wandb_tags or []) + ["mitty"],
+        dir=str(run_dir),
+    )
+
+    def info(msg):
+        if log:
+            log.info(msg)
+
+    def write_csv_row(**fields):
+        if csv_logger is not None:
+            csv_logger.write(**fields)
+
+    info(f"Run: {run_dir}")
+    info(f"Args: {vars(args)}")
+    info(f"DDP: rank={rank}, world_size={world_size}, device={args.device}")
+
+    # ── Data ──
+    train_files = load_cached_files(args.cache_train)
+    eval_files = load_cached_files(args.cache_eval) if args.cache_eval else []
+    ood_files = load_cached_files(args.cache_ood) if args.cache_ood else []
+    info(f"Data: train={len(train_files)} eval={len(eval_files)} ood={len(ood_files)}")
+
+    # ── Patch weights ──
+    patch_dir_eval = ""
+    patch_dir_ood = ""
+    if args.patch_dir:
+        patch_leaf = os.path.basename(args.patch_dir)
+        patch_parent = os.path.dirname(os.path.dirname(args.patch_dir))
+        patch_dir_eval = os.path.join(patch_parent, "eval", patch_leaf)
+        patch_dir_ood = os.path.join(patch_parent, "ood_eval", patch_leaf)
+        info(f"Patch weights: train={args.patch_dir}"
+             f" eval={patch_dir_eval} ood={patch_dir_ood}")
+    else:
+        info("Patch weights: disabled (uniform loss)")
+
+    # ── Model ──
+    info("Loading model...")
+    t0 = time.time()
+    load_vae = is_main and args.eval_video_steps > 0
+    model = MittyTrainingModule(
+        device=args.device,
+        lora_rank=args.lora_rank,
+        lora_target_modules=args.lora_target_modules,
+        use_gradient_checkpointing=True,
+        load_vae=load_vae,
+    )
+    info(f"Model loaded in {time.time() - t0:.1f}s (load_vae={load_vae})")
+
+    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    n_total = sum(p.numel() for p in model.parameters())
+    info(f"Params: {n_total:,} total, {n_trainable:,} trainable ({n_trainable / 1e6:.1f}M)")
+
+    # Sync initial LoRA weights across ranks
+    if world_size > 1:
+        for p in model.parameters():
+            if p.requires_grad:
+                dist.broadcast(p.data, src=0)
+        info("LoRA weights synced across ranks")
+
+    optimizer = torch.optim.AdamW(
+        model.trainable_modules(), lr=args.lr, weight_decay=args.weight_decay,
+    )
+
+    epoch_samples = len(train_files) * args.repeat
+    samples_per_rank = epoch_samples // world_size
+    steps_per_epoch = max(1, samples_per_rank // args.batch_size)
+    total_steps = args.epochs * steps_per_epoch
+    effective_bs = args.batch_size * world_size
+
+    # LR schedule: warmup (linear 0→lr) + cosine (lr→lr_min)
+    if args.warmup_steps > 0 and total_steps > args.warmup_steps:
+        warmup = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=1e-3, end_factor=1.0,
+            total_iters=args.warmup_steps,
+        )
+        cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=total_steps - args.warmup_steps,
+            eta_min=args.lr_min,
+        )
+        lr_scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer, schedulers=[warmup, cosine],
+            milestones=[args.warmup_steps],
+        )
+    elif total_steps > 0:
+        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=total_steps, eta_min=args.lr_min,
+        )
+    else:
+        lr_scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0)
+
+    info(
+        f"Plan: {args.epochs} ep x {len(train_files)} train x {args.repeat} repeat"
+        f" = {epoch_samples} samples/ep"
+    )
+    info(
+        f"DDP: {epoch_samples} samples / {world_size} ranks"
+        f" × {args.batch_size} batch_size = {steps_per_epoch} steps/ep,"
+        f" effective_bs={effective_bs}"
+    )
+    info(f"LR: warmup {args.warmup_steps} steps → cosine to {args.lr_min:.1e}"
+         f" (lr={args.lr:.1e})")
+    info(f"Save every {args.save_steps}, eval every {args.eval_steps}"
+         f", eval video every {args.eval_video_steps}")
+    info("=" * 60)
+
+    step = 0
+    train_t0 = time.time()
+
+    for epoch in range(args.epochs):
+        rng = random.Random(args.seed + epoch)
+        epoch_files = train_files * args.repeat
+        rng.shuffle(epoch_files)
+        my_files = epoch_files[rank::world_size]
+
+        # Chunk into batches of `args.batch_size`; drop incomplete tail
+        batches = [
+            my_files[i:i + args.batch_size]
+            for i in range(0, len(my_files), args.batch_size)
+            if i + args.batch_size <= len(my_files)
+        ]
+
+        for batch_files in batches:
+            step += 1
+            st = time.time()
+
+            samples = []
+            for f in batch_files:
+                s = load_sample(f)
+                if args.patch_dir:
+                    _load_patch_weights(s, f, args.patch_dir)
+                samples.append(s)
+            batch = collate_batch(samples, args.device)
+            optimizer.zero_grad()
+            loss = model(batch)
+            loss.backward()
+
+            if world_size > 1:
+                sync_gradients(model)
+
+            optimizer.step()
+            lr_scheduler.step()
+
+            loss_val = loss.item()
+            if world_size > 1:
+                loss_val = reduce_scalar(loss_val, args.device)
+
+            step_time = time.time() - st
+            lr = optimizer.param_groups[0]["lr"]
+            info(f"step={step}/{total_steps} train_loss={loss_val:.4f}"
+                 f" lr={lr:.1e} time={step_time:.1f}s")
+
+            row_fields = {
+                "step": step,
+                "train_loss": f"{loss_val:.4f}",
+                "lr": f"{lr:.3e}",
+                "time_s": f"{step_time:.2f}",
+            }
+            if is_main:
+                wb.log({
+                    "train/loss": loss_val,
+                    "train/lr": lr,
+                    "train/time_s": step_time,
+                }, step=step)
+
+            # Hit eval / eval-video at step 1 too (baseline snapshot)
+            hit_eval = bool(args.eval_steps) and (
+                step == 1 or step % args.eval_steps == 0)
+            hit_eval_video = bool(args.eval_video_steps) and (
+                step == 1 or step % args.eval_video_steps == 0)
+
+            # Checkpoint (rank 0)
+            if args.save_steps and step % args.save_steps == 0 and is_main:
+                p = ckpt_dir / f"step-{step:04d}.safetensors"
+                n = save_lora_ckpt(model, str(p))
+                info(f"  SAVE {p} ({n} tensors)")
+                row_fields["save_ckpt"] = p.name
+
+            # Eval loss (rank 0 only); averaged over files × num_t_samples t
+            if hit_eval and is_main:
+                eval_payload = {}
+                if eval_files:
+                    el = eval_loss(model, eval_files, args.device,
+                                   num_t_samples=args.eval_t_samples,
+                                   patch_dir=patch_dir_eval)
+                    info(f"  EVAL eval_loss_in_task={el:.4f} "
+                         f"({len(eval_files)} samples × {args.eval_t_samples} t)")
+                    row_fields["eval_loss_in_task"] = f"{el:.4f}"
+                    eval_payload["train/eval_loss_in_task"] = el
+                if ood_files:
+                    ol = eval_loss(model, ood_files, args.device,
+                                   num_t_samples=args.eval_t_samples,
+                                   patch_dir=patch_dir_ood)
+                    info(f"  EVAL eval_loss_ood={ol:.4f} "
+                         f"({len(ood_files)} samples × {args.eval_t_samples} t)")
+                    row_fields["eval_loss_ood"] = f"{ol:.4f}"
+                    eval_payload["train/eval_loss_ood"] = ol
+                if eval_payload:
+                    wb.log(eval_payload, step=step)
+
+            # Eval videos (rank 0 only); `-1` means "all samples in the split"
+            if hit_eval_video and is_main:
+                n_in = (args.eval_video_samples_in_task
+                        if args.eval_video_samples_in_task > 0
+                        else len(eval_files))
+                n_ood = (args.eval_video_samples_ood
+                         if args.eval_video_samples_ood > 0
+                         else len(ood_files))
+                if eval_files:
+                    generate_eval_videos(
+                        model, eval_files, str(eval_dir / "in_task"), step,
+                        args.device,
+                        num_samples=n_in,
+                        num_inference_steps=args.num_inference_steps,
+                        log=log,
+                    )
+                    if args.wandb_log_videos:
+                        log_step_eval_videos(
+                            wb, str(eval_dir / "in_task" / f"step-{step:04d}"),
+                            step, split_tag="in_task",
+                        )
+                if ood_files:
+                    generate_eval_videos(
+                        model, ood_files, str(eval_dir / "ood"), step,
+                        args.device,
+                        num_samples=n_ood,
+                        num_inference_steps=args.num_inference_steps,
+                        log=log,
+                    )
+                    if args.wandb_log_videos:
+                        log_step_eval_videos(
+                            wb, str(eval_dir / "ood" / f"step-{step:04d}"),
+                            step, split_tag="ood",
+                        )
+                row_fields["eval_video"] = f"step-{step:04d}"
+
+            write_csv_row(**row_fields)
+
+            if world_size > 1 and (hit_eval or hit_eval_video):
+                dist.barrier()
+
+    # Final checkpoint (if not at save boundary)
+    if args.save_steps and step > 0 and step % args.save_steps != 0 and is_main:
+        p = ckpt_dir / f"step-{step:04d}.safetensors"
+        save_lora_ckpt(model, str(p))
+        info(f"  SAVE (final) {p}")
+
+    elapsed = time.time() - train_t0
+    info("=" * 60)
+    if step > 0:
+        info(f"Done. {step} steps in {elapsed:.0f}s ({elapsed / step:.1f}s/step)")
+
+    if csv_logger is not None:
+        csv_logger.close()
+    wb.finish()
+
+    cleanup_distributed()
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Mitty LoRA training (Wan 2.2 TI2V-5B)")
+
+    ap.add_argument("--cache-train", required=True)
+    ap.add_argument("--cache-eval", default="")
+    ap.add_argument("--cache-ood", default="")
+    ap.add_argument("--patch-dir", default="",
+                    help="hand_patch weight dir for train split "
+                         "(eval/ood auto-derived; empty = uniform loss)")
+    ap.add_argument("--output-dir",
+                    default=os.path.join(TRAINING_DATA_ROOT, "log"))
+
+    # Model paths
+    ap.add_argument("--dit-dir", default=DEFAULT_DIT_DIR)
+    ap.add_argument("--vae-path", default=DEFAULT_VAE)
+    ap.add_argument("--tokenizer-dir", default=DEFAULT_TOKENIZER)
+
+    # Device
+    ap.add_argument("--device", default="cuda:0")
+    ap.add_argument("--seed", type=int, default=42)
+
+    # LoRA
+    ap.add_argument("--lora-rank", type=int, default=96)
+    ap.add_argument("--lora-target-modules", default="q,k,v,o")
+
+    # Training
+    ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--lr-min", type=float, default=1e-6,
+                    help="cosine annealing end LR")
+    ap.add_argument("--warmup-steps", type=int, default=50,
+                    help="linear warmup steps (0 = no warmup)")
+    ap.add_argument("--weight-decay", type=float, default=1e-2)
+    ap.add_argument("--epochs", type=int, default=3)
+    ap.add_argument("--repeat", type=int, default=5)
+    ap.add_argument("--batch-size", type=int, default=1,
+                    help="per-rank training batch size (real batch; the whole "
+                         "batch shares one sampled timestep)")
+    ap.add_argument("--save-steps", type=int, default=50)
+    ap.add_argument("--eval-steps", type=int, default=50)
+    ap.add_argument("--eval-t-samples", type=int, default=5,
+                    help="timesteps to sample per eval sample (reduces variance)")
+
+    # Eval video
+    ap.add_argument("--eval-video-steps", type=int, default=0,
+                    help="generate eval videos every N steps (0=off, needs VAE)")
+    ap.add_argument("--eval-video-samples-in-task", type=int, default=2,
+                    help="N in-task eval videos per trigger (-1 = all)")
+    ap.add_argument("--eval-video-samples-ood", type=int, default=2,
+                    help="N OOD eval videos per trigger (-1 = all)")
+    ap.add_argument("--num-inference-steps", type=int, default=30)
+
+    # W&B
+    ap.add_argument("--wandb-project", default=None,
+                    help="W&B project name; unset = disabled")
+    ap.add_argument("--wandb-run-name", default=None,
+                    help="W&B run name (default: timestamp)")
+    ap.add_argument("--wandb-tags", nargs="+", default=[],
+                    help="extra W&B tags (in addition to 'mitty')")
+    ap.add_argument("--wandb-log-videos", action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help="upload eval videos to W&B (--no-wandb-log-videos to skip)")
+
+    args = ap.parse_args()
+
+    # Resolve relative paths
+    for attr in ("cache_train", "cache_eval", "cache_ood", "patch_dir", "output_dir"):
+        val = getattr(args, attr)
+        if val and not os.path.isabs(val):
+            setattr(args, attr, os.path.join(MAIN_ROOT, val))
+
+    train(args)
+
+
+if __name__ == "__main__":
+    main()
