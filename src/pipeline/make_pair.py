@@ -325,8 +325,10 @@ def process_pair(p: dict, do_compare: bool, resume: bool,
 
     # hand patch weight map
     if hand_patch and p.get("hand_df") is not None:
+        hand_df = p["hand_df"]
         clip_idx = p.get("clip_idx") or 0
-        clip_start_frame = int(clip_idx * p["clip_dur"] * SEGMENT_FPS)
+        seg_start = int(hand_df["frame_idx"].min())
+        clip_start_frame = seg_start + int(clip_idx * p["clip_dur"] * SEGMENT_FPS)
         clip_frames = int(p["clip_dur"] * SEGMENT_FPS)
         weights = compute_clip_weight_map(
             p["hand_df"], clip_start_frame, clip_frames, hand_weight)
