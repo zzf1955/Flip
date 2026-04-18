@@ -6,6 +6,8 @@
 
 Notion MCP (`mcp__notion__API-*`) 是 Notion REST API 的透传，ToolSearch 返回的 schema 不必严格遵守；按 Notion 官方 API 的参数结构调用即可。
 
+如果用户直接提出了需求，请使用 flip/.claude/skills/develop/SKILL.md
+
 ## 项目概述
 
 FLIP: Flipped-Direction Learning via Inpainting Pipeline for Cross-Embodiment Video Editing
@@ -290,3 +292,62 @@ python -m src.tools.retarget_diag --episode 0 --frame 30 \
 ```
 
 输出到 `output/<stage>/<exp_name>/`。
+
+## LoRA 微调流程
+
+训练产物统一放到 `training_data/log/<timestamp>/` 下。
+
+### 阶段 1: data_process（embedding 缓存，单卡）
+
+```bash
+DEST="/disk_n/zzf/.cache/huggingface/hub/models--alibaba-pai--Wan2.1-Fun-V1.1-14B-Control/manual"
+DATA="training_data/pair/1s"
+TRAIN_SCRIPT="/disk_n/zzf/DiffSynth-Studio/examples/wanvideo/model_training/train.py"
+MODEL_PATHS="[\"$DEST/diffusion_pytorch_model.safetensors\",\"$DEST/models_t5_umt5-xxl-enc-bf16.pth\",\"$DEST/Wan2.1_VAE.pth\",\"$DEST/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth\"]"
+
+RUN_DIR="training_data/log/$(date +%Y-%m-%d_%H%M%S)"
+mkdir -p "$RUN_DIR"
+
+CUDA_VISIBLE_DEVICES=3 \
+LD_PRELOAD=/home/leadtek/miniconda3/envs/flip/lib/libjpeg.so.8 \
+  accelerate launch --num_processes=1 \
+  "$TRAIN_SCRIPT" \
+  --task "sft:data_process" \
+  --dataset_base_path "$DATA" \
+  --dataset_metadata_path "$DATA/metadata.csv" \
+  --data_file_keys "video,control_video" \
+  --model_paths "$MODEL_PATHS" \
+  --extra_inputs "control_video" \
+  --offload_models "$DEST/diffusion_pytorch_model.safetensors" \
+  --lora_base_model "dit" \
+  --lora_target_modules "q,k,v,o,ffn.0,ffn.2" \
+  --lora_rank 16 \
+  --height 480 --width 640 --num_frames 17 \
+  --output_path "$RUN_DIR/data_cache"
+```
+
+输出：`$RUN_DIR/data_cache/0/*.pth`（每样本 ~50MB）
+
+### 阶段 2: LoRA 训练（单卡）
+
+```bash
+python -m src.pipeline.train_lora \
+  --cache-dir "$RUN_DIR/data_cache" \
+  --device cuda:0 \
+  --epochs 1 --repeat 20 \
+  --save-steps 50 --eval-steps 50 \
+  --eval-video-steps 50 --eval-video-samples 2
+```
+
+输出：`training_data/log/<auto-timestamp>/ckpt/`、`eval/`、`train.log`
+
+### 训练目录结构
+
+```
+training_data/log/
+└── YYYY-MM-DD_HHMMSS/
+    ├── data_cache/0/*.pth        # 阶段 1 embedding 缓存
+    ├── ckpt/step-NNN.safetensors # 阶段 2 LoRA checkpoint
+    ├── eval/step-NNN/            # eval 视频 (gt + ctrl + gen)
+    └── train.log                 # 每步 loss + eval 日志
+```
