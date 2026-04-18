@@ -8,12 +8,12 @@ def postprocess_mask(mask):
     """Smooth -> dilate -> edge blur.
 
     1. Gaussian blur (7x7) to remove aliasing
-    2. Dilate (11x11 ellipse) for 5px safety margin
+    2. Dilate (41x41 ellipse) for 20px safety margin
     3. Gaussian blur (31x31) for soft edges (LaMa supports grayscale masks)
     """
     out = cv2.GaussianBlur(mask, (7, 7), 0)
     out = (out > 128).astype(np.uint8) * 255
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (41, 41))
     out = cv2.dilate(out, kernel)
     blurred = cv2.GaussianBlur(out, (31, 31), 0)
     out = np.maximum(out, blurred)

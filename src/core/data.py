@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 import cv2
 
-from .config import ACTIVE_DATA_DIR
+from .config import ACTIVE_DATA_DIR, DATASET_ROOT
 
 
 # ── Episode / parquet loading ──
@@ -67,6 +67,43 @@ def load_episode_info(ep, data_dir=None):
     ep_df = df[df["episode_index"] == ep].sort_values("frame_index")
 
     return video_path, from_ts, to_ts, ep_df
+
+
+def load_all_episode_meta(task_name, dataset_root=None):
+    """Load full episode metadata for a task.
+
+    Returns:
+        meta_df: DataFrame with all episodes
+        cam_key: detected camera key (e.g. 'head_stereo_left' or 'cam_0')
+    """
+    if dataset_root is None:
+        dataset_root = DATASET_ROOT
+    data_dir = os.path.join(dataset_root, task_name)
+    meta = pd.read_parquet(os.path.join(data_dir, "meta", "episodes",
+                                         "chunk-000", "file-000.parquet"))
+    _CAM_KEY_CANDIDATES = ["head_stereo_left", "cam_0"]
+    cam_key = None
+    for cand in _CAM_KEY_CANDIDATES:
+        if f"videos/observation.images.{cand}/file_index" in meta.columns:
+            cam_key = cand
+            break
+    if cam_key is None:
+        raise ValueError(f"No known head camera key found for {task_name}")
+    return meta, cam_key
+
+
+def load_data_parquet(task_name, file_index, dataset_root=None):
+    """Load a data parquet file by file index.
+
+    Returns:
+        DataFrame with all rows from that parquet file.
+    """
+    if dataset_root is None:
+        dataset_root = DATASET_ROOT
+    data_dir = os.path.join(dataset_root, task_name)
+    path = os.path.join(data_dir, "data", "chunk-000",
+                        f"file-{file_index:03d}.parquet")
+    return pd.read_parquet(path)
 
 
 def build_frame_data(ep_df):
