@@ -31,9 +31,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 
-from src.core.train_utils import FFMPEG
-
-TRAINING_LOG_ROOT = Path("training_data/log")
+MAIN_ROOT = Path(os.environ.get("FLIP_MAIN_ROOT", "/disk_n/zzf/flip"))
+TRAINING_LOG_ROOT = MAIN_ROOT / "training_data" / "log"
+FFMPEG = os.environ.get(
+    "FFMPEG_BIN",
+    "/home/leadtek/miniconda3/envs/flip/bin/ffmpeg",
+)
 FFPROBE = FFMPEG.replace("ffmpeg", "ffprobe")
 
 
@@ -59,7 +62,7 @@ def read_video_frames(path: str) -> np.ndarray:
     proc = subprocess.run(cmd, capture_output=True)
     if proc.returncode != 0:
         raise RuntimeError(f"ffmpeg failed on {path}: {proc.stderr.decode()}")
-    raw = np.frombuffer(proc.stdout, dtype=np.uint8)
+    raw = np.frombuffer(proc.stdout, dtype=np.uint8).copy()
     return raw.reshape(-1, h, w, 3)
 
 
@@ -199,7 +202,8 @@ def collect_inception_features(
     all_frames = np.concatenate(video_arrays, axis=0)
     feats = []
     for i in range(0, len(all_frames), batch_size):
-        batch = torch.from_numpy(all_frames[i:i + batch_size]).permute(0, 3, 1, 2).float() / 255.0
+        chunk = all_frames[i:i + batch_size]
+        batch = torch.from_numpy(chunk).permute(0, 3, 1, 2).float() / 255.0
         feats.append(extractor(batch.to(device)).cpu().numpy())
     return np.concatenate(feats, axis=0)
 
