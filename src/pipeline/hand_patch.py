@@ -209,13 +209,11 @@ def write_debug_video(
     rows = list(clip_df.iterrows())
     h, w = frames_bgr[0].shape[:2]
 
-    writer = cv2.VideoWriter(
-        out_path, cv2.VideoWriter_fourcc(*"mp4v"),
-        min(fps, 30), (w, h),
-    )
+    from src.core.data import open_video_writer, write_frame, close_video
+    container_out, stream_out = open_video_writer(
+        out_path, w, h, fps=min(fps, 30))
 
     for fi, frame in enumerate(frames_bgr):
-        # FK overlay for this frame
         if fi < len(rows):
             _, row = rows[fi]
             rq = np.array(row["observation.state.robot_q_current"], dtype=np.float64)
@@ -223,7 +221,6 @@ def write_debug_video(
             q = build_q(model, rq, hs, hand_type="inspire")
             transforms = do_fk(model, data, q)
 
-            # Draw hand mesh masks as semi-transparent overlay
             colors_bgr = {"left_hand": (0, 200, 255), "right_hand": (255, 200, 0)}
             mesh_overlay = frame.copy()
             for hand_name, cache in hand_caches.items():
@@ -235,9 +232,9 @@ def write_debug_video(
 
         out_frame = draw_debug_frame(
             frame, bboxes_pixel, bboxes_latent, hand_weight)
-        writer.write(out_frame)
+        write_frame(container_out, stream_out, out_frame)
 
-    writer.release()
+    close_video(container_out, stream_out)
 
 
 # ── Main ──────────────────────────────────────────────────────────────
