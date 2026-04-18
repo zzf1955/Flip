@@ -39,10 +39,16 @@ import torch
 sys.stdout.reconfigure(line_buffering=True)
 
 from src.core.config import (
-    ALL_TASKS, SEGMENT_DIR, SEEDANCE_DIRECT_DIR, OVERLAY_DIR,
-    SEEDANCE_ADVANCE_DIR, HAND_PATCH_4S_DIR,
+    ALL_TASKS, MAIN_ROOT,
     PAIR_DIR, TRAINING_DATA_ROOT,
 )
+
+_MAIN_TRAINING_DATA = os.path.join(MAIN_ROOT, "training_data")
+_MAIN_SEGMENT = os.path.join(_MAIN_TRAINING_DATA, "segment")
+_MAIN_HAND_PATCH_4S = os.path.join(_MAIN_TRAINING_DATA, "hand_patch", "4s")
+_MAIN_SEEDANCE_DIRECT = os.path.join(_MAIN_TRAINING_DATA, "seedance_direct")
+_MAIN_OVERLAY = os.path.join(_MAIN_TRAINING_DATA, "overlay")
+_MAIN_SEEDANCE_ADVANCE = os.path.join(_MAIN_TRAINING_DATA, "seedance_advance")
 
 FFMPEG = os.environ.get(
     "FFMPEG_BIN",
@@ -57,9 +63,9 @@ PROMPT = "A first-person view robot arm performing household tasks flip_v2v"
 FRAMES_4K1 = {"1s": 17, "2s": 33, "4s": 65}
 
 HUMAN_SOURCE_MAP = {
-    "seedance_direct": SEEDANCE_DIRECT_DIR,
-    "overlay": OVERLAY_DIR,
-    "seedance_advance": SEEDANCE_ADVANCE_DIR,
+    "seedance_direct": _MAIN_SEEDANCE_DIRECT,
+    "overlay": _MAIN_OVERLAY,
+    "seedance_advance": _MAIN_SEEDANCE_ADVANCE,
 }
 
 SEGMENT_FPS = 30
@@ -119,7 +125,7 @@ def make_compare(robot_path: str, human_path: str, out_path: str):
 
 def load_hand_patch_data(task: str, ep_dir: str, seg: str) -> pd.DataFrame | None:
     """Load precomputed per-frame hand bboxes from hand_patch/4s/."""
-    path = os.path.join(HAND_PATCH_4S_DIR, task, ep_dir, f"{seg}_hands.parquet")
+    path = os.path.join(_MAIN_HAND_PATCH_4S, task, ep_dir, f"{seg}_hands.parquet")
     if not os.path.isfile(path):
         return None
     return pd.read_parquet(path)
@@ -200,7 +206,7 @@ def collect_pairs(task: str, second: str, human_root: str,
                 if not m:
                     continue
                 seg = m.group(1)
-                robot_src = os.path.join(SEGMENT_DIR, task, ep_dir,
+                robot_src = os.path.join(_MAIN_SEGMENT, task, ep_dir,
                                          f"{seg}_video.mp4")
                 if not os.path.isfile(robot_src):
                     continue
@@ -221,7 +227,7 @@ def collect_pairs(task: str, second: str, human_root: str,
                 if not m:
                     continue
                 seg = m.group(1)
-                robot_src = os.path.join(SEGMENT_DIR, task, ep_dir,
+                robot_src = os.path.join(_MAIN_SEGMENT, task, ep_dir,
                                          f"{seg}_video.mp4")
                 if not os.path.isfile(robot_src):
                     continue
@@ -243,7 +249,7 @@ def collect_pairs(task: str, second: str, human_root: str,
                 seg = m.group(1)
                 clip_idx = int(m.group(2))
                 clip_start = clip_idx * dur_sec
-                robot_src = os.path.join(SEGMENT_DIR, task, ep_dir,
+                robot_src = os.path.join(_MAIN_SEGMENT, task, ep_dir,
                                          f"{seg}_video.mp4")
                 if not os.path.isfile(robot_src):
                     continue
@@ -462,7 +468,7 @@ def main():
                         n_loaded += 1
                 p["hand_df"] = _hand_cache[cache_key]
             print(f"\n[{sec}] hand patch: {n_loaded} segments loaded "
-                  f"from {HAND_PATCH_4S_DIR}")
+                  f"from {_MAIN_HAND_PATCH_4S}")
 
         splits = split_by_task(
             all_pairs, ood_tasks, args.per_task_eval, args.split_seed,
