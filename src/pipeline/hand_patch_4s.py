@@ -14,7 +14,6 @@ Usage:
 """
 
 import argparse
-import json
 import os
 import sys
 import time
@@ -24,10 +23,7 @@ import pandas as pd
 
 sys.stdout.reconfigure(line_buffering=True)
 
-from src.core.config import (
-    BEST_PARAMS, HAND_PATCH_4S_DIR, MAIN_ROOT, SEGMENT_DIR,
-    get_hand_type,
-)
+from src.core.config import BEST_PARAMS, MAIN_ROOT, get_hand_type
 from src.pipeline.hand_patch import (
     VIDEO_H, VIDEO_W,
     load_fk_model,
@@ -35,8 +31,9 @@ from src.pipeline.hand_patch import (
 from src.core.fk import build_q, do_fk
 from src.pipeline.sam2_segment import mask_to_bbox, render_mask_for_links
 
-SEGMENT_ROOT = SEGMENT_DIR
-OUTPUT_ROOT = HAND_PATCH_4S_DIR
+_TRAINING_DATA = os.path.join(MAIN_ROOT, "training_data")
+SEGMENT_ROOT = os.path.join(_TRAINING_DATA, "segment")
+OUTPUT_ROOT = os.path.join(_TRAINING_DATA, "hand_patch", "4s")
 
 
 def compute_per_frame_bboxes(model, data, hand_caches, seg_df,
@@ -103,6 +100,23 @@ def process_segment(task_short, ep_dir, seg_name, model, data, hand_caches,
     return True
 
 
+def discover_segments(task_short):
+    """Scan segment directory for all (ep_dir, seg_name) pairs."""
+    task_dir = os.path.join(SEGMENT_ROOT, task_short)
+    if not os.path.isdir(task_dir):
+        return []
+    results = []
+    for ep_dir in sorted(os.listdir(task_dir)):
+        ep_path = os.path.join(task_dir, ep_dir)
+        if not os.path.isdir(ep_path):
+            continue
+        for f in sorted(os.listdir(ep_path)):
+            if f.endswith("_joints.parquet"):
+                seg_name = f.replace("_joints.parquet", "")
+                results.append((ep_dir, seg_name))
+    return results
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Precompute per-frame hand FK bboxes at 4s segment level")
@@ -114,16 +128,11 @@ def main():
                     help="skip segments whose output already exists")
     args = ap.parse_args()
 
-    manifest_path = os.path.join(SEGMENT_ROOT, "manifest.json")
-    if not os.path.isfile(manifest_path):
-        print(f"manifest not found: {manifest_path}")
-        print("run segment_episodes.py first")
-        return
-
-    manifest = json.load(open(manifest_path))
-
     if args.task == "all":
-        tasks = sorted(manifest.keys())
+        tasks = sorted(
+            d for d in os.listdir(SEGMENT_ROOT)
+            if os.path.isdir(os.path.join(SEGMENT_ROOT, d))
+        )
     else:
         tasks = [t.strip() for t in args.task.split(",")]
 
@@ -134,7 +143,6 @@ def main():
     print(f"  margin:       {args.margin}px")
     print(f"  resume:       {args.resume}")
 
-    # Load FK model for the first task's hand type, reload if hand type changes
     current_hand_type = None
     model = data = hand_caches = None
 
@@ -143,12 +151,7 @@ def main():
     t_start = time.time()
 
     for task_short in tasks:
-        if task_short not in manifest:
-            print(f"\n  WARN: {task_short} not in manifest, skipping")
-            continue
-
-        task_info = manifest[task_short]
-        full_task_name = task_info.get("task_name", task_short)
+        full_task_name = f"G1_WBT_{task_short}"
         hand_type = get_hand_type(full_task_name)
 
         if hand_type != current_hand_type:
@@ -158,26 +161,20 @@ def main():
             print(f"  loaded in {time.time() - t0:.1f}s")
             current_hand_type = hand_type
 
-        episodes = task_info.get("episodes", {})
+        segments = discover_segments(task_short)
         seg_count = 0
         skip_count = 0
 
-        for ep_key in sorted(episodes.keys()):
-            ep_info = episodes[ep_key]
-            n_segs = ep_info.get("n_segments", 0)
-            ep_dir = ep_key
-
-            for si in range(n_segs):
-                seg_name = f"seg{si:02d}"
-                produced = process_segment(
-                    task_short, ep_dir, seg_name,
-                    model, data, hand_caches,
-                    hand_type, args.margin, args.resume,
-                )
-                if produced:
-                    seg_count += 1
-                else:
-                    skip_count += 1
+        for ep_dir, seg_name in segments:
+            produced = process_segment(
+                task_short, ep_dir, seg_name,
+                model, data, hand_caches,
+                hand_type, args.margin, args.resume,
+            )
+            if produced:
+                seg_count += 1
+            else:
+                skip_count += 1
 
         total_processed += seg_count
         total_skipped += skip_count

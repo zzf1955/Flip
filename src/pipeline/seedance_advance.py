@@ -34,7 +34,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 sys.stdout.reconfigure(line_buffering=True)
 
-from src.core.config import OVERLAY_4S_DIR, SEEDANCE_ADVANCE_DIR
+from src.core.config import MAIN_ROOT
 from src.pipeline.seedance_gen import (
     FFMPEG, FFPROBE, MIN_PIXELS,
     MODEL_STANDARD, MODEL_FAST,
@@ -42,8 +42,9 @@ from src.pipeline.seedance_gen import (
     download, resize_video,
 )
 
-INPUT_ROOT = OVERLAY_4S_DIR
-OUTPUT_ROOT = os.path.join(SEEDANCE_ADVANCE_DIR, "4s")
+_TRAINING_DATA = os.path.join(MAIN_ROOT, "training_data")
+INPUT_ROOT = os.path.join(_TRAINING_DATA, "overlay", "4s")
+OUTPUT_ROOT = os.path.join(_TRAINING_DATA, "seedance_advance", "4s")
 
 DEFAULT_PROMPT_ADVANCE = (
     "将视频中的合成人体替换为真实的真人。真人为亚洲男性，穿白色短袖T恤，黑色长裤，灰色拖鞋。"
