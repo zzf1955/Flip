@@ -6,23 +6,20 @@ directory of .pth files with the same naming as the mitty_cache dir,
 ready to be loaded by train_mitty.py via --patch-dir.
 
 Usage:
-  # Generate weights for train split
+  # Generate weights for one split
+  # (output defaults to training_data/pair/1s/<split>/hand_patch/)
   python -m src.pipeline.hand_patch \
-      --cache-dir output/mitty_cache_1s/train \
-      --output    output/hand_patch_1s/train \
-      --hand-weight 3.0
+      --cache-dir output/mitty_cache_1s/train
 
   # With debug overlay videos
   python -m src.pipeline.hand_patch \
       --cache-dir output/mitty_cache_1s/eval \
-      --output    output/hand_patch_1s/eval \
       --debug-dir output/hand_patch_1s/debug/eval
 
   # All three splits at once
   for split in train eval ood_eval; do
     python -m src.pipeline.hand_patch \
-        --cache-dir output/mitty_cache_1s/$split \
-        --output    output/hand_patch_1s/$split
+        --cache-dir output/mitty_cache_1s/$split
   done
 """
 
@@ -54,7 +51,8 @@ from src.pipeline.sam2_segment import (
 # Use MAIN_ROOT (not BASE_DIR) so worktrees find shared training data
 _TRAINING_DATA = os.path.join(MAIN_ROOT, "training_data")
 _SEGMENT_DIR = os.path.join(_TRAINING_DATA, "segment")
-DEFAULT_SOURCE_MAP = os.path.join(_TRAINING_DATA, "pair", "1s", "source_map.json")
+DEFAULT_PAIR_DIR = os.path.join(_TRAINING_DATA, "pair", "1s")
+DEFAULT_SOURCE_MAP = os.path.join(DEFAULT_PAIR_DIR, "source_map.json")
 SEGMENT_FPS = 30
 CLIP_FRAMES_1S = 30  # 1s at 30fps
 VIDEO_H, VIDEO_W = 480, 640
@@ -307,8 +305,8 @@ def main():
         description="Generate hand-region weight maps for Mitty training")
     ap.add_argument("--cache-dir", required=True,
                     help="mitty_cache dir (reads pair filenames + source_id)")
-    ap.add_argument("--output", required=True,
-                    help="output weight map directory")
+    ap.add_argument("--output", default="",
+                    help="output dir (default: training_data/pair/1s/<split>/hand_patch/)")
     ap.add_argument("--source-map", default=DEFAULT_SOURCE_MAP,
                     help="path to source_map.json")
     ap.add_argument("--hand-weight", type=float, default=3.0,
@@ -328,14 +326,17 @@ def main():
             setattr(args, attr, os.path.join(MAIN_ROOT, val))
 
     cache_dir = Path(args.cache_dir).resolve()
+
+    # Auto-derive output: training_data/pair/1s/<split>/hand_patch/
+    split = cache_dir.name  # e.g. "train", "eval", "ood_eval"
+    if not args.output:
+        args.output = os.path.join(DEFAULT_PAIR_DIR, split, "hand_patch")
+
     output_dir = Path(args.output).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if args.debug_dir:
         Path(args.debug_dir).mkdir(parents=True, exist_ok=True)
-
-    # Detect split name from cache_dir basename
-    split = cache_dir.name  # e.g. "train", "eval", "ood_eval"
 
     # Load source map
     source_map = json.load(open(args.source_map))
