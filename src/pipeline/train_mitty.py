@@ -133,6 +133,7 @@ class MittyTrainingModule(DiffusionTrainingModule):
         lora_target_modules: str = "q,k,v,o",
         use_gradient_checkpointing: bool = True,
         load_vae: bool = True,
+        init_lora_path: str = "",
     ):
         super().__init__()
         self.pipe = build_pipe(device, dit_dir, vae_path, tokenizer_dir,
@@ -154,6 +155,18 @@ class MittyTrainingModule(DiffusionTrainingModule):
             lora_rank=lora_rank,
             upcast_dtype=torch.bfloat16,
         )
+
+        if init_lora_path:
+            from safetensors.torch import load_file
+            sd = load_file(init_lora_path)
+            result = self.pipe.dit.load_state_dict(sd, strict=False)
+            if result.unexpected_keys:
+                raise ValueError(
+                    f"LoRA checkpoint has unexpected keys: "
+                    f"{result.unexpected_keys[:5]}")
+            self._init_lora_n = len(sd)
+        else:
+            self._init_lora_n = 0
 
         # Install Mitty forward
         self.pipe.model_fn = mitty_model_fn_wan_video
@@ -428,8 +441,11 @@ def train(args):
         lora_target_modules=args.lora_target_modules,
         use_gradient_checkpointing=True,
         load_vae=load_vae,
+        init_lora_path=args.init_lora,
     )
     info(f"Model loaded in {time.time() - t0:.1f}s (load_vae={load_vae})")
+    if model._init_lora_n:
+        info(f"Loaded {model._init_lora_n} LoRA tensors from {args.init_lora}")
 
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     n_total = sum(p.numel() for p in model.parameters())
@@ -665,6 +681,8 @@ def main():
     # LoRA
     ap.add_argument("--lora-rank", type=int, default=96)
     ap.add_argument("--lora-target-modules", default="q,k,v,o")
+    ap.add_argument("--init-lora", default="",
+                    help="path to .safetensors LoRA checkpoint to initialize from")
 
     # Training
     ap.add_argument("--lr", type=float, default=1e-4)
@@ -706,7 +724,8 @@ def main():
     args = ap.parse_args()
 
     # Resolve relative paths
-    for attr in ("cache_train", "cache_eval", "cache_ood", "patch_dir", "output_dir"):
+    for attr in ("cache_train", "cache_eval", "cache_ood", "patch_dir", "output_dir",
+                 "init_lora"):
         val = getattr(args, attr)
         if val and not os.path.isabs(val):
             setattr(args, attr, os.path.join(MAIN_ROOT, val))

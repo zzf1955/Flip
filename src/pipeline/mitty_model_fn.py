@@ -152,6 +152,8 @@ def MittyFlowMatchLoss(pipe, **inputs):
 
     noise_pred_robot = noise_pred[:, :, f_H:]
     if patch_weights is not None:
+        if patch_weights.dim() == 3:
+            patch_weights = patch_weights.unsqueeze(0)
         w = patch_weights.unsqueeze(1).float()  # (B,1,f_R,H,W)
         mse = (noise_pred_robot.float() - training_target.float()).pow(2)
         loss = (mse * w).mean()
