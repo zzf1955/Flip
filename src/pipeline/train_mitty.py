@@ -413,8 +413,13 @@ def train(args):
     info(f"DDP: rank={rank}, world_size={world_size}, device={args.device}")
 
     # ── Data ──
+    if args.eval_video_steps == -1:
+        args.eval_video_steps = args.eval_steps
+
     train_files = load_cached_files(args.cache_train)
     eval_files = load_cached_files(args.cache_eval) if args.cache_eval else []
+    if args.max_eval_files and len(eval_files) > args.max_eval_files:
+        eval_files = eval_files[:args.max_eval_files]
     ood_files = load_cached_files(args.cache_ood) if args.cache_ood else []
     info(f"Data: train={len(train_files)} eval={len(eval_files)} ood={len(ood_files)}")
 
@@ -702,12 +707,15 @@ def main():
                     help="timesteps to sample per eval sample (reduces variance)")
 
     # Eval video
-    ap.add_argument("--eval-video-steps", type=int, default=0,
-                    help="generate eval videos every N steps (0=off, needs VAE)")
-    ap.add_argument("--eval-video-samples-in-task", type=int, default=2,
+    ap.add_argument("--eval-video-steps", type=int, default=-1,
+                    help="generate eval videos every N steps "
+                         "(-1=follow eval-steps, 0=off, needs VAE)")
+    ap.add_argument("--eval-video-samples-in-task", type=int, default=4,
                     help="N in-task eval videos per trigger (-1 = all)")
     ap.add_argument("--eval-video-samples-ood", type=int, default=2,
                     help="N OOD eval videos per trigger (-1 = all)")
+    ap.add_argument("--max-eval-files", type=int, default=0,
+                    help="cap eval file count (0=no cap)")
     ap.add_argument("--num-inference-steps", type=int, default=30)
 
     # W&B
