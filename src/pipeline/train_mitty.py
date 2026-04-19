@@ -25,6 +25,7 @@ import os
 import random
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -520,16 +521,25 @@ def train(args):
             if i + args.batch_size <= len(my_files)
         ]
 
-        for batch_files in batches:
-            step += 1
-            st = time.time()
-
-            samples = []
-            for f in batch_files:
+        def _prefetch(files):
+            out = []
+            for f in files:
                 s = load_sample(f)
                 if args.patch_dir:
                     _load_patch_weights(s, f, args.patch_dir)
-                samples.append(s)
+                out.append(s)
+            return out
+
+        prefetch_ex = ThreadPoolExecutor(max_workers=1)
+        pending = prefetch_ex.submit(_prefetch, batches[0]) if batches else None
+
+        for batch_idx, batch_files in enumerate(batches):
+            samples = pending.result()
+            if batch_idx + 1 < len(batches):
+                pending = prefetch_ex.submit(_prefetch, batches[batch_idx + 1])
+
+            step += 1
+            st = time.time()
             batch = collate_batch(samples, args.device)
             optimizer.zero_grad()
             loss = model(batch)
@@ -638,6 +648,8 @@ def train(args):
 
             if world_size > 1 and (hit_eval or hit_eval_video):
                 dist.barrier()
+
+        prefetch_ex.shutdown(wait=False)
 
     # Final checkpoint (if not at save boundary)
     if args.save_steps and step > 0 and step % args.save_steps != 0 and is_main:
