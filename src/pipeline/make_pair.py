@@ -1,8 +1,9 @@
 """
 Generate training pairs and comparison videos, split into train / eval / ood_eval.
 
-Matches segment (robot) videos with human videos (seedance_direct or overlay),
-resamples both to 16fps, and writes three independent subdirectories per duration:
+Matches segment (robot) videos with human videos (seedance_direct, overlay, or
+seedance_advance), resamples both to 16fps, and writes three independent
+subdirectories per duration:
   pair/<second>/train/          <- majority of clips for training
   pair/<second>/eval/           <- in-task eval, N clips per non-OOD task
   pair/<second>/ood_eval/       <- OOD eval, all clips from --ood-tasks
@@ -14,6 +15,7 @@ Usage:
   python -m src.pipeline.make_pair --task all --second 1s --clean
 
   python -m src.pipeline.make_pair --task all --second 1s \
+    --human-source seedance_advance --hand-patch --hand-weight 3.0 \
     --ood-tasks Inspire_Pickup_Pillow_MainCamOnly --per-task-eval 1
 """
 
@@ -21,6 +23,7 @@ import argparse
 import csv
 import glob
 import json
+import math
 import os
 import random
 import re
@@ -30,12 +33,22 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import pandas as pd
+import torch
+
 sys.stdout.reconfigure(line_buffering=True)
 
 from src.core.config import (
-    ALL_TASKS, SEGMENT_DIR, SEEDANCE_DIRECT_DIR, OVERLAY_DIR,
+    ALL_TASKS, MAIN_ROOT,
     PAIR_DIR, TRAINING_DATA_ROOT,
 )
+
+_MAIN_TRAINING_DATA = os.path.join(MAIN_ROOT, "training_data")
+_MAIN_SEGMENT = os.path.join(_MAIN_TRAINING_DATA, "segment")
+_MAIN_HAND_PATCH_4S = os.path.join(_MAIN_TRAINING_DATA, "hand_patch", "4s")
+_MAIN_SEEDANCE_DIRECT = os.path.join(_MAIN_TRAINING_DATA, "seedance_direct")
+_MAIN_OVERLAY = os.path.join(_MAIN_TRAINING_DATA, "overlay")
+_MAIN_SEEDANCE_ADVANCE = os.path.join(_MAIN_TRAINING_DATA, "seedance_advance")
 
 FFMPEG = os.environ.get(
     "FFMPEG_BIN",
@@ -50,9 +63,12 @@ PROMPT = "A first-person view robot arm performing household tasks flip_v2v"
 FRAMES_4K1 = {"1s": 17, "2s": 33, "4s": 65}
 
 HUMAN_SOURCE_MAP = {
-    "seedance_direct": SEEDANCE_DIRECT_DIR,
-    "overlay": OVERLAY_DIR,
+    "seedance_direct": _MAIN_SEEDANCE_DIRECT,
+    "overlay": _MAIN_OVERLAY,
+    "seedance_advance": _MAIN_SEEDANCE_ADVANCE,
 }
+
+SEGMENT_FPS = 30
 
 # ── helpers ────────────────────────────────────────────────────────────
 
@@ -105,6 +121,52 @@ def make_compare(robot_path: str, human_path: str, out_path: str):
     ])
 
 
+# ── hand patch helpers ─────────────────────────────────────────────────
+
+def load_hand_patch_data(task: str, ep_dir: str, seg: str) -> pd.DataFrame | None:
+    """Load precomputed per-frame hand bboxes from hand_patch/4s/."""
+    path = os.path.join(_MAIN_HAND_PATCH_4S, task, ep_dir, f"{seg}_hands.parquet")
+    if not os.path.isfile(path):
+        return None
+    return pd.read_parquet(path)
+
+
+def compute_clip_weight_map(hand_df: pd.DataFrame,
+                            clip_start_frame: int, clip_frames: int,
+                            hand_weight: float) -> torch.Tensor | None:
+    """Slice per-frame bboxes for clip window, union, convert to latent weight map."""
+    from src.pipeline.hand_patch import (
+        LATENT_F, LATENT_H, LATENT_W, VAE_SPATIAL,
+        pixel_bbox_to_latent, build_weight_map,
+    )
+
+    clip_df = hand_df[
+        (hand_df["frame_idx"] >= clip_start_frame) &
+        (hand_df["frame_idx"] < clip_start_frame + clip_frames)
+    ]
+    if clip_df.empty:
+        return None
+
+    bboxes_pixel = {}
+    for hand in ("left", "right"):
+        cols = [f"{hand}_x1", f"{hand}_y1", f"{hand}_x2", f"{hand}_y2"]
+        valid = clip_df[cols].dropna()
+        if valid.empty:
+            bboxes_pixel[f"{hand}_hand"] = None
+        else:
+            bboxes_pixel[f"{hand}_hand"] = [
+                int(valid[f"{hand}_x1"].min()),
+                int(valid[f"{hand}_y1"].min()),
+                int(valid[f"{hand}_x2"].max()),
+                int(valid[f"{hand}_y2"].max()),
+            ]
+
+    bboxes_latent = {
+        k: pixel_bbox_to_latent(v) for k, v in bboxes_pixel.items()
+    }
+    return build_weight_map(bboxes_latent, hand_weight)
+
+
 # ── matching ───────────────────────────────────────────────────────────
 
 def collect_pairs(task: str, second: str, human_root: str,
@@ -144,7 +206,7 @@ def collect_pairs(task: str, second: str, human_root: str,
                 if not m:
                     continue
                 seg = m.group(1)
-                robot_src = os.path.join(SEGMENT_DIR, task, ep_dir,
+                robot_src = os.path.join(_MAIN_SEGMENT, task, ep_dir,
                                          f"{seg}_video.mp4")
                 if not os.path.isfile(robot_src):
                     continue
@@ -165,7 +227,7 @@ def collect_pairs(task: str, second: str, human_root: str,
                 if not m:
                     continue
                 seg = m.group(1)
-                robot_src = os.path.join(SEGMENT_DIR, task, ep_dir,
+                robot_src = os.path.join(_MAIN_SEGMENT, task, ep_dir,
                                          f"{seg}_video.mp4")
                 if not os.path.isfile(robot_src):
                     continue
@@ -187,7 +249,7 @@ def collect_pairs(task: str, second: str, human_root: str,
                 seg = m.group(1)
                 clip_idx = int(m.group(2))
                 clip_start = clip_idx * dur_sec
-                robot_src = os.path.join(SEGMENT_DIR, task, ep_dir,
+                robot_src = os.path.join(_MAIN_SEGMENT, task, ep_dir,
                                          f"{seg}_video.mp4")
                 if not os.path.isfile(robot_src):
                     continue
@@ -242,7 +304,9 @@ def split_by_task(all_pairs: list[dict], ood_tasks: set[str],
 # ── process one pair ───────────────────────────────────────────────────
 
 def process_pair(p: dict, do_compare: bool, resume: bool,
-                 num_frames: int | None = None) -> dict:
+                 num_frames: int | None = None,
+                 hand_patch: bool = False,
+                 hand_weight: float = 3.0) -> dict:
     """Process a single pair. Returns metadata dict."""
     os.makedirs(os.path.dirname(p["out_robot"]), exist_ok=True)
     os.makedirs(os.path.dirname(p["out_human"]), exist_ok=True)
@@ -264,6 +328,25 @@ def process_pair(p: dict, do_compare: bool, resume: bool,
         os.makedirs(os.path.dirname(p["compare"]), exist_ok=True)
         if not (resume and os.path.isfile(p["compare"])):
             make_compare(p["out_robot"], p["out_human"], p["compare"])
+
+    # hand patch weight map
+    if hand_patch and p.get("hand_df") is not None:
+        hand_df = p["hand_df"]
+        clip_idx = p.get("clip_idx") or 0
+        seg_start = int(hand_df["frame_idx"].min())
+        clip_start_frame = seg_start + int(clip_idx * p["clip_dur"] * SEGMENT_FPS)
+        clip_frames = int(p["clip_dur"] * SEGMENT_FPS)
+        weights = compute_clip_weight_map(
+            p["hand_df"], clip_start_frame, clip_frames, hand_weight)
+        if weights is not None:
+            split_dir = os.path.dirname(os.path.dirname(p["out_robot"]))
+            patch_dir = os.path.join(split_dir, "hand_patch")
+            os.makedirs(patch_dir, exist_ok=True)
+            pair_name = os.path.basename(p["out_robot"]).replace(".mp4", ".pth")
+            torch.save({
+                "weights": weights,
+                "hand_weight": hand_weight,
+            }, os.path.join(patch_dir, pair_name))
 
     return {
         "video": p["rel_robot"],
@@ -315,6 +398,10 @@ def main():
                     help="clips per non-OOD task to reserve for in-task eval")
     ap.add_argument("--split-seed", type=int, default=42)
     ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--hand-patch", action="store_true",
+                    help="generate hand patch weight maps from precomputed 4s bbox data")
+    ap.add_argument("--hand-weight", type=float, default=3.0,
+                    help="weight multiplier for hand regions (default: 3.0)")
     args = ap.parse_args()
 
     human_root = HUMAN_SOURCE_MAP[args.human_source]
@@ -343,6 +430,9 @@ def main():
     print(f"  split seed:    {args.split_seed}")
     print(f"  source-second: {args.source_second or '(same as --second)'}")
     print(f"  clean:         {args.clean}")
+    print(f"  hand-patch:    {args.hand_patch}")
+    if args.hand_patch:
+        print(f"  hand-weight:   {args.hand_weight}")
 
     t_total = time.time()
 
@@ -365,11 +455,26 @@ def main():
             print(f"\n[{sec}] no pairs found, skipping")
             continue
 
+        # Load hand patch data if enabled (shared across clips from same segment)
+        if args.hand_patch:
+            _hand_cache: dict[str, pd.DataFrame | None] = {}
+            n_loaded = 0
+            for p in all_pairs:
+                cache_key = f"{p['task']}/{p['episode']}/{p['seg']}"
+                if cache_key not in _hand_cache:
+                    _hand_cache[cache_key] = load_hand_patch_data(
+                        p["task"], p["episode"], p["seg"])
+                    if _hand_cache[cache_key] is not None:
+                        n_loaded += 1
+                p["hand_df"] = _hand_cache[cache_key]
+            print(f"\n[{sec}] hand patch: {n_loaded} segments loaded "
+                  f"from {_MAIN_HAND_PATCH_4S}")
+
         splits = split_by_task(
             all_pairs, ood_tasks, args.per_task_eval, args.split_seed,
         )
 
-        print(f"\n[{sec}] {len(all_pairs)} pairs → "
+        print(f"\n[{sec}] {len(all_pairs)} pairs -> "
               f"train={len(splits['train'])} "
               f"eval={len(splits['eval'])} "
               f"ood_eval={len(splits['ood_eval'])} "
@@ -412,7 +517,7 @@ def main():
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
             futures = {
                 pool.submit(process_pair, p, args.compare, args.resume,
-                            num_frames): p
+                            num_frames, args.hand_patch, args.hand_weight): p
                 for p in to_process
             }
             done = 0
