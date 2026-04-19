@@ -132,3 +132,11 @@
 
 **创建的任务：**
 - [010] 数据 Pipeline 重构: seedance_advance + 手部 patch + make_pair 整合
+
+---
+
+**用户原始需求：**
+> 训练 IO 瓶颈严重（.pth 文件 55MB 但训练只用 9MB，90% 是 PIL 帧浪费）。要求：1. 加上 W&B 数据上传 2. eval 集合缩小到 50 3. 优化 PIL 剥离 + prefetch 4. eval 视频和 eval 频率对齐，每次输出 4 条
+
+**创建的任务：**
+- [011] 训练 pipeline IO 优化 + eval 对齐 + W&B 完善
