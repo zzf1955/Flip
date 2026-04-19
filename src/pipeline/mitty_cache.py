@@ -124,6 +124,8 @@ def main():
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--resume", action="store_true",
                     help="skip pairs whose .pth already exists")
+    ap.add_argument("--no-frames", action="store_true",
+                    help="skip saving PIL frames to reduce file size (~55MB→~9MB)")
     args = ap.parse_args()
 
     # Resolve relative paths against MAIN_ROOT
@@ -187,11 +189,12 @@ def main():
             "robot_latent": robot_lat,
             "context_posi": prompt_emb_cache[row["prompt"]],
             "context_nega": nega_emb,
-            "human_frames": human_frames,
-            "robot_frames": robot_frames,
             "prompt": row["prompt"],
             "source_id": source_id,
         }
+        if not args.no_frames:
+            data["human_frames"] = human_frames
+            data["robot_frames"] = robot_frames
         torch.save(data, str(out_path))
 
         dt = time.time() - t0
