@@ -35,11 +35,16 @@ sys.stdout.reconfigure(line_buffering=True)
 import torch
 import torch.distributed as dist
 
-from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
 from diffsynth.diffusion.flow_match import FlowMatchScheduler
 from diffsynth.diffusion.training_module import DiffusionTrainingModule
 
 from src.core.config import MAIN_ROOT, TRAINING_DATA_ROOT
+from src.core.wan_loader import (
+    SimplePipe,
+    build_dit_shard_list,
+    load_dit,
+    load_vae as _load_vae,
+)
 from src.core.train_utils import (
     CsvLogger,
     WandbLogger,
@@ -75,49 +80,18 @@ DEFAULT_TOKENIZER = os.path.join(MANUAL_DIR, "google", "umt5-xxl")
 # ── Model ──────────────────────────────────────────────────────────────
 
 def build_pipe(device: str, dit_dir: str, vae_path: str,
-               tokenizer_dir: str, load_vae: bool = True) -> WanVideoPipeline:
-    """Load TI2V-5B DiT (+VAE) with layered VRAM:
-    - DiT resident on GPU (bf16, ~10 GB)
-    - VAE CPU offload (eval-only)
-    - T5 is NOT loaded (text embeddings are pre-cached)
+               tokenizer_dir: str, load_vae: bool = True) -> SimplePipe:
+    """Direct TI2V-5B DiT (+VAE) loader (see src/core/wan_loader.py):
+    - DiT resident on `device` (bf16, ~10 GB)
+    - VAE parked on CPU, moved to `device` on demand (eval-only)
+    - Text encoder / tokenizer not loaded (embeddings are pre-cached)
     """
-    dit_shards = sorted(
-        os.path.join(dit_dir, f) for f in os.listdir(dit_dir)
-        if f.startswith("diffusion_pytorch_model-") and f.endswith(".safetensors")
-    )
-    assert dit_shards, f"No DiT shards in {dit_dir}"
-
-    dit_kwargs = {
-        "offload_dtype": torch.bfloat16,
-        "offload_device": device,
-        "onload_dtype": torch.bfloat16,
-        "onload_device": device,
-        "preparing_dtype": torch.bfloat16,
-        "preparing_device": device,
-        "computation_dtype": torch.bfloat16,
-        "computation_device": device,
-    }
-    vae_kwargs = {
-        "offload_dtype": torch.bfloat16,
-        "offload_device": "cpu",
-        "onload_dtype": torch.bfloat16,
-        "onload_device": "cpu",
-        "preparing_dtype": torch.bfloat16,
-        "preparing_device": device,
-        "computation_dtype": torch.bfloat16,
-        "computation_device": device,
-    }
-
-    model_configs = [ModelConfig(path=dit_shards, **dit_kwargs)]
+    del tokenizer_dir  # unused (kept for signature compat)
+    shards = build_dit_shard_list(dit_dir)
+    pipe = SimplePipe(device)
+    pipe.dit = load_dit(shards, device, torch.bfloat16)
     if load_vae:
-        model_configs.append(ModelConfig(path=vae_path, **vae_kwargs))
-
-    pipe = WanVideoPipeline.from_pretrained(
-        torch_dtype=torch.bfloat16,
-        device=device,
-        model_configs=model_configs,
-        tokenizer_config=ModelConfig(path=tokenizer_dir),
-    )
+        pipe.vae = _load_vae(vae_path, torch.bfloat16, home_device="cpu")
     return pipe
 
 
@@ -160,6 +134,12 @@ class MittyTrainingModule(DiffusionTrainingModule):
         if init_lora_path:
             from safetensors.torch import load_file
             sd = load_file(init_lora_path)
+            # Legacy ckpts from DiffSynth's AutoWrappedLinear path carry a
+            # `.module.` prefix on every LoRA key (e.g. `blocks.0.self_attn.q` →
+            # `blocks.0.module.self_attn.q`). The new loader uses bare Linears,
+            # so strip that prefix when present to keep resume-from-old working.
+            if any(".module." in k for k in sd):
+                sd = {k.replace(".module.", ".", 1): v for k, v in sd.items()}
             result = self.pipe.dit.load_state_dict(sd, strict=False)
             if result.unexpected_keys:
                 raise ValueError(
@@ -437,7 +417,7 @@ def train(args):
     else:
         info("Patch weights: disabled (uniform loss)")
 
-    # ── Model (stagger across ranks to avoid CPU OOM) ──
+    # ── Model (stagger across ranks to avoid CPU OOM; see CLAUDE.md) ──
     info("Loading model...")
     t0 = time.time()
     load_vae = is_main and args.eval_video_steps > 0
