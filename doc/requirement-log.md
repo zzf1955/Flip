@@ -180,3 +180,18 @@
 
 **创建的任务：**
 - [014] 训练循环 step 化 + W&B 统一管理
+
+---
+
+**用户原始需求：**
+> 看一下目前的训练 pipeline,当前应该有几个不同的组件, 主干有 Mitty 和直接 Rectifie 的做法两种,然后 loss 有 hand patch 增强. 能不能把训练 pipeline 整合一下,方便我做消融实验,这几个可以选择主干,选择 loss 类型
+
+讨论要点：
+- 两个 train_*.py 90% 重复，差异仅 5 处：model_fn/Loss、denoise 内循环、logger name、wandb tag、argparse description
+- 新增 `src/pipeline/train.py` 统一入口 + `backbones/{mitty,rectflow}.py` BackboneSpec
+- 旧脚本 `train_mitty.py`/`train_rf.py` 完全保留不动（用户明确"先留着"），由新入口反向 import 复用
+- 显式 `--loss {uniform,hand_patch}`（用户要求多一个参数），`--patch-dir` 冲突走 `ap.error` 硬失败
+- W&B tags 自动 = `[backbone, loss]`，消融维度可按 tag 分面
+
+**创建的任务：**
+- [015] 统一训练 pipeline 入口（backbone / loss 消融友好）
