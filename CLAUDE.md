@@ -297,7 +297,12 @@ python -m src.tools.retarget_diag --episode 0 --frame 30 \
 
 ### 模型加载
 
-`wan_loader.py` 的 `load_dit()` 使用 safetensors 直接读到目标 GPU（`safe_open(device="cuda:X")`），不经过 CPU 中转，各 rank 并行加载互不干扰，无需错峰。VAE 仍在 CPU 上加载（仅 rank 0 eval 时用）。
+`wan_loader.py` 所有加载函数直接读到目标 GPU，不经过 CPU 中转：
+- `load_dit()`: safetensors `safe_open(device="cuda:X")` (~10GB)
+- `load_vae()`: `torch.load(map_location=device)` / safetensors (~0.67GB)
+- `load_text_encoder()`: `torch.load(map_location=device)` (~5.5GB，仅 mitty_cache 用)
+- 训练样本 cache: `load_sample(path, device=device)` 直接到 GPU
+- DDP 各 rank 并行加载互不干扰，无需错峰
 
 ## LoRA 微调流程
 

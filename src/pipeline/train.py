@@ -103,9 +103,9 @@ def eval_loss(model, files: list[str], device: str,
     try:
         losses = []
         for i, f in enumerate(files):
-            s = load_sample(f)
+            s = load_sample(f, device=device)
             if patch_dir:
-                _load_patch_weights(s, f, patch_dir)
+                _load_patch_weights(s, f, patch_dir, device=device)
             s = prepare_sample(s, device)
             sub = []
             for k in range(num_t_samples):
@@ -155,7 +155,7 @@ def generate_eval_videos(
     n = min(num_samples, len(files))
     for idx in range(n):
         t0 = time.time()
-        s = load_sample(files[idx])
+        s = load_sample(files[idx], device=device)
 
         if s.get("robot_frames"):
             save_video(s["robot_frames"], str(step_dir / f"gt_{idx:02d}.mp4"))
@@ -353,9 +353,9 @@ def train(args, spec: BackboneSpec):
         def _prefetch(files):
             out = []
             for f in files:
-                s = load_sample(f)
+                s = load_sample(f, device=args.device)
                 if args.patch_dir:
-                    _load_patch_weights(s, f, args.patch_dir)
+                    _load_patch_weights(s, f, args.patch_dir, device=args.device)
                 out.append(s)
             return out
 
