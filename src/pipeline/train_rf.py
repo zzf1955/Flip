@@ -316,23 +316,18 @@ def train(args):
     else:
         info("Patch weights: disabled (uniform loss)")
 
-    # ── Model (stagger across ranks to avoid CPU OOM) ──
+    # ── Model (safetensors reads directly to GPU — no CPU staging) ──
     info("Loading model...")
     t0 = time.time()
     load_vae = is_main and args.eval_video_steps > 0
-    for load_rank in range(world_size):
-        if rank == load_rank:
-            model = RFTrainingModule(
-                device=args.device,
-                lora_rank=args.lora_rank,
-                lora_target_modules=args.lora_target_modules,
-                use_gradient_checkpointing=True,
-                load_vae=load_vae,
-                init_lora_path=args.init_lora,
-            )
-            import gc; gc.collect()
-        if world_size > 1:
-            dist.barrier()
+    model = RFTrainingModule(
+        device=args.device,
+        lora_rank=args.lora_rank,
+        lora_target_modules=args.lora_target_modules,
+        use_gradient_checkpointing=True,
+        load_vae=load_vae,
+        init_lora_path=args.init_lora,
+    )
     info(f"Model loaded in {time.time() - t0:.1f}s (load_vae={load_vae})")
     if model._init_lora_n:
         info(f"Loaded {model._init_lora_n} LoRA tensors from {args.init_lora}")
