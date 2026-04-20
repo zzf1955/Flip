@@ -15,8 +15,14 @@ from pathlib import Path
 import torch
 
 
+SKIP_THRESHOLD = 15 * 1024 * 1024  # 15MB — stripped files are ~9MB
+
+
 def strip_one(path_str: str) -> tuple[str, int, int]:
     path = Path(path_str)
+    size = path.stat().st_size
+    if size < SKIP_THRESHOLD:
+        return path.name, 0, size
     d = torch.load(path, map_location="cpu", weights_only=False)
     removed = []
     for k in ("human_frames", "robot_frames"):
@@ -25,8 +31,7 @@ def strip_one(path_str: str) -> tuple[str, int, int]:
             removed.append(k)
     if removed:
         torch.save(d, str(path))
-    old_size = path.stat().st_size
-    return path.name, len(removed), old_size
+    return path.name, len(removed), size
 
 
 def main():
@@ -43,9 +48,12 @@ def main():
     print(f"Stripping PIL frames from {len(files)} files in {cache_dir}")
     t0 = time.time()
 
-    with Pool(4) as pool:
+    workers = int(sys.argv[2]) if len(sys.argv) > 2 else 1
+    print(f"Workers: {workers}")
+
+    with Pool(workers) as pool:
         for i, (name, n_removed, _) in enumerate(
-            pool.imap_unordered(strip_one, [str(f) for f in files])
+            pool.imap(strip_one, [str(f) for f in files])
         ):
             if (i + 1) % 200 == 0 or i + 1 == len(files):
                 print(f"  [{i+1}/{len(files)}] {name} removed={n_removed}")

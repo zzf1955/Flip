@@ -293,6 +293,23 @@ python -m src.tools.retarget_diag --episode 0 --frame 30 \
 
 输出到 `output/<stage>/<exp_name>/`。
 
+## DDP 训练注意事项
+
+### 错峰加载模型（防 CPU OOM）
+
+多卡 DDP 时，**必须**让各 rank 依次加载模型，不能同时加载。原因：
+1. 4 个进程同时加载 DiT（~10GB）+ VAE + tokenizer，CPU 内存瞬间峰值 ~60GB，会触发 systemd-oomd 杀进程
+2. rank 0 先加载后，模型文件已进入 page cache，后续 rank 从内存读取而非磁盘，速度快很多
+
+```python
+for load_rank in range(world_size):
+    if rank == load_rank:
+        model = MittyTrainingModule(...)
+        import gc; gc.collect()
+    if world_size > 1:
+        dist.barrier()
+```
+
 ## LoRA 微调流程
 
 训练产物统一放到 `training_data/log/<timestamp>/` 下。
