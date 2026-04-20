@@ -163,3 +163,20 @@
 
 **创建的任务：**
 - [013] Wan2.2 TI2V-5B 直给式 loader 替换 DiffSynth from_pretrained（仅训练路径）
+
+---
+
+## 2026-04-20
+
+**用户原始需求：**
+> 看一下当前的 wb 和同级口径, dataloader 之类的, 我需要全部按照 step 来控制训练, 而不是 epoch. 然后 wb 的实验全部放到 Flip 项目中, run 命名前缀也需要加上, 不然全是日期命名。wb 的 tag 和实验命名统一管理, 在其中记录参数之类的, 详细一些。
+
+讨论要点：
+- 三个训练脚本 (train_lora/train_mitty/train_rf) 均以 `--epochs × --repeat` 间接控制步数，改为 `--max-steps` 直接控制
+- dataloader 从 epoch 循环改为 `infinite_file_batches()` 无限迭代器，数据自动循环洗牌
+- W&B project 默认改为 `"Flip"`，run 命名格式 `{prefix}-r{rank}-lr{lr}-{timestamp}`
+- W&B tag 自动从 args 提取关键超参（lora_rank, lr, batch_size, warmup, max_steps 等）
+- 三个函数统一放 `train_utils.py`：`infinite_file_batches`, `build_run_name`, `build_wandb_tags`
+
+**创建的任务：**
+- [014] 训练循环 step 化 + W&B 统一管理
