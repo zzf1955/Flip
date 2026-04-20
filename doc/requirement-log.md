@@ -140,3 +140,13 @@
 
 **创建的任务：**
 - [011] 训练 pipeline IO 优化 + eval 对齐 + W&B 完善
+
+---
+
+## 2026-04-20
+
+**用户原始需求：**
+> 恒等映射训练效果不好，猜测是算法瓶颈。分析 Wan 2.2 TI2V-5B 的 I2V 机制后，提出方案 A：Rectified Flow——把初始噪声换成原视频（source latent），去掉 Mitty concat，作为 Mitty 的对比实验。双卡 DDP。
+
+**创建的任务：**
+- [012] Rectified Flow Route A 训练代码
