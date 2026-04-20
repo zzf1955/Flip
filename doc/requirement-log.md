@@ -195,3 +195,17 @@
 
 **创建的任务：**
 - [015] 统一训练 pipeline 入口（backbone / loss 消融友好）
+
+---
+
+**用户原始需求：**
+> 你看一下当前 Mitty 的重建实验,视频输入输出是多少帧? 为什么 eval 数据中 2026-04-20_004842 的 eval 视频和 Control 视频, GT 视频长度不一样? ... 修一下这个 bug, 然后跑一下训练,看看 Control 和 GT 是否一致
+
+讨论要点：
+- 排查发现 `make_robot_pair.py:89-103` 把 4s segment 切相邻 1s clip 配对（c0t1, c1t2, c2t3），不是 identity 重建
+- cache 里 `human_latent` ≠ `robot_latent`，eval 视频 ctrl/gt 内容不同
+- 修法：每 segment 4 个 (c{i}, c{i}) identity pair，shutil.copyfile 让两份 mp4 完全相同
+- 全量 cache 重生 ~10000 sample 单卡十几小时，本任务只用小集 (`--max-segments 10`) 跑通验证
+
+**创建的任务：**
+- [016] 修复 robot-recon 数据生成 bug（identity 配对）
