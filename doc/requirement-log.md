@@ -150,3 +150,16 @@
 
 **创建的任务：**
 - [012] Rectified Flow Route A 训练代码
+
+---
+
+**用户原始需求：**
+> 当前 DiffSynth 模型加载代码太慢，替换成自己的代码（先只改训练，T5 不动）。
+
+讨论要点：
+- DiffSynth `WanVideoPipeline.from_pretrained` 为通用 plug-and-play 设计：`hash_model_file` 扫 metadata、`DiskMap` 建索引、`AutoWrappedLinear` 包每个 Linear、25 个 PipelineUnit 实例化，对固定模型+固定显存布局的训练全是 overhead
+- 绕开 `from_pretrained` 写直给式 loader：固定 TI2V-5B 配置，跳过 hash/DiskMap/VRAM 管理
+- 范围限定仅 `train_mitty.py::build_pipe`；T5 路径（`mitty_cache.py`）、LoRA 训练（`train_lora.py`）、推理脚本不动
+
+**创建的任务：**
+- [013] Wan2.2 TI2V-5B 直给式 loader 替换 DiffSynth from_pretrained（仅训练路径）
