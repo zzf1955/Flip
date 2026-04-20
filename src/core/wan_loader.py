@@ -1,11 +1,11 @@
-"""Fast direct loader for Wan2.2 TI2V-5B DiT + Wan2.2 VAE (training path only).
+"""Fast direct loader for Wan2.2 TI2V-5B DiT + VAE + T5 (training path only).
 
-Replaces DiffSynth's `WanVideoPipeline.from_pretrained` for train_mitty:
+Replaces DiffSynth's `WanVideoPipeline.from_pretrained`:
 - Skips `hash_model_file` / `DiskMap` metadata scans
 - Skips `enable_vram_management` wrapping (AutoWrappedLinear is overhead when
   offload_device == onload_device == cuda)
 - Skips the 25 PipelineUnit instantiations
-- DiT shards read in parallel with ThreadPoolExecutor
+- All models load directly to target GPU — no CPU staging
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from torch import nn
 
 from diffsynth.diffusion.flow_match import FlowMatchScheduler
 from diffsynth.models.wan_video_dit import WanModel
+from diffsynth.models.wan_video_text_encoder import WanTextEncoder
 from diffsynth.models.wan_video_vae import WanVideoVAE38
 from diffsynth.core.vram.initialization import skip_model_initialization
 from diffsynth.utils.state_dict_converters.wan_video_vae import (
@@ -101,22 +102,21 @@ def load_vae(
     dtype: torch.dtype = torch.bfloat16,
     home_device: str | torch.device = "cpu",
 ) -> WanVideoVAE38:
-    """Load Wan2.2 VAE. Parked on `home_device` (default cpu). Actual compute
-    device is chosen later via SimplePipe.load_models_to_device(["vae"]).
-    """
+    """Load Wan2.2 VAE directly to `home_device`."""
+    dev = str(home_device)
     with skip_model_initialization():
         vae = WanVideoVAE38(z_dim=48, dim=160)
 
     if path.endswith(".safetensors"):
-        sd = _read_safetensors(path, dtype)
+        sd = _read_safetensors(path, dtype, device=dev)
     else:
-        sd = torch.load(path, map_location="cpu", weights_only=True)
+        sd = torch.load(path, map_location=dev, weights_only=True)
         if isinstance(sd, dict) and len(sd) == 1 and "model_state" in sd:
             sd = sd["model_state"]
         sd = WanVideoVAEStateDictConverter(sd)
         for k, v in list(sd.items()):
             if isinstance(v, torch.Tensor) and v.dtype != dtype:
-                sd[k] = v.to(dtype)
+                sd[k] = v.to(dtype=dtype)
 
     result = vae.load_state_dict(sd, assign=True, strict=True)
     if result.missing_keys or result.unexpected_keys:
@@ -170,3 +170,45 @@ def build_dit_shard_list(dit_dir: str) -> list[str]:
     if not shards:
         raise FileNotFoundError(f"No DiT shards in {dit_dir}")
     return shards
+
+
+# ── T5 text encoder ──────────────────────────────────────────────────
+
+WAN22_T5_CONFIG = {
+    "vocab": 256384,
+    "dim": 4096,
+    "dim_attn": 4096,
+    "dim_ffn": 10240,
+    "num_heads": 64,
+    "num_layers": 24,
+    "num_buckets": 32,
+    "shared_pos": False,
+    "dropout": 0.1,
+}
+
+
+def load_text_encoder(
+    path: str,
+    device: str | torch.device,
+    dtype: torch.dtype = torch.bfloat16,
+) -> WanTextEncoder:
+    """Load Wan2.2 T5 text encoder directly to `device`."""
+    with skip_model_initialization():
+        model = WanTextEncoder(**WAN22_T5_CONFIG)
+    sd = torch.load(path, map_location=str(device), weights_only=True)
+    for k, v in list(sd.items()):
+        if isinstance(v, torch.Tensor) and v.dtype != dtype:
+            sd[k] = v.to(dtype=dtype)
+    result = model.load_state_dict(sd, assign=True, strict=True)
+    if result.missing_keys or result.unexpected_keys:
+        raise RuntimeError(
+            f"T5 state_dict mismatch: missing={result.missing_keys[:5]}, "
+            f"unexpected={result.unexpected_keys[:5]}"
+        )
+    return model.eval()
+
+
+def load_tokenizer(tokenizer_dir: str, seq_len: int = 512):
+    """Load HuggingFace T5 tokenizer (no DiffSynth wrapper)."""
+    from transformers import AutoTokenizer
+    return AutoTokenizer.from_pretrained(tokenizer_dir), seq_len

@@ -85,7 +85,7 @@ def build_pipe(device: str, dit_dir: str, vae_path: str,
                tokenizer_dir: str, load_vae: bool = True) -> SimplePipe:
     """Direct TI2V-5B DiT (+VAE) loader (see src/core/wan_loader.py):
     - DiT resident on `device` (bf16, ~10 GB)
-    - VAE parked on CPU, moved to `device` on demand (eval-only)
+    - VAE on `device` (bf16, ~0.67 GB) — no CPU parking
     - Text encoder / tokenizer not loaded (embeddings are pre-cached)
     """
     del tokenizer_dir  # unused (kept for signature compat)
@@ -93,7 +93,7 @@ def build_pipe(device: str, dit_dir: str, vae_path: str,
     pipe = SimplePipe(device)
     pipe.dit = load_dit(shards, device, torch.bfloat16)
     if load_vae:
-        pipe.vae = _load_vae(vae_path, torch.bfloat16, home_device="cpu")
+        pipe.vae = _load_vae(vae_path, torch.bfloat16, home_device=device)
     return pipe
 
 
@@ -135,7 +135,7 @@ class MittyTrainingModule(DiffusionTrainingModule):
 
         if init_lora_path:
             from safetensors.torch import load_file
-            sd = load_file(init_lora_path)
+            sd = load_file(init_lora_path, device=str(device))
             # Legacy ckpts from DiffSynth's AutoWrappedLinear path carry a
             # `.module.` prefix on every LoRA key (e.g. `blocks.0.self_attn.q` →
             # `blocks.0.module.self_attn.q`). The new loader uses bare Linears,
@@ -167,11 +167,12 @@ class MittyTrainingModule(DiffusionTrainingModule):
 
 # ── Sample IO ──────────────────────────────────────────────────────────
 
-def _load_patch_weights(sample: dict, cache_path: str, patch_dir: str):
+def _load_patch_weights(sample: dict, cache_path: str, patch_dir: str,
+                        device: str = "cpu"):
     """Attach patch_weights from a companion .pth in patch_dir."""
     patch_path = os.path.join(patch_dir, os.path.basename(cache_path))
     if os.path.isfile(patch_path):
-        pd_ = torch.load(patch_path, map_location="cpu", weights_only=False)
+        pd_ = torch.load(patch_path, map_location=device, weights_only=False)
         sample["patch_weights"] = pd_["weights"]
 
 
@@ -239,9 +240,9 @@ def eval_loss(model: MittyTrainingModule, files: list[str], device: str,
     try:
         losses = []
         for i, f in enumerate(files):
-            s = load_sample(f)
+            s = load_sample(f, device=device)
             if patch_dir:
-                _load_patch_weights(s, f, patch_dir)
+                _load_patch_weights(s, f, patch_dir, device=device)
             s = prepare_sample(s, device)
             sub = []
             for k in range(num_t_samples):
@@ -293,7 +294,7 @@ def generate_eval_videos(
     n = min(num_samples, len(files))
     for idx in range(n):
         t0 = time.time()
-        s = load_sample(files[idx])
+        s = load_sample(files[idx], device=device)
         human_lat = s["human_latent"].to(device=device, dtype=torch.bfloat16)
         robot_lat_shape = s["robot_latent"].shape
         ctx_posi = s["context_posi"].to(device=device, dtype=torch.bfloat16)
@@ -494,9 +495,9 @@ def train(args):
     def _prefetch(files):
         out = []
         for f in files:
-            s = load_sample(f)
+            s = load_sample(f, device=args.device)
             if args.patch_dir:
-                _load_patch_weights(s, f, args.patch_dir)
+                _load_patch_weights(s, f, args.patch_dir, device=args.device)
             out.append(s)
         return out
 
