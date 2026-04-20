@@ -129,8 +129,8 @@ def load_cached_files(cache_dir: str, recursive: bool = False) -> list[str]:
     return files
 
 
-def load_sample(path: str):
-    return torch.load(path, map_location="cpu", weights_only=False)
+def load_sample(path: str, device: str = "cpu"):
+    return torch.load(path, map_location=device, weights_only=False)
 
 
 def infinite_file_batches(
