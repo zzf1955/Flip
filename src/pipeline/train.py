@@ -76,11 +76,9 @@ from src.pipeline.train_mitty import (
     DEFAULT_DIT_DIR,
     DEFAULT_TOKENIZER,
     DEFAULT_VAE,
-    MANUAL_DIR,  # noqa: F401 — re-exported for callers
     _load_patch_weights,
-    build_pipe,  # noqa: F401
     collate_batch,
-    prepare_sample,  # noqa: F401 — used indirectly via load_sample path
+    prepare_sample,
 )
 
 
