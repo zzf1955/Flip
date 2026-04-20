@@ -351,7 +351,7 @@ LD_PRELOAD=/home/leadtek/miniconda3/envs/flip/lib/libjpeg.so.8 \
 python -m src.pipeline.train_lora \
   --cache-dir "$RUN_DIR/data_cache" \
   --device cuda:0 \
-  --epochs 1 --repeat 20 \
+  --max-steps 400 \
   --save-steps 50 --eval-steps 50 \
   --eval-video-steps 50 --eval-video-samples 2
 ```

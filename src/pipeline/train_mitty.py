@@ -10,14 +10,14 @@ Usage:
     --cache-train output/mitty_cache_1s/train \\
     --cache-eval  output/mitty_cache_1s/eval \\
     --cache-ood   output/mitty_cache_1s/ood_eval \\
-    --epochs 1 --repeat 1 --save-steps 10 --eval-steps 10 --eval-video-steps 20
+    --max-steps 50 --save-steps 10 --eval-steps 10 --eval-video-steps 20
 
   # DDP 4 GPUs (equivalent bs=4 for Mitty)
   torchrun --nproc_per_node=4 -m src.pipeline.train_mitty \\
     --cache-train output/mitty_cache_1s/train \\
     --cache-eval  output/mitty_cache_1s/eval \\
     --cache-ood   output/mitty_cache_1s/ood_eval \\
-    --epochs 3 --repeat 5 --save-steps 50 --eval-steps 50 --eval-video-steps 100
+    --max-steps 400 --save-steps 50 --eval-steps 50 --eval-video-steps 100
 """
 
 import argparse
@@ -26,7 +26,6 @@ import random
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
 from pathlib import Path
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -48,7 +47,10 @@ from src.core.wan_loader import (
 from src.core.train_utils import (
     CsvLogger,
     WandbLogger,
+    build_run_name,
+    build_wandb_tags,
     cleanup_distributed,
+    infinite_file_batches,
     load_cached_files,
     load_sample,
     log_step_eval_videos,
@@ -350,7 +352,7 @@ def train(args):
     if ddp_device is not None:
         args.device = ddp_device
 
-    run_name = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    run_name = build_run_name("mitty", args)
     run_dir = Path(args.output_dir) / run_name
     ckpt_dir = run_dir / "ckpt"
     eval_dir = run_dir / "eval"
@@ -377,7 +379,7 @@ def train(args):
         project=args.wandb_project if is_main else None,
         run_name=args.wandb_run_name or run_name,
         config=vars(args),
-        tags=(args.wandb_tags or []) + ["mitty"],
+        tags=build_wandb_tags("mitty", args, extra_tags=args.wandb_tags),
         dir=str(run_dir),
     )
 
@@ -453,10 +455,7 @@ def train(args):
         model.trainable_modules(), lr=args.lr, weight_decay=args.weight_decay,
     )
 
-    epoch_samples = len(train_files) * args.repeat
-    samples_per_rank = epoch_samples // world_size
-    steps_per_epoch = max(1, samples_per_rank // args.batch_size)
-    total_steps = args.epochs * steps_per_epoch
+    total_steps = args.max_steps
     effective_bs = args.batch_size * world_size
 
     # LR schedule: warmup (linear 0→lr) + cosine (lr→lr_min)
@@ -480,15 +479,9 @@ def train(args):
     else:
         lr_scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0)
 
-    info(
-        f"Plan: {args.epochs} ep x {len(train_files)} train x {args.repeat} repeat"
-        f" = {epoch_samples} samples/ep"
-    )
-    info(
-        f"DDP: {epoch_samples} samples / {world_size} ranks"
-        f" × {args.batch_size} batch_size = {steps_per_epoch} steps/ep,"
-        f" effective_bs={effective_bs}"
-    )
+    info(f"Plan: {total_steps} steps, {len(train_files)} train files, cycling infinitely")
+    info(f"DDP: world_size={world_size}, batch_size={args.batch_size},"
+         f" effective_bs={effective_bs}")
     info(f"LR: warmup {args.warmup_steps} steps → cosine to {args.lr_min:.1e}"
          f" (lr={args.lr:.1e})")
     info(f"Save every {args.save_steps}, eval every {args.eval_steps}"
@@ -498,148 +491,141 @@ def train(args):
     step = 0
     train_t0 = time.time()
 
-    for epoch in range(args.epochs):
-        rng = random.Random(args.seed + epoch)
-        epoch_files = train_files * args.repeat
-        rng.shuffle(epoch_files)
-        my_files = epoch_files[rank::world_size]
+    data_iter = infinite_file_batches(
+        train_files, batch_size=args.batch_size,
+        world_size=world_size, rank=rank, seed=args.seed,
+    )
 
-        # Chunk into batches of `args.batch_size`; drop incomplete tail
-        batches = [
-            my_files[i:i + args.batch_size]
-            for i in range(0, len(my_files), args.batch_size)
-            if i + args.batch_size <= len(my_files)
-        ]
+    def _prefetch(files):
+        out = []
+        for f in files:
+            s = load_sample(f)
+            if args.patch_dir:
+                _load_patch_weights(s, f, args.patch_dir)
+            out.append(s)
+        return out
 
-        def _prefetch(files):
-            out = []
-            for f in files:
-                s = load_sample(f)
-                if args.patch_dir:
-                    _load_patch_weights(s, f, args.patch_dir)
-                out.append(s)
-            return out
+    prefetch_ex = ThreadPoolExecutor(max_workers=1)
+    next_batch = next(data_iter)
+    pending = prefetch_ex.submit(_prefetch, next_batch)
 
-        prefetch_ex = ThreadPoolExecutor(max_workers=1)
-        pending = prefetch_ex.submit(_prefetch, batches[0]) if batches else None
+    while step < total_steps:
+        samples = pending.result()
+        next_batch = next(data_iter)
+        pending = prefetch_ex.submit(_prefetch, next_batch)
 
-        for batch_idx, batch_files in enumerate(batches):
-            samples = pending.result()
-            if batch_idx + 1 < len(batches):
-                pending = prefetch_ex.submit(_prefetch, batches[batch_idx + 1])
+        step += 1
+        st = time.time()
+        batch = collate_batch(samples, args.device)
+        optimizer.zero_grad()
+        loss = model(batch)
+        loss.backward()
 
-            step += 1
-            st = time.time()
-            batch = collate_batch(samples, args.device)
-            optimizer.zero_grad()
-            loss = model(batch)
-            loss.backward()
+        if world_size > 1:
+            sync_gradients(model)
 
-            if world_size > 1:
-                sync_gradients(model)
+        optimizer.step()
+        lr_scheduler.step()
 
-            optimizer.step()
-            lr_scheduler.step()
+        loss_val = loss.item()
+        if world_size > 1:
+            loss_val = reduce_scalar(loss_val, args.device)
 
-            loss_val = loss.item()
-            if world_size > 1:
-                loss_val = reduce_scalar(loss_val, args.device)
+        step_time = time.time() - st
+        lr = optimizer.param_groups[0]["lr"]
+        info(f"step={step}/{total_steps} train_loss={loss_val:.4f}"
+             f" lr={lr:.1e} time={step_time:.1f}s")
 
-            step_time = time.time() - st
-            lr = optimizer.param_groups[0]["lr"]
-            info(f"step={step}/{total_steps} train_loss={loss_val:.4f}"
-                 f" lr={lr:.1e} time={step_time:.1f}s")
+        row_fields = {
+            "step": step,
+            "train_loss": f"{loss_val:.4f}",
+            "lr": f"{lr:.3e}",
+            "time_s": f"{step_time:.2f}",
+        }
+        if is_main:
+            wb.log({
+                "train/loss": loss_val,
+                "train/lr": lr,
+                "train/time_s": step_time,
+            }, step=step)
 
-            row_fields = {
-                "step": step,
-                "train_loss": f"{loss_val:.4f}",
-                "lr": f"{lr:.3e}",
-                "time_s": f"{step_time:.2f}",
-            }
-            if is_main:
-                wb.log({
-                    "train/loss": loss_val,
-                    "train/lr": lr,
-                    "train/time_s": step_time,
-                }, step=step)
+        # Hit eval / eval-video at step 1 too (baseline snapshot)
+        hit_eval = bool(args.eval_steps) and (
+            step == 1 or step % args.eval_steps == 0)
+        hit_eval_video = bool(args.eval_video_steps) and (
+            step == 1 or step % args.eval_video_steps == 0)
 
-            # Hit eval / eval-video at step 1 too (baseline snapshot)
-            hit_eval = bool(args.eval_steps) and (
-                step == 1 or step % args.eval_steps == 0)
-            hit_eval_video = bool(args.eval_video_steps) and (
-                step == 1 or step % args.eval_video_steps == 0)
+        # Checkpoint (rank 0)
+        if args.save_steps and step % args.save_steps == 0 and is_main:
+            p = ckpt_dir / f"step-{step:04d}.safetensors"
+            n = save_lora_ckpt(model, str(p))
+            info(f"  SAVE {p} ({n} tensors)")
+            row_fields["save_ckpt"] = p.name
 
-            # Checkpoint (rank 0)
-            if args.save_steps and step % args.save_steps == 0 and is_main:
-                p = ckpt_dir / f"step-{step:04d}.safetensors"
-                n = save_lora_ckpt(model, str(p))
-                info(f"  SAVE {p} ({n} tensors)")
-                row_fields["save_ckpt"] = p.name
+        # Eval loss (rank 0 only); averaged over files × num_t_samples t
+        if hit_eval and is_main:
+            eval_payload = {}
+            if eval_files:
+                el = eval_loss(model, eval_files, args.device,
+                               num_t_samples=args.eval_t_samples,
+                               patch_dir=patch_dir_eval)
+                info(f"  EVAL eval_loss_in_task={el:.4f} "
+                     f"({len(eval_files)} samples × {args.eval_t_samples} t)")
+                row_fields["eval_loss_in_task"] = f"{el:.4f}"
+                eval_payload["train/eval_loss_in_task"] = el
+            if ood_files:
+                ol = eval_loss(model, ood_files, args.device,
+                               num_t_samples=args.eval_t_samples,
+                               patch_dir=patch_dir_ood)
+                info(f"  EVAL eval_loss_ood={ol:.4f} "
+                     f"({len(ood_files)} samples × {args.eval_t_samples} t)")
+                row_fields["eval_loss_ood"] = f"{ol:.4f}"
+                eval_payload["train/eval_loss_ood"] = ol
+            if eval_payload:
+                wb.log(eval_payload, step=step)
 
-            # Eval loss (rank 0 only); averaged over files × num_t_samples t
-            if hit_eval and is_main:
-                eval_payload = {}
-                if eval_files:
-                    el = eval_loss(model, eval_files, args.device,
-                                   num_t_samples=args.eval_t_samples,
-                                   patch_dir=patch_dir_eval)
-                    info(f"  EVAL eval_loss_in_task={el:.4f} "
-                         f"({len(eval_files)} samples × {args.eval_t_samples} t)")
-                    row_fields["eval_loss_in_task"] = f"{el:.4f}"
-                    eval_payload["train/eval_loss_in_task"] = el
-                if ood_files:
-                    ol = eval_loss(model, ood_files, args.device,
-                                   num_t_samples=args.eval_t_samples,
-                                   patch_dir=patch_dir_ood)
-                    info(f"  EVAL eval_loss_ood={ol:.4f} "
-                         f"({len(ood_files)} samples × {args.eval_t_samples} t)")
-                    row_fields["eval_loss_ood"] = f"{ol:.4f}"
-                    eval_payload["train/eval_loss_ood"] = ol
-                if eval_payload:
-                    wb.log(eval_payload, step=step)
-
-            # Eval videos (rank 0 only); `-1` means "all samples in the split"
-            if hit_eval_video and is_main:
-                n_in = (args.eval_video_samples_in_task
-                        if args.eval_video_samples_in_task > 0
-                        else len(eval_files))
-                n_ood = (args.eval_video_samples_ood
-                         if args.eval_video_samples_ood > 0
-                         else len(ood_files))
-                if eval_files:
-                    generate_eval_videos(
-                        model, eval_files, str(eval_dir / "in_task"), step,
-                        args.device,
-                        num_samples=n_in,
-                        num_inference_steps=args.num_inference_steps,
-                        log=log,
+        # Eval videos (rank 0 only); `-1` means "all samples in the split"
+        if hit_eval_video and is_main:
+            n_in = (args.eval_video_samples_in_task
+                    if args.eval_video_samples_in_task > 0
+                    else len(eval_files))
+            n_ood = (args.eval_video_samples_ood
+                     if args.eval_video_samples_ood > 0
+                     else len(ood_files))
+            if eval_files:
+                generate_eval_videos(
+                    model, eval_files, str(eval_dir / "in_task"), step,
+                    args.device,
+                    num_samples=n_in,
+                    num_inference_steps=args.num_inference_steps,
+                    log=log,
+                )
+                if args.wandb_log_videos:
+                    log_step_eval_videos(
+                        wb, str(eval_dir / "in_task" / f"step-{step:04d}"),
+                        step, split_tag="in_task",
                     )
-                    if args.wandb_log_videos:
-                        log_step_eval_videos(
-                            wb, str(eval_dir / "in_task" / f"step-{step:04d}"),
-                            step, split_tag="in_task",
-                        )
-                if ood_files:
-                    generate_eval_videos(
-                        model, ood_files, str(eval_dir / "ood"), step,
-                        args.device,
-                        num_samples=n_ood,
-                        num_inference_steps=args.num_inference_steps,
-                        log=log,
+            if ood_files:
+                generate_eval_videos(
+                    model, ood_files, str(eval_dir / "ood"), step,
+                    args.device,
+                    num_samples=n_ood,
+                    num_inference_steps=args.num_inference_steps,
+                    log=log,
+                )
+                if args.wandb_log_videos:
+                    log_step_eval_videos(
+                        wb, str(eval_dir / "ood" / f"step-{step:04d}"),
+                        step, split_tag="ood",
                     )
-                    if args.wandb_log_videos:
-                        log_step_eval_videos(
-                            wb, str(eval_dir / "ood" / f"step-{step:04d}"),
-                            step, split_tag="ood",
-                        )
-                row_fields["eval_video"] = f"step-{step:04d}"
+            row_fields["eval_video"] = f"step-{step:04d}"
 
-            write_csv_row(**row_fields)
+        write_csv_row(**row_fields)
 
-            if world_size > 1 and (hit_eval or hit_eval_video):
-                dist.barrier()
+        if world_size > 1 and (hit_eval or hit_eval_video):
+            dist.barrier()
 
-        prefetch_ex.shutdown(wait=False)
+    prefetch_ex.shutdown(wait=False)
 
     # Final checkpoint (if not at save boundary)
     if args.save_steps and step > 0 and step % args.save_steps != 0 and is_main:
@@ -693,8 +679,8 @@ def main():
     ap.add_argument("--warmup-steps", type=int, default=50,
                     help="linear warmup steps (0 = no warmup)")
     ap.add_argument("--weight-decay", type=float, default=1e-2)
-    ap.add_argument("--epochs", type=int, default=3)
-    ap.add_argument("--repeat", type=int, default=5)
+    ap.add_argument("--max-steps", type=int, required=True,
+                    help="Total training steps (data cycles infinitely)")
     ap.add_argument("--batch-size", type=int, default=1,
                     help="per-rank training batch size (real batch; the whole "
                          "batch shares one sampled timestep)")
@@ -716,8 +702,8 @@ def main():
     ap.add_argument("--num-inference-steps", type=int, default=30)
 
     # W&B
-    ap.add_argument("--wandb-project", default=None,
-                    help="W&B project name; unset = disabled")
+    ap.add_argument("--wandb-project", default="Flip",
+                    help="W&B project name (default: 'Flip'; set to '' to disable)")
     ap.add_argument("--wandb-run-name", default=None,
                     help="W&B run name (default: timestamp)")
     ap.add_argument("--wandb-tags", nargs="+", default=[],
