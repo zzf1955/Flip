@@ -189,6 +189,15 @@ def train(args, spec: BackboneSpec):
     if ddp_device is not None:
         args.device = ddp_device
 
+    # Deterministic timestep sampling inside the loss — the legacy train_mitty /
+    # train_rf left torch.randint seeded by interpreter start time, so loss
+    # values differed run-to-run. Ablation runs need reproducibility across
+    # seeds, so pin the global torch RNG here (rank offset keeps DDP workers
+    # decorrelated).
+    torch.manual_seed(args.seed + rank)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed + rank)
+
     run_name = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     run_dir = Path(args.output_dir) / run_name
     ckpt_dir = run_dir / "ckpt"
