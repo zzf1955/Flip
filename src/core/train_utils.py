@@ -16,8 +16,11 @@ import csv
 import glob
 import logging
 import os
+import random
 import subprocess
 import sys
+from collections.abc import Iterator
+from datetime import datetime
 
 import numpy as np
 import torch
@@ -130,6 +133,29 @@ def load_sample(path: str):
     return torch.load(path, map_location="cpu", weights_only=False)
 
 
+def infinite_file_batches(
+    files: list[str],
+    batch_size: int,
+    world_size: int,
+    rank: int,
+    seed: int = 42,
+) -> Iterator[list[str]]:
+    """Yield batches of file paths infinitely, reshuffling each pass.
+
+    All ranks use the same seed so sharding is deterministic.
+    Incomplete trailing batch is dropped.
+    """
+    pass_idx = 0
+    while True:
+        rng = random.Random(seed + pass_idx)
+        shuffled = list(files)
+        rng.shuffle(shuffled)
+        my_files = shuffled[rank::world_size]
+        for i in range(0, len(my_files) - batch_size + 1, batch_size):
+            yield my_files[i:i + batch_size]
+        pass_idx += 1
+
+
 def save_lora_ckpt(model, path: str) -> int:
     """Extract LoRA params and save as safetensors. Returns number of tensors."""
     sd = model.state_dict()
@@ -168,6 +194,55 @@ def tensor_to_frames(video_tensor: torch.Tensor) -> list[Image.Image]:
 
 
 # ── W&B ────────────────────────────────────────────────────────────────
+
+def _fmt_lr(lr: float) -> str:
+    """Format learning rate compactly: 1e-4 → '1e-4', 3e-5 → '3e-5'."""
+    s = f"{lr:.0e}"
+    base, exp = s.split("e")
+    return f"{base}e{int(exp)}"
+
+
+def build_run_name(prefix: str, args) -> str:
+    """Build a descriptive run name: {prefix}-r{rank}-lr{lr}-{timestamp}."""
+    lr = getattr(args, "lr", None)
+    lora_rank = getattr(args, "lora_rank", None)
+    parts = [prefix]
+    if lora_rank is not None:
+        parts.append(f"r{lora_rank}")
+    if lr is not None:
+        parts.append(f"lr{_fmt_lr(lr)}")
+    parts.append(datetime.now().strftime("%Y-%m-%d_%H%M%S"))
+    return "-".join(parts)
+
+
+def build_wandb_tags(method_tag: str, args,
+                     extra_tags: list[str] | None = None) -> list[str]:
+    """Build W&B tags from args: [method, r{rank}, lr{lr}, bs{N}, ...].
+
+    Uses getattr for safe extraction across different scripts' arg namespaces.
+    """
+    tags = [method_tag]
+    lora_rank = getattr(args, "lora_rank", None)
+    if lora_rank is not None:
+        tags.append(f"r{lora_rank}")
+    lr = getattr(args, "lr", None)
+    if lr is not None:
+        tags.append(f"lr{_fmt_lr(lr)}")
+    bs = getattr(args, "batch_size", None)
+    if bs is not None and bs > 1:
+        tags.append(f"bs{bs}")
+    warmup = getattr(args, "warmup_steps", None)
+    if warmup is not None and warmup > 0:
+        tags.append(f"warmup{warmup}")
+    max_steps = getattr(args, "max_steps", None)
+    if max_steps is not None:
+        tags.append(f"steps{max_steps}")
+    if getattr(args, "init_lora", ""):
+        tags.append("init-lora")
+    if extra_tags:
+        tags.extend(extra_tags)
+    return tags
+
 
 class WandbLogger:
     """Thin W&B wrapper. No-op when `project` is falsy (e.g. user didn't pass
