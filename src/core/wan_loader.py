@@ -89,14 +89,12 @@ def load_dit(
 
 def load_vae(
     path: str,
-    device: str | torch.device,
     dtype: torch.dtype = torch.bfloat16,
     home_device: str | torch.device = "cpu",
 ) -> WanVideoVAE38:
-    """Load Wan2.2 VAE. Parked on `home_device` (default cpu, moved to `device`
-    on demand via SimplePipe.load_models_to_device).
+    """Load Wan2.2 VAE. Parked on `home_device` (default cpu). Actual compute
+    device is chosen later via SimplePipe.load_models_to_device(["vae"]).
     """
-    del device  # only home_device matters at load time
     with skip_model_initialization():
         vae = WanVideoVAE38(z_dim=48, dim=160)
 

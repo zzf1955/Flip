@@ -91,7 +91,7 @@ def build_pipe(device: str, dit_dir: str, vae_path: str,
     pipe = SimplePipe(device)
     pipe.dit = load_dit(shards, device, torch.bfloat16)
     if load_vae:
-        pipe.vae = _load_vae(vae_path, device, torch.bfloat16, home_device="cpu")
+        pipe.vae = _load_vae(vae_path, torch.bfloat16, home_device="cpu")
     return pipe
 
 
