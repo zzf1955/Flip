@@ -358,6 +358,46 @@ python -m src.pipeline.train_lora \
 
 输出：`training_data/log/<auto-timestamp>/ckpt/`、`eval/`、`train.log`
 
+### Wan 2.2 TI2V-5B 统一训练入口（推荐）
+
+两个消融维度：主干 `--backbone {mitty,rectflow}`、loss `--loss {uniform,hand_patch}`。
+`--loss hand_patch` 必须配 `--patch-dir`，`--loss uniform` 不允许传 `--patch-dir`（argparse 硬校验）。
+
+```bash
+# Mitty + uniform（baseline）
+torchrun --nproc_per_node=4 -m src.pipeline.train \
+  --backbone mitty --loss uniform \
+  --cache-train output/mitty_cache_1s/train \
+  --cache-eval  output/mitty_cache_1s/eval \
+  --cache-ood   output/mitty_cache_1s/ood_eval \
+  --epochs 3 --repeat 5 --save-steps 50 --eval-steps 50
+
+# Mitty + hand_patch 加权
+torchrun --nproc_per_node=4 -m src.pipeline.train \
+  --backbone mitty --loss hand_patch \
+  --patch-dir training_data/pair/1s/train/hand_patch \
+  --cache-train output/mitty_cache_1s/train ...
+
+# RectFlow（Route A：source 代替 Gaussian noise）
+torchrun --nproc_per_node=4 -m src.pipeline.train \
+  --backbone rectflow --loss uniform \
+  --cache-train output/mitty_cache_1s/train ...
+```
+
+W&B tags 自动 `[backbone, loss, ...wandb-tags]`，消融表按 tag 分面。
+训练用 `torch.manual_seed(args.seed + rank)` 固定随机，结果可复现。
+
+**Legacy 等效命令**（旧脚本保留，单独维护；新实验建议统一走 `train.py`）：
+
+```bash
+# 等效于 --backbone mitty --loss uniform
+python -m src.pipeline.train_mitty --cache-train ...
+# 等效于 --backbone mitty --loss hand_patch --patch-dir ...
+python -m src.pipeline.train_mitty --patch-dir ... --cache-train ...
+# 等效于 --backbone rectflow --loss uniform
+python -m src.pipeline.train_rf --cache-train ...
+```
+
 ### 训练目录结构
 
 ```
