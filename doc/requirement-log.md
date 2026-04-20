@@ -209,3 +209,18 @@
 
 **创建的任务：**
 - [016] 修复 robot-recon 数据生成 bug（identity 配对）
+
+---
+
+**用户原始需求：**
+> 新建一个 Task，做一下 GPU 直接加载。T5 分词器的预处理 GPU 直接加载，DiT 的权重直接加载，然后 VAE 处理 cache 的时候提高 cache。所有加载不要走 CPU。
+
+讨论要点：
+- DiT 直接 GPU 已在 t014b 分支完成，合并到 main
+- mitty_cache.py 中 T5 + VAE 仍走 DiffSynth `WanVideoPipeline.from_pretrained()`，需彻底脱离
+- wan_loader.py 新增 `load_text_encoder()` + `load_tokenizer()` 直接加载器
+- 训练脚本的 load_sample / _load_patch_weights / init_lora / VAE 全部传 device 到 GPU
+- train_lora.py（Wan 2.1 legacy）不在范围内
+
+**创建的任务：**
+- [017] GPU 直接加载 — 消除所有 CPU 中转
