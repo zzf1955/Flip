@@ -48,24 +48,30 @@ WAN22_TI2V_5B_DIT_CONFIG = {
 }
 
 
-def _read_safetensors(path: str, dtype: torch.dtype) -> dict[str, torch.Tensor]:
+def _read_safetensors(
+    path: str, dtype: torch.dtype, device: str = "cpu",
+) -> dict[str, torch.Tensor]:
     sd: dict[str, torch.Tensor] = {}
-    with safe_open(path, framework="pt", device="cpu") as f:
+    with safe_open(path, framework="pt", device=device) as f:
         for k in f.keys():
             sd[k] = f.get_tensor(k).to(dtype)
     return sd
 
 
-def _load_shards_parallel(
-    paths: Iterable[str], dtype: torch.dtype
+def _load_shards(
+    paths: Iterable[str], dtype: torch.dtype, device: str = "cpu",
 ) -> dict[str, torch.Tensor]:
     paths = list(paths)
     sd: dict[str, torch.Tensor] = {}
     if len(paths) == 1:
-        return _read_safetensors(paths[0], dtype)
-    with ThreadPoolExecutor(max_workers=min(len(paths), 4)) as ex:
-        for part in ex.map(lambda p: _read_safetensors(p, dtype), paths):
-            sd.update(part)
+        return _read_safetensors(paths[0], dtype, device)
+    if device == "cpu":
+        with ThreadPoolExecutor(max_workers=min(len(paths), 4)) as ex:
+            for part in ex.map(lambda p: _read_safetensors(p, dtype, device), paths):
+                sd.update(part)
+    else:
+        for p in paths:
+            sd.update(_read_safetensors(p, dtype, device))
     return sd
 
 
@@ -74,17 +80,20 @@ def load_dit(
     device: str | torch.device,
     dtype: torch.dtype = torch.bfloat16,
 ) -> WanModel:
-    """Load Wan2.2 TI2V-5B DiT to `device` with `dtype`. Returns eval-mode model."""
+    """Load Wan2.2 TI2V-5B DiT directly to `device` via safetensors.
+
+    Reads tensors straight to GPU — no CPU staging, no staggered DDP loading needed.
+    """
     with skip_model_initialization():
         model = WanModel(**WAN22_TI2V_5B_DIT_CONFIG)
-    sd = _load_shards_parallel(shard_paths, dtype)
+    sd = _load_shards(shard_paths, dtype, device=str(device))
     result = model.load_state_dict(sd, assign=True, strict=True)
     if result.missing_keys or result.unexpected_keys:
         raise RuntimeError(
             f"DiT state_dict mismatch: missing={result.missing_keys[:5]}, "
             f"unexpected={result.unexpected_keys[:5]}"
         )
-    return model.to(device=device, dtype=dtype).eval()
+    return model.eval()
 
 
 def load_vae(

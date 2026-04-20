@@ -295,20 +295,9 @@ python -m src.tools.retarget_diag --episode 0 --frame 30 \
 
 ## DDP 训练注意事项
 
-### 错峰加载模型（防 CPU OOM）
+### 模型加载
 
-多卡 DDP 时，**必须**让各 rank 依次加载模型，不能同时加载。原因：
-1. 4 个进程同时加载 DiT（~10GB）+ VAE + tokenizer，CPU 内存瞬间峰值 ~60GB，会触发 systemd-oomd 杀进程
-2. rank 0 先加载后，模型文件已进入 page cache，后续 rank 从内存读取而非磁盘，速度快很多
-
-```python
-for load_rank in range(world_size):
-    if rank == load_rank:
-        model = MittyTrainingModule(...)
-        import gc; gc.collect()
-    if world_size > 1:
-        dist.barrier()
-```
+`wan_loader.py` 的 `load_dit()` 使用 safetensors 直接读到目标 GPU（`safe_open(device="cuda:X")`），不经过 CPU 中转，各 rank 并行加载互不干扰，无需错峰。VAE 仍在 CPU 上加载（仅 rank 0 eval 时用）。
 
 ## LoRA 微调流程
 
