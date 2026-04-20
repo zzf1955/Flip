@@ -31,17 +31,21 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 sys.stdout.reconfigure(line_buffering=True)
 
 import av
+import numpy as np
 import torch
 from PIL import Image
 
-from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
 from src.core.config import MAIN_ROOT
+from src.core.wan_loader import load_text_encoder, load_tokenizer, load_vae
 
 
 MANUAL_DIR = os.path.join(
     "/disk_n/zzf/.cache/huggingface/hub",
     "models--Wan-AI--Wan2.2-TI2V-5B", "manual",
 )
+T5_PATH = os.path.join(MANUAL_DIR, "models_t5_umt5-xxl-enc-bf16.pth")
+VAE_PATH = os.path.join(MANUAL_DIR, "Wan2.2_VAE.pth")
+TOKENIZER_DIR = os.path.join(MANUAL_DIR, "google", "umt5-xxl")
 
 NEGATIVE_PROMPT = (
     "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，"
@@ -58,60 +62,53 @@ def load_video_as_pil(path: str) -> list[Image.Image]:
     return frames
 
 
-def build_pipe(device: str) -> WanVideoPipeline:
-    """Build pipeline with T5 + VAE only (no DiT)."""
-    t5_path = os.path.join(MANUAL_DIR, "models_t5_umt5-xxl-enc-bf16.pth")
-    vae_path = os.path.join(MANUAL_DIR, "Wan2.2_VAE.pth")
-    tokenizer_dir = os.path.join(MANUAL_DIR, "google", "umt5-xxl")
+def build_models(device: str):
+    """Load T5 + VAE directly to GPU (no DiffSynth pipeline)."""
+    t5 = load_text_encoder(T5_PATH, device, torch.bfloat16)
+    vae = load_vae(VAE_PATH, torch.bfloat16, home_device=device)
+    tokenizer, seq_len = load_tokenizer(TOKENIZER_DIR)
+    return t5, vae, tokenizer, seq_len
 
-    # T5: ~5.6GB bf16, VAE: ~0.5GB. 两个加一起 GPU 也够，保持 CPU offload 一致行为
-    cpu_offload = {
-        "offload_dtype": torch.bfloat16,
-        "offload_device": "cpu",
-        "onload_dtype": torch.bfloat16,
-        "onload_device": "cpu",
-        "preparing_dtype": torch.bfloat16,
-        "preparing_device": device,
-        "computation_dtype": torch.bfloat16,
-        "computation_device": device,
-    }
 
-    pipe = WanVideoPipeline.from_pretrained(
-        torch_dtype=torch.bfloat16,
-        device=device,
-        model_configs=[
-            ModelConfig(path=t5_path, **cpu_offload),
-            ModelConfig(path=vae_path, **cpu_offload),
-        ],
-        tokenizer_config=ModelConfig(path=tokenizer_dir),
-    )
-    return pipe
+def _preprocess_video(frames: list[Image.Image], device: str,
+                      dtype=torch.bfloat16) -> torch.Tensor:
+    """PIL frames → (1, 3, T, H, W) in [-1, 1], matching DiffSynth's preprocess_video."""
+    tensors = []
+    for f in frames:
+        t = torch.from_numpy(np.array(f, dtype=np.float32))
+        t = t.to(dtype=dtype, device=device)
+        t = t * (2.0 / 255.0) - 1.0
+        t = t.permute(2, 0, 1)  # (C, H, W)
+        tensors.append(t)
+    return torch.stack(tensors, dim=1).unsqueeze(0)  # (1, C, T, H, W)
 
 
 @torch.no_grad()
-def encode_prompt(pipe: WanVideoPipeline, prompt: str) -> torch.Tensor:
+def encode_prompt(t5, tokenizer, seq_len: int, prompt: str,
+                  device: str) -> torch.Tensor:
     """Encode prompt to T5 embedding. Returns (1, 512, 4096) bf16."""
-    pipe.load_models_to_device(["text_encoder"])
-    ids, mask = pipe.tokenizer(prompt, return_mask=True, add_special_tokens=True)
-    ids = ids.to(pipe.device)
-    mask = mask.to(pipe.device)
+    inputs = tokenizer(
+        [prompt], return_tensors="pt",
+        padding="max_length", truncation=True,
+        max_length=seq_len, add_special_tokens=True,
+    )
+    ids = inputs.input_ids.to(device)
+    mask = inputs.attention_mask.to(device)
     seq_lens = mask.gt(0).sum(dim=1).long()
-    prompt_emb = pipe.text_encoder(ids, mask)
+    emb = t5(ids, mask)
     for i, v in enumerate(seq_lens):
-        prompt_emb[:, v:] = 0
-    return prompt_emb
+        emb[:, v:] = 0
+    return emb
 
 
 @torch.no_grad()
-def encode_video(pipe: WanVideoPipeline, frames: list[Image.Image]) -> torch.Tensor:
+def encode_video(vae, frames: list[Image.Image], device: str) -> torch.Tensor:
     """VAE-encode frames. Wan 2.2 VAE: spatial 16x, temporal 4x, z_dim=48.
 
     480x640 / 17 frames → (1, 48, 5, 30, 40)
     """
-    pipe.load_models_to_device(["vae"])
-    video_tensor = pipe.preprocess_video(frames)   # (1, 3, T, H, W), bf16, [-1, 1]
-    # vae.encode accepts list of (C,T,H,W) or tensor with batch dim; iterates over batch
-    latent = pipe.vae.encode(video_tensor, device=pipe.device)
+    video_tensor = _preprocess_video(frames, device)
+    latent = vae.encode(video_tensor, device=device)
     return latent.to(dtype=torch.bfloat16)
 
 
@@ -152,15 +149,18 @@ def main():
     print(f"Output:   {output_dir}")
     print(f"Device:   {args.device}")
 
-    pipe = build_pipe(args.device)
-    print("Pipeline loaded (T5 + VAE)")
+    t5, vae, tokenizer, seq_len = build_models(args.device)
+    print(f"Models loaded directly to {args.device} (T5 + VAE, no DiffSynth)")
 
     # Pre-encode unique prompts (all pairs share the same prompt in current dataset)
     prompts = sorted(set(r["prompt"] for r in rows))
     print(f"Prompts:  {len(prompts)} unique")
     t0 = time.time()
-    prompt_emb_cache = {p: encode_prompt(pipe, p).cpu() for p in prompts}
-    nega_emb = encode_prompt(pipe, NEGATIVE_PROMPT).cpu()
+    prompt_emb_cache = {
+        p: encode_prompt(t5, tokenizer, seq_len, p, args.device).cpu()
+        for p in prompts
+    }
+    nega_emb = encode_prompt(t5, tokenizer, seq_len, NEGATIVE_PROMPT, args.device).cpu()
     print(f"T5 encode done in {time.time() - t0:.1f}s")
 
     skipped = 0
@@ -178,8 +178,8 @@ def main():
         human_frames = load_video_as_pil(str(human_path))
         robot_frames = load_video_as_pil(str(robot_path))
 
-        human_lat = encode_video(pipe, human_frames).cpu()
-        robot_lat = encode_video(pipe, robot_frames).cpu()
+        human_lat = encode_video(vae, human_frames, args.device).cpu()
+        robot_lat = encode_video(vae, robot_frames, args.device).cpu()
 
         source_key = f"{split_name}/{Path(row['video']).name}"
         source_id = source_map.get(source_key, {}).get("source_id", "")

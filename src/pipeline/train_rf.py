@@ -111,7 +111,7 @@ class RFTrainingModule(DiffusionTrainingModule):
 
         if init_lora_path:
             from safetensors.torch import load_file
-            sd = load_file(init_lora_path)
+            sd = load_file(init_lora_path, device=str(device))
             result = self.pipe.dit.load_state_dict(sd, strict=False)
             if result.unexpected_keys:
                 raise ValueError(
@@ -147,9 +147,9 @@ def eval_loss(model: RFTrainingModule, files: list[str], device: str,
     try:
         losses = []
         for i, f in enumerate(files):
-            s = load_sample(f)
+            s = load_sample(f, device=device)
             if patch_dir:
-                _load_patch_weights(s, f, patch_dir)
+                _load_patch_weights(s, f, patch_dir, device=device)
             s = prepare_sample(s, device)
             sub = []
             for k in range(num_t_samples):
@@ -198,7 +198,7 @@ def generate_eval_videos(
     n = min(num_samples, len(files))
     for idx in range(n):
         t0 = time.time()
-        s = load_sample(files[idx])
+        s = load_sample(files[idx], device=device)
         source_lat = s["human_latent"].to(device=device, dtype=torch.bfloat16)
         ctx_posi = s["context_posi"].to(device=device, dtype=torch.bfloat16)
         ctx_nega = s["context_nega"].to(device=device, dtype=torch.bfloat16)
@@ -389,9 +389,9 @@ def train(args):
     def _prefetch(files):
         out = []
         for f in files:
-            s = load_sample(f)
+            s = load_sample(f, device=args.device)
             if args.patch_dir:
-                _load_patch_weights(s, f, args.patch_dir)
+                _load_patch_weights(s, f, args.patch_dir, device=args.device)
             out.append(s)
         return out
 
