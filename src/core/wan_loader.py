@@ -51,11 +51,18 @@ WAN22_TI2V_5B_DIT_CONFIG = {
 
 def _read_safetensors(
     path: str, dtype: torch.dtype, device: str = "cpu",
+    progress_prefix: str = "",
 ) -> dict[str, torch.Tensor]:
     sd: dict[str, torch.Tensor] = {}
     with safe_open(path, framework="pt", device=device) as f:
-        for k in f.keys():
+        keys = list(f.keys())
+        n = len(keys)
+        for i, k in enumerate(keys):
             sd[k] = f.get_tensor(k).to(dtype)
+            if progress_prefix and (i + 1) % 100 == 0:
+                print(f"  {progress_prefix} {i+1}/{n} tensors", flush=True)
+    if progress_prefix:
+        print(f"  {progress_prefix} {n}/{n} tensors done", flush=True)
     return sd
 
 
@@ -65,14 +72,20 @@ def _load_shards(
     paths = list(paths)
     sd: dict[str, torch.Tensor] = {}
     if len(paths) == 1:
-        return _read_safetensors(paths[0], dtype, device)
+        return _read_safetensors(
+            paths[0], dtype, device,
+            progress_prefix=os.path.basename(paths[0]),
+        )
     if device == "cpu":
         with ThreadPoolExecutor(max_workers=min(len(paths), 4)) as ex:
             for part in ex.map(lambda p: _read_safetensors(p, dtype, device), paths):
                 sd.update(part)
     else:
-        for p in paths:
-            sd.update(_read_safetensors(p, dtype, device))
+        for i, p in enumerate(paths):
+            sd.update(_read_safetensors(
+                p, dtype, device,
+                progress_prefix=f"[{i+1}/{len(paths)}] {os.path.basename(p)}",
+            ))
     return sd
 
 
@@ -80,20 +93,31 @@ def load_dit(
     shard_paths: Iterable[str],
     device: str | torch.device,
     dtype: torch.dtype = torch.bfloat16,
+    skip_load: bool = False,
 ) -> WanModel:
     """Load Wan2.2 TI2V-5B DiT directly to `device` via safetensors.
 
-    Reads tensors straight to GPU — no CPU staging, no staggered DDP loading needed.
+    When ``skip_load=True`` the model structure is allocated on ``device``
+    with dtype ``dtype`` but no weights are read from disk.  Used for DDP
+    broadcast: rank 0 loads normally, others call with ``skip_load=True``
+    and receive weights via NCCL.
     """
     with skip_model_initialization():
         model = WanModel(**WAN22_TI2V_5B_DIT_CONFIG)
-    sd = _load_shards(shard_paths, dtype, device=str(device))
-    result = model.load_state_dict(sd, assign=True, strict=True)
-    if result.missing_keys or result.unexpected_keys:
-        raise RuntimeError(
-            f"DiT state_dict mismatch: missing={result.missing_keys[:5]}, "
-            f"unexpected={result.unexpected_keys[:5]}"
-        )
+    if skip_load:
+        model.to_empty(device=device)
+        for p in model.parameters():
+            p.data = p.data.to(dtype=dtype)
+        for b in model.buffers():
+            b.data = b.data.to(dtype=dtype)
+    else:
+        sd = _load_shards(shard_paths, dtype, device=str(device))
+        result = model.load_state_dict(sd, assign=True, strict=True)
+        if result.missing_keys or result.unexpected_keys:
+            raise RuntimeError(
+                f"DiT state_dict mismatch: missing={result.missing_keys[:5]}, "
+                f"unexpected={result.unexpected_keys[:5]}"
+            )
     return model.eval()
 
 
@@ -161,7 +185,13 @@ class SimplePipe(nn.Module):
 
 
 def build_dit_shard_list(dit_dir: str) -> list[str]:
-    """Return sorted list of `diffusion_pytorch_model-*.safetensors` in `dit_dir`."""
+    """Return DiT weight paths in ``dit_dir``.
+
+    Prefers a single pre-converted bf16 file over the original FP32 shards.
+    """
+    bf16_path = os.path.join(dit_dir, "diffusion_pytorch_model-bf16.safetensors")
+    if os.path.isfile(bf16_path):
+        return [bf16_path]
     shards = sorted(
         os.path.join(dit_dir, f)
         for f in os.listdir(dit_dir)

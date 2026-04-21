@@ -264,10 +264,11 @@ def train(args, spec: BackboneSpec):
     else:
         info("Patch weights: disabled (uniform loss)")
 
-    # ── Model (safetensors reads directly to GPU — no CPU staging) ──
+    # ── Model (rank 0 loads from disk; others allocate empty + receive via broadcast) ──
     info("Loading model...")
     t0 = time.time()
     load_vae = is_main and args.eval_video_steps > 0
+    skip_dit = world_size > 1 and rank != 0
     model = spec.training_module_factory(
         device=args.device,
         lora_rank=args.lora_rank,
@@ -275,8 +276,10 @@ def train(args, spec: BackboneSpec):
         use_gradient_checkpointing=True,
         load_vae=load_vae,
         init_lora_path=args.init_lora,
+        skip_dit_load=skip_dit,
     )
-    info(f"Model loaded in {time.time() - t0:.1f}s (load_vae={load_vae})")
+    info(f"Model {'allocated (empty)' if skip_dit else 'loaded from disk'}"
+         f" in {time.time() - t0:.1f}s (load_vae={load_vae})")
     if getattr(model, "_init_lora_n", 0):
         info(f"Loaded {model._init_lora_n} LoRA tensors from {args.init_lora}")
 
@@ -286,10 +289,15 @@ def train(args, spec: BackboneSpec):
          f"({n_trainable / 1e6:.1f}M)")
 
     if world_size > 1:
-        for p in model.parameters():
-            if p.requires_grad:
-                dist.broadcast(p.data, src=0)
-        info("LoRA weights synced across ranks")
+        t_bc = time.time()
+        dit = model.pipe.dit
+        for p in dit.parameters():
+            dist.broadcast(p.data, src=0)
+        for b in dit.buffers():
+            dist.broadcast(b, src=0)
+        bc_gb = sum(p.numel() for p in dit.parameters()) * 2 / 1e9
+        info(f"DiT weights broadcast from rank 0 in {time.time() - t_bc:.1f}s "
+             f"({bc_gb:.2f} GB bf16)")
 
     optimizer = torch.optim.AdamW(
         model.trainable_modules(), lr=args.lr, weight_decay=args.weight_decay,
