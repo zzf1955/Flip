@@ -51,11 +51,18 @@ WAN22_TI2V_5B_DIT_CONFIG = {
 
 def _read_safetensors(
     path: str, dtype: torch.dtype, device: str = "cpu",
+    progress_prefix: str = "",
 ) -> dict[str, torch.Tensor]:
     sd: dict[str, torch.Tensor] = {}
     with safe_open(path, framework="pt", device=device) as f:
-        for k in f.keys():
+        keys = list(f.keys())
+        n = len(keys)
+        for i, k in enumerate(keys):
             sd[k] = f.get_tensor(k).to(dtype)
+            if progress_prefix and (i + 1) % 100 == 0:
+                print(f"  {progress_prefix} {i+1}/{n} tensors", flush=True)
+    if progress_prefix:
+        print(f"  {progress_prefix} {n}/{n} tensors done", flush=True)
     return sd
 
 
@@ -65,14 +72,20 @@ def _load_shards(
     paths = list(paths)
     sd: dict[str, torch.Tensor] = {}
     if len(paths) == 1:
-        return _read_safetensors(paths[0], dtype, device)
+        return _read_safetensors(
+            paths[0], dtype, device,
+            progress_prefix=os.path.basename(paths[0]),
+        )
     if device == "cpu":
         with ThreadPoolExecutor(max_workers=min(len(paths), 4)) as ex:
             for part in ex.map(lambda p: _read_safetensors(p, dtype, device), paths):
                 sd.update(part)
     else:
-        for p in paths:
-            sd.update(_read_safetensors(p, dtype, device))
+        for i, p in enumerate(paths):
+            sd.update(_read_safetensors(
+                p, dtype, device,
+                progress_prefix=f"[{i+1}/{len(paths)}] {os.path.basename(p)}",
+            ))
     return sd
 
 
