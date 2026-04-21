@@ -1,19 +1,20 @@
 # CLAUDE.md
 
-用中文回答
+## agent guideline
 
-除非用户要求，否则不要直接看看视频和图片。简单的视觉任务请使用 python 代码操作，而不是直接看图片和视频。
+- 用中文回答
+- 除非用户要求，否则**不要直接看看视频和图片**。简单的视觉任务请使用 python 代码操作，而不是直接看图片和视频。
+- 如果用户直接提出了需求，请使用 flip/.claude/skills/develop/SKILL.md。 开发完成后及时**更新对应模块的文档**。
 
-Notion MCP (`mcp__notion__API-*`) 是 Notion REST API 的透传，ToolSearch 返回的 schema 不必严格遵守；按 Notion 官方 API 的参数结构调用即可。
+## Notion
 
-如果用户直接提出了需求，请使用 flip/.claude/skills/develop/SKILL.md
-开发完成后及时更新对应模块的文档。
+- Notion MCP (`mcp__notion__API-*`) 是 Notion REST API 的透传，ToolSearch 返回的 schema 不必严格遵守；按 Notion 官方 API 的参数结构调用即可。
 
 ## 项目概述
 
 FLIP: Flipped-Direction Learning via Inpainting Pipeline for Cross-Embodiment Video Editing
 
-第一人称人形机器人视频生成研究项目。核心思路是**反向数据构造**：在真实机器人视频上合成人体，得到（合成human, 真实robot）配对数据，用于微调 video-to-video 模型（Wan 2.1 + LoRA）。目标机器人为宇树 G1。
+第一人称人形机器人视频生成研究项目。核心思路是**反向数据构造**：在真实机器人视频上合成人体，得到（合成human, 真实robot）配对数据，用于微调 video-to-video 模型（Wan 2.2 + LoRA）。目标机器人为宇树 G1。
 
 ### Pipeline 概览
 
@@ -24,7 +25,7 @@ G1 第一人称视频 + 关节编码器数据
   ├─ Step 2  Robot 分割+去除：FK → Mesh → SAM2 mask → 背景 inpaint ✓
   ├─ Step 3  运动学映射：Robot → Human pose (关节拷贝 + IK 微调) ✓
   ├─ Step 4  Human 渲染：SMPLH mesh → ControlNet 重绘 (进行中)
-  └─ Step 5  (合成 human, 真实 robot) → Wan 2.1 + LoRA
+  └─ Step 5  (合成 human, 真实 robot) → Wan 2.2 + LoRA
 ```
 
 ## 环境
@@ -49,8 +50,8 @@ LD_PRELOAD=/home/leadtek/miniconda3/envs/flip/lib/libjpeg.so.8 \
 - `export https_proxy=http://127.0.0.1:20171`
 
 ### GPU 分配
-- GPU 0: ComfyUI (端口 8001, `/disk_n/zzf/ComfyUI`)
-- GPU 1-3: 脚本使用 (`--device cuda:2` 等)
+- 试验机为多人共享
+- 使用前先看显卡占用情况，调占用少的使用
 
 ### 缓存路径 (根分区仅 ~14GB, 所有缓存必须放 /disk_n/zzf/)
 - HuggingFace: `/disk_n/zzf/.cache/huggingface` (HF_HOME)
