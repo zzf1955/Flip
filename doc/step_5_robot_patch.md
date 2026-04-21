@@ -7,7 +7,7 @@
 ## 数据结构
 
 ```
-training_data/robot_patch/1s/
+training_data/pair/1s_patch/
 ├── train/
 │   ├── video/           # pair_0000.mp4 ... (原始 robot 视频, 17帧@16fps)
 │   ├── control_video/   # pair_0000.mp4 ... (降质 robot 视频)
@@ -32,6 +32,7 @@ training_data/robot_patch/1s/
 
 - 空间：480×640 → 30×40（VAE 16× 下采样，每 16×16 block max-pool）
 - 时间：17帧 → 5组 (4+4+4+4+1)，每组 mask 取 union
+- `--patch-expand N`：latent 空间膨胀 N 个 cell（椭圆结构元素），默认 1
 - `weights` key 与 `train.py` 的 `_load_patch_weights` 直接兼容
 
 ## 处理流程
@@ -99,12 +100,13 @@ python -m src.pipeline.robot_patch --task all --degrade blur --clean
 | `--degrade` | `blur` | `blur` / `noise` / `mean` |
 | `--blur-ksize` | 51 | blur 高斯核大小（奇数） |
 | `--noise-std` | 50.0 | noise 模式的标准差（0-255 scale） |
+| `--patch-expand` | 1 | latent mask 向外膨胀的 cell 数（0=不扩展） |
 | `--max-segments` | 0 | 每 task 最大 segment 数（0=不限） |
 | `--per-task-eval` | 5 | 每 task 预留 eval 的 segment 数 |
 | `--seed` | 42 | train/eval 划分随机种子 |
 | `--workers` | 4 | 视频写入线程数 |
 | `--resume` | false | 跳过已存在的输出 |
-| `--clean` | false | 清空 `robot_patch/1s/` 后重新生成 |
+| `--clean` | false | 清空 `pair/1s_patch/` 后重新生成 |
 
 ## 下游训练
 
@@ -113,17 +115,17 @@ python -m src.pipeline.robot_patch --task all --degrade blur --clean
 ```bash
 # 1. 编码为 VAE cache
 python -m src.pipeline.mitty_cache \
-  --pair-dir training_data/robot_patch/1s/train \
+  --pair-dir training_data/pair/1s_patch/train \
   --output output/cache/robot_patch/train --device cuda:0
 
 python -m src.pipeline.mitty_cache \
-  --pair-dir training_data/robot_patch/1s/eval \
+  --pair-dir training_data/pair/1s_patch/eval \
   --output output/cache/robot_patch/eval --device cuda:0
 
 # 2. 训练（robot patch 加权 loss）
 torchrun --nproc_per_node=4 -m src.pipeline.train \
   --backbone mitty --loss hand_patch \
-  --patch-dir training_data/robot_patch/1s/train/patch \
+  --patch-dir training_data/pair/1s_patch/train/patch \
   --cache-train output/cache/robot_patch/train \
   --cache-eval output/cache/robot_patch/eval \
   --epochs 3 --repeat 5 --save-steps 50 --eval-steps 50

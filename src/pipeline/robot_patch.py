@@ -50,7 +50,7 @@ from src.core.render import render_mask
 
 _MAIN_TRAINING_DATA = os.path.join(MAIN_ROOT, "training_data")
 _SEGMENT_DIR = os.path.join(_MAIN_TRAINING_DATA, "segment")
-_ROBOT_PATCH_DIR = os.path.join(_MAIN_TRAINING_DATA, "robot_patch")
+_PAIR_DIR = os.path.join(_MAIN_TRAINING_DATA, "pair")
 
 SEGMENT_FPS = 30
 TARGET_FPS = 16
@@ -174,14 +174,23 @@ def pixel_mask_to_latent(mask_hw: np.ndarray) -> np.ndarray:
     return latent
 
 
-def build_latent_mask(masks: list[np.ndarray]) -> torch.Tensor:
-    """17 per-frame pixel masks -> (LATENT_F, LATENT_H, LATENT_W) binary tensor."""
+def build_latent_mask(masks: list[np.ndarray], expand: int = 0) -> torch.Tensor:
+    """17 per-frame pixel masks -> (LATENT_F, LATENT_H, LATENT_W) binary tensor.
+
+    expand: number of latent cells to dilate outward (0 = no expansion).
+    """
     latent = torch.zeros(LATENT_F, LATENT_H, LATENT_W, dtype=torch.float32)
     for j in range(LATENT_F):
         start = j * 4
         end = min(start + 4, NUM_FRAMES)
         group = np.maximum.reduce(masks[start:end])
         latent[j] = torch.from_numpy(pixel_mask_to_latent(group))
+    if expand > 0:
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (2 * expand + 1, 2 * expand + 1))
+        for j in range(LATENT_F):
+            dilated = cv2.dilate(latent[j].numpy(), kernel)
+            latent[j] = torch.from_numpy((dilated > 0.5).astype(np.float32))
     return latent
 
 
@@ -242,7 +251,8 @@ def process_clip(pair: dict, seg_frames: list[np.ndarray],
                  seg_df: pd.DataFrame, seg_frame_min: int,
                  fk_model, fk_data, mesh_cache, cam_const,
                  hand_type: str, degrade_mode: str,
-                 blur_ksize: int, noise_std: float) -> dict | None:
+                 blur_ksize: int, noise_std: float,
+                 patch_expand: int = 0) -> dict | None:
     """Process one 1s clip from pre-loaded segment data.
 
     Returns dict with keys: clean_frames, degraded_frames, latent_mask.
@@ -299,7 +309,7 @@ def process_clip(pair: dict, seg_frames: list[np.ndarray],
         clean_frames.append(frame)
         degraded_frames.append(degraded)
 
-    latent_mask = build_latent_mask(hard_masks)
+    latent_mask = build_latent_mask(hard_masks, expand=patch_expand)
 
     return {
         "clean_frames": clean_frames,
@@ -344,10 +354,12 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--workers", type=int, default=4,
                     help="thread pool workers for video I/O")
+    ap.add_argument("--patch-expand", type=int, default=1,
+                    help="latent-space dilation radius for patch mask (0 = no expansion)")
     ap.add_argument("--resume", action="store_true",
                     help="skip pairs whose outputs already exist")
     ap.add_argument("--clean", action="store_true",
-                    help="remove existing robot_patch/1s/ before writing")
+                    help="remove existing pair/1s_patch/ before writing")
     args = ap.parse_args()
 
     key = args.task.lower()
@@ -359,7 +371,7 @@ def main():
     else:
         tasks = [t.strip() for t in args.task.split(",")]
 
-    sec_dir = os.path.join(_ROBOT_PATCH_DIR, "1s")
+    sec_dir = os.path.join(_PAIR_DIR, "1s_patch")
     if args.clean and os.path.isdir(sec_dir):
         shutil.rmtree(sec_dir)
 
@@ -370,6 +382,7 @@ def main():
         print(f"  blur-ksize:    {args.blur_ksize}")
     elif args.degrade == "noise":
         print(f"  noise-std:     {args.noise_std}")
+    print(f"  patch-expand:  {args.patch_expand}")
     print(f"  max-segments:  {args.max_segments or 'unlimited'}")
     print(f"  per-task-eval: {args.per_task_eval}")
     print(f"  seed:          {args.seed}")
@@ -493,6 +506,7 @@ def main():
                 pair, seg_frames, seg_df, seg_frame_min,
                 fk_model, fk_data, mesh_cache, cam_const,
                 hand_type, args.degrade, args.blur_ksize, args.noise_std,
+                patch_expand=args.patch_expand,
             )
 
             if result is None:
