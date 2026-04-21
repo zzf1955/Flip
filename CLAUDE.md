@@ -260,6 +260,7 @@ data/
 | `doc/step_4_seedance_api.md` | Step 4 商业方案：Seedance 2.0 API 用法 + 输入输出限制 |
 | `doc/step_4_wan_vace_regen.md` | Step 4 本地方案：ComfyUI + Wan 2.1 VACE depth+mask 重绘（含 Cosmos 对照） |
 | `doc/step_5_finetune_baseline.md` | Wan 2.1 FunControl LoRA 训练 baseline |
+| `doc/step_5_two_stage_training.md` | 两阶段训练策略：恒等重建 → 外观替换 |
 | `doc/requirement-log.md` | 需求跟踪日志（task 001-003） |
 
 归档文档在 `doc/archive/`。任务跟踪在 `doc/tasks/`。
@@ -351,6 +352,39 @@ python -m src.pipeline.train_lora \
 ```
 
 输出：`training_data/log/<auto-timestamp>/ckpt/`、`eval/`、`train.log`
+
+### Wan 2.2 TI2V-5B 两阶段训练策略
+
+训练分两阶段进行（详见 `doc/step_5_two_stage_training.md`）：
+
+**Phase 1: 恒等重建**（robot→robot，学习重建能力）
+```bash
+# 数据：training_data/pair/1s_identity/ (control_video = video，同一个 robot 视频)
+# Cache：output/mitty_cache_1s_identity/
+
+python -m src.pipeline.mitty_cache \
+  --pair-dir training_data/pair/1s_identity/train \
+  --output output/mitty_cache_1s_identity/train --device cuda:2
+
+python -m src.pipeline.train_mitty \
+  --cache-train output/mitty_cache_1s_identity/train \
+  --cache-eval  output/mitty_cache_1s_identity/eval \
+  --cache-ood   output/mitty_cache_1s_identity/ood_eval \
+  --max-steps 400 --save-steps 50 --eval-steps 50
+```
+
+**Phase 2: 外观替换**（human→robot，用 Phase 1 ckpt 初始化）
+```bash
+# 数据：training_data/pair/1s/ (human≠robot，真实 pair)
+# Cache：output/mitty_cache_1s/
+
+python -m src.pipeline.train_mitty \
+  --init-lora training_data/log/<phase1-run>/ckpt/step-NNNN.safetensors \
+  --cache-train output/mitty_cache_1s/train \
+  --cache-eval  output/mitty_cache_1s/eval \
+  --cache-ood   output/mitty_cache_1s/ood_eval \
+  --max-steps 400 --save-steps 50 --eval-steps 50
+```
 
 ### Wan 2.2 TI2V-5B 统一训练入口（推荐）
 
