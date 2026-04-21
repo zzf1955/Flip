@@ -9,6 +9,12 @@
 - [020] DiT 加载重构：bf16 预存 + DDP broadcast
 
 **用户原始需求：**
+> 把手部 patch 换成机器人全身的 patch。patch 阶段产出机器人视频、机器人 patch 视频、patch.pth。用于外观学习。patch 视频支持三种方式：patch 区域模糊、patch 区域加噪声、patch 区域均值填充。
+
+**创建的任务：**
+- [022] 全身机器人 Patch 数据生成 Pipeline
+
+**用户原始需求：**
 > 看一下当前的 cache 管理。应该分为：数据的 VAE 缓存、T5 缓存，然后每个训练和 eval 的样本分开。需要统一 cache 管理，放到 training data 文件下，并规范这部分数据的命名。
 
 **创建的任务：**
