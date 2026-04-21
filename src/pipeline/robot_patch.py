@@ -28,7 +28,7 @@ import re
 import shutil
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 
 import av
 import cv2
@@ -43,14 +43,14 @@ from src.core.config import (
     ALL_TASKS, BEST_PARAMS, G1_URDF, MAIN_ROOT, MESH_DIR,
     get_hand_type, get_skip_meshes,
 )
-
-_MAIN_TRAINING_DATA = os.path.join(MAIN_ROOT, "training_data")
-_SEGMENT_DIR = os.path.join(_MAIN_TRAINING_DATA, "segment")
-_ROBOT_PATCH_DIR = os.path.join(_MAIN_TRAINING_DATA, "robot_patch")
 from src.core.camera import make_camera_const
 from src.core.data import close_video, open_video_writer, write_frame
 from src.core.fk import build_q, do_fk, parse_urdf_meshes, preload_meshes
 from src.core.render import render_mask
+
+_MAIN_TRAINING_DATA = os.path.join(MAIN_ROOT, "training_data")
+_SEGMENT_DIR = os.path.join(_MAIN_TRAINING_DATA, "segment")
+_ROBOT_PATCH_DIR = os.path.join(_MAIN_TRAINING_DATA, "robot_patch")
 
 SEGMENT_FPS = 30
 TARGET_FPS = 16
@@ -442,6 +442,7 @@ def main():
     n_done = 0
     n_skip = 0
     n_fail = 0
+    last_report = 0
 
     # Group pairs by (task, episode, seg) for segment-level batching
     seg_groups: dict[str, list[dict]] = {}
@@ -502,11 +503,12 @@ def main():
             pending_futures.append(fut)
             n_done += 1
 
-        if n_done % 50 < CLIPS_PER_SEG and n_done >= 50:
+        if n_done - last_report >= 100:
             elapsed = time.time() - t_start
             rate = n_done / elapsed if elapsed > 0 else 0
             print(f"  [{n_done} done, {n_skip} skipped, {n_fail} failed] "
                   f"({rate:.1f} pairs/s)")
+            last_report = n_done
 
     # Wait for all writes to complete
     for fut in pending_futures:
