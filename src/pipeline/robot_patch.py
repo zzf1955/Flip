@@ -41,9 +41,12 @@ sys.stdout.reconfigure(line_buffering=True)
 
 from src.core.config import (
     ALL_TASKS, BEST_PARAMS, G1_URDF, MAIN_ROOT, MESH_DIR,
-    ROBOT_PATCH_DIR, SEGMENT_DIR,
     get_hand_type, get_skip_meshes,
 )
+
+_MAIN_TRAINING_DATA = os.path.join(MAIN_ROOT, "training_data")
+_SEGMENT_DIR = os.path.join(_MAIN_TRAINING_DATA, "segment")
+_ROBOT_PATCH_DIR = os.path.join(_MAIN_TRAINING_DATA, "robot_patch")
 from src.core.camera import make_camera_const
 from src.core.data import close_video, open_video_writer, write_frame
 from src.core.fk import build_q, do_fk, parse_urdf_meshes, preload_meshes
@@ -72,7 +75,7 @@ RESAMPLE_INDICES = [min(round(i * SEGMENT_FPS / TARGET_FPS), 29)
 def find_segments(tasks: list[str]) -> list[dict]:
     segments = []
     for task in tasks:
-        task_dir = os.path.join(SEGMENT_DIR, task)
+        task_dir = os.path.join(_SEGMENT_DIR, task)
         if not os.path.isdir(task_dir):
             continue
         for root, _, files in os.walk(task_dir):
@@ -215,18 +218,11 @@ def degrade_mean(frame: np.ndarray, soft_mask: np.ndarray,
 
 # ── Video I/O ────────────────────────────────────────────────────────
 
-def read_clip_frames(video_path: str, start_frame: int,
-                     n_frames: int = 30) -> list[np.ndarray]:
-    """Read n_frames starting at start_frame from a video file."""
+def read_all_frames(video_path: str) -> list[np.ndarray]:
+    """Read all frames from a video file."""
     container = av.open(video_path)
     stream = container.streams.video[0]
-    frames = []
-    for i, av_frame in enumerate(container.decode(stream)):
-        if i < start_frame:
-            continue
-        if i >= start_frame + n_frames:
-            break
-        frames.append(av_frame.to_ndarray(format="bgr24"))
+    frames = [f.to_ndarray(format="bgr24") for f in container.decode(stream)]
     container.close()
     return frames
 
@@ -240,31 +236,28 @@ def write_video_from_frames(frames: list[np.ndarray], path: str,
     close_video(container, stream)
 
 
-# ── Per-pair processing ──────────────────────────────────────────────
+# ── Per-clip processing ──────────────────────────────────────────────
 
-def process_pair(pair: dict, fk_model, fk_data, mesh_cache, cam_const,
+def process_clip(pair: dict, seg_frames: list[np.ndarray],
+                 seg_df: pd.DataFrame, seg_frame_min: int,
+                 fk_model, fk_data, mesh_cache, cam_const,
                  hand_type: str, degrade_mode: str,
                  blur_ksize: int, noise_std: float) -> dict | None:
-    """Compute masks, apply degradation, return frames + latent mask.
+    """Process one 1s clip from pre-loaded segment data.
 
     Returns dict with keys: clean_frames, degraded_frames, latent_mask.
-    Returns None if the clip has no data.
+    Returns None if the clip has insufficient data.
     """
-    if not os.path.isfile(pair["parquet_path"]):
+    clip_start = pair["clip_start_30fps"]
+    clip_end = clip_start + 30
+    clip_frames_30 = seg_frames[clip_start:clip_end]
+    if len(clip_frames_30) < 17:
         return None
 
-    all_frames_30 = read_clip_frames(
-        pair["video_path"], pair["clip_start_30fps"], n_frames=30)
-    if len(all_frames_30) < 17:
-        return None
-
-    df = pd.read_parquet(pair["parquet_path"])
-    seg_frame_min = int(df["frame_index"].min())
-    clip_abs_start = seg_frame_min + pair["clip_start_30fps"]
-
-    clip_df = df[
-        (df["frame_index"] >= clip_abs_start) &
-        (df["frame_index"] < clip_abs_start + 30)
+    clip_abs_start = seg_frame_min + clip_start
+    clip_df = seg_df[
+        (seg_df["frame_index"] >= clip_abs_start) &
+        (seg_df["frame_index"] < clip_abs_start + 30)
     ]
     if len(clip_df) < 17:
         return None
@@ -274,10 +267,10 @@ def process_pair(pair: dict, fk_model, fk_data, mesh_cache, cam_const,
     hard_masks = []
     rng = np.random.default_rng(seed=hash(pair["source_id"]) & 0xFFFFFFFF)
 
-    for out_idx, src_idx in enumerate(RESAMPLE_INDICES):
-        if src_idx >= len(all_frames_30):
-            src_idx = len(all_frames_30) - 1
-        frame = all_frames_30[src_idx]
+    for _, src_idx in enumerate(RESAMPLE_INDICES):
+        if src_idx >= len(clip_frames_30):
+            src_idx = len(clip_frames_30) - 1
+        frame = clip_frames_30[src_idx]
 
         abs_frame = clip_abs_start + src_idx
         row = clip_df[clip_df["frame_index"] == abs_frame]
@@ -366,7 +359,7 @@ def main():
     else:
         tasks = [t.strip() for t in args.task.split(",")]
 
-    sec_dir = os.path.join(ROBOT_PATCH_DIR, "1s")
+    sec_dir = os.path.join(_ROBOT_PATCH_DIR, "1s")
     if args.clean and os.path.isdir(sec_dir):
         shutil.rmtree(sec_dir)
 
@@ -450,16 +443,18 @@ def main():
     n_skip = 0
     n_fail = 0
 
-    # Organize pairs by task for hand_type batching
-    pairs_by_task: dict[str, list[dict]] = {}
+    # Group pairs by (task, episode, seg) for segment-level batching
+    seg_groups: dict[str, list[dict]] = {}
     for p in all_to_process:
-        pairs_by_task.setdefault(p["task"], []).append(p)
+        seg_key = f"{p['task']}/{p['episode']}/{p['seg']}"
+        seg_groups.setdefault(seg_key, []).append(p)
 
     write_pool = ThreadPoolExecutor(max_workers=args.workers)
     pending_futures: list = []
 
-    for task in sorted(pairs_by_task.keys()):
-        task_pairs = pairs_by_task[task]
+    for seg_key in sorted(seg_groups.keys()):
+        seg_pairs = seg_groups[seg_key]
+        task = seg_pairs[0]["task"]
         full_task_name = f"G1_WBT_{task}"
         hand_type = get_hand_type(full_task_name)
 
@@ -470,16 +465,32 @@ def main():
             print(f"  loaded in {time.time() - t0:.1f}s")
             current_hand_type = hand_type
 
-        for pi, pair in enumerate(task_pairs):
+        # Check if all clips in this segment can be skipped
+        active_pairs = []
+        for p in seg_pairs:
             if args.resume and all(
-                os.path.isfile(pair[k])
+                os.path.isfile(p[k])
                 for k in ("out_video", "out_ctrl", "out_patch")
             ):
                 n_skip += 1
-                continue
+            else:
+                active_pairs.append(p)
+        if not active_pairs:
+            continue
 
-            result = process_pair(
-                pair, fk_model, fk_data, mesh_cache, cam_const,
+        # Read video + parquet once for the entire segment
+        ref = active_pairs[0]
+        seg_frames = read_all_frames(ref["video_path"])
+        if not os.path.isfile(ref["parquet_path"]):
+            n_fail += len(active_pairs)
+            continue
+        seg_df = pd.read_parquet(ref["parquet_path"])
+        seg_frame_min = int(seg_df["frame_index"].min())
+
+        for pair in active_pairs:
+            result = process_clip(
+                pair, seg_frames, seg_df, seg_frame_min,
+                fk_model, fk_data, mesh_cache, cam_const,
                 hand_type, args.degrade, args.blur_ksize, args.noise_std,
             )
 
@@ -491,12 +502,11 @@ def main():
             pending_futures.append(fut)
             n_done += 1
 
-            if n_done % 50 == 0:
-                elapsed = time.time() - t_start
-                rate = n_done / elapsed if elapsed > 0 else 0
-                print(f"  [{n_done} done, {n_skip} skipped, {n_fail} failed] "
-                      f"{task} {pi+1}/{len(task_pairs)} "
-                      f"({rate:.1f} pairs/s)")
+        if n_done % 50 < CLIPS_PER_SEG and n_done >= 50:
+            elapsed = time.time() - t_start
+            rate = n_done / elapsed if elapsed > 0 else 0
+            print(f"  [{n_done} done, {n_skip} skipped, {n_fail} failed] "
+                  f"({rate:.1f} pairs/s)")
 
     # Wait for all writes to complete
     for fut in pending_futures:
