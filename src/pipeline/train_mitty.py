@@ -82,7 +82,8 @@ DEFAULT_TOKENIZER = os.path.join(MANUAL_DIR, "google", "umt5-xxl")
 # ── Model ──────────────────────────────────────────────────────────────
 
 def build_pipe(device: str, dit_dir: str, vae_path: str,
-               tokenizer_dir: str, load_vae: bool = True) -> SimplePipe:
+               tokenizer_dir: str, load_vae: bool = True,
+               skip_dit_load: bool = False) -> SimplePipe:
     """Direct TI2V-5B DiT (+VAE) loader (see src/core/wan_loader.py):
     - DiT resident on `device` (bf16, ~10 GB)
     - VAE on `device` (bf16, ~0.67 GB) — no CPU parking
@@ -91,7 +92,7 @@ def build_pipe(device: str, dit_dir: str, vae_path: str,
     del tokenizer_dir  # unused (kept for signature compat)
     shards = build_dit_shard_list(dit_dir)
     pipe = SimplePipe(device)
-    pipe.dit = load_dit(shards, device, torch.bfloat16)
+    pipe.dit = load_dit(shards, device, torch.bfloat16, skip_load=skip_dit_load)
     if load_vae:
         pipe.vae = _load_vae(vae_path, torch.bfloat16, home_device=device)
     return pipe
@@ -111,10 +112,11 @@ class MittyTrainingModule(DiffusionTrainingModule):
         use_gradient_checkpointing: bool = True,
         load_vae: bool = True,
         init_lora_path: str = "",
+        skip_dit_load: bool = False,
     ):
         super().__init__()
         self.pipe = build_pipe(device, dit_dir, vae_path, tokenizer_dir,
-                               load_vae=load_vae)
+                               load_vae=load_vae, skip_dit_load=skip_dit_load)
         self.pipe.scheduler.set_timesteps(1000, training=True)
 
         # Freeze everything
