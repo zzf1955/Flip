@@ -89,10 +89,11 @@ class RFTrainingModule(DiffusionTrainingModule):
         use_gradient_checkpointing: bool = True,
         load_vae: bool = True,
         init_lora_path: str = "",
+        skip_dit_load: bool = False,
     ):
         super().__init__()
         self.pipe = build_pipe(device, dit_dir, vae_path, tokenizer_dir,
-                               load_vae=load_vae)
+                               load_vae=load_vae, skip_dit_load=skip_dit_load)
         self.pipe.scheduler.set_timesteps(1000, training=True)
 
         for name, module in self.pipe.named_children():
