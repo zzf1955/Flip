@@ -28,7 +28,8 @@ import re
 import shutil
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
+from multiprocessing import get_context
 
 import av
 import cv2
@@ -334,6 +335,50 @@ def write_pair_outputs(pair: dict, result: dict):
     }, pair["out_patch"])
 
 
+# ── Per-process worker ───────────────────────────────────────────────
+
+_fk_cache: dict[str, tuple] = {}
+
+
+def _get_fk(hand_type: str):
+    """Load FK model once per (process, hand_type), cached."""
+    if hand_type not in _fk_cache:
+        _fk_cache[hand_type] = load_fk_model(hand_type)
+    return _fk_cache[hand_type]
+
+
+def _process_segment(seg_key: str, pairs: list[dict],
+                     worker_args: tuple) -> tuple[int, int]:
+    """Process all clips in one segment. Runs in a worker process."""
+    degrade_mode, blur_ksize, noise_std, patch_expand = worker_args
+    task = pairs[0]["task"]
+    hand_type = get_hand_type(f"G1_WBT_{task}")
+    fk_model, fk_data, mesh_cache, cam_const = _get_fk(hand_type)
+
+    ref = pairs[0]
+    seg_frames = read_all_frames(ref["video_path"])
+    if not os.path.isfile(ref["parquet_path"]):
+        return 0, len(pairs)
+    seg_df = pd.read_parquet(ref["parquet_path"])
+    seg_frame_min = int(seg_df["frame_index"].min())
+
+    done = 0
+    fail = 0
+    for pair in pairs:
+        result = process_clip(
+            pair, seg_frames, seg_df, seg_frame_min,
+            fk_model, fk_data, mesh_cache, cam_const,
+            hand_type, degrade_mode, blur_ksize, noise_std,
+            patch_expand=patch_expand,
+        )
+        if result is None:
+            fail += 1
+            continue
+        write_pair_outputs(pair, result)
+        done += 1
+    return done, fail
+
+
 # ── Main ─────────────────────────────────────────────────────────────
 
 def main():
@@ -352,8 +397,8 @@ def main():
     ap.add_argument("--per-task-eval", type=int, default=5,
                     help="segments per task reserved for eval")
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--workers", type=int, default=4,
-                    help="thread pool workers for video I/O")
+    ap.add_argument("--workers", type=int, default=64,
+                    help="parallel worker processes for segment processing")
     ap.add_argument("--patch-expand", type=int, default=1,
                     help="latent-space dilation radius for patch mask (0 = no expansion)")
     ap.add_argument("--resume", action="store_true",
@@ -447,15 +492,7 @@ def main():
             }
             all_to_process.append(p)
 
-    # Load FK model (reloaded when hand_type changes)
-    current_hand_type = None
-    fk_model = fk_data = mesh_cache = cam_const = None
-
     t_start = time.time()
-    n_done = 0
-    n_skip = 0
-    n_fail = 0
-    last_report = 0
 
     # Group pairs by (task, episode, seg) for segment-level batching
     seg_groups: dict[str, list[dict]] = {}
@@ -463,24 +500,12 @@ def main():
         seg_key = f"{p['task']}/{p['episode']}/{p['seg']}"
         seg_groups.setdefault(seg_key, []).append(p)
 
-    write_pool = ThreadPoolExecutor(max_workers=args.workers)
-    pending_futures: list = []
-
+    # Filter out skippable segments, count skips
+    n_skip = 0
+    work_items: list[tuple[str, list[dict]]] = []
     for seg_key in sorted(seg_groups.keys()):
         seg_pairs = seg_groups[seg_key]
-        task = seg_pairs[0]["task"]
-        full_task_name = f"G1_WBT_{task}"
-        hand_type = get_hand_type(full_task_name)
-
-        if hand_type != current_hand_type:
-            print(f"\nLoading FK model for hand_type={hand_type}...")
-            t0 = time.time()
-            fk_model, fk_data, mesh_cache, cam_const = load_fk_model(hand_type)
-            print(f"  loaded in {time.time() - t0:.1f}s")
-            current_hand_type = hand_type
-
-        # Check if all clips in this segment can be skipped
-        active_pairs = []
+        active = []
         for p in seg_pairs:
             if args.resume and all(
                 os.path.isfile(p[k])
@@ -488,46 +513,32 @@ def main():
             ):
                 n_skip += 1
             else:
-                active_pairs.append(p)
-        if not active_pairs:
-            continue
+                active.append(p)
+        if active:
+            work_items.append((seg_key, active))
 
-        # Read video + parquet once for the entire segment
-        ref = active_pairs[0]
-        seg_frames = read_all_frames(ref["video_path"])
-        if not os.path.isfile(ref["parquet_path"]):
-            n_fail += len(active_pairs)
-            continue
-        seg_df = pd.read_parquet(ref["parquet_path"])
-        seg_frame_min = int(seg_df["frame_index"].min())
+    print(f"  {len(work_items)} segments to process, {n_skip} pairs skipped (resume)")
 
-        for pair in active_pairs:
-            result = process_clip(
-                pair, seg_frames, seg_df, seg_frame_min,
-                fk_model, fk_data, mesh_cache, cam_const,
-                hand_type, args.degrade, args.blur_ksize, args.noise_std,
-                patch_expand=args.patch_expand,
-            )
+    # Process segments in parallel with ProcessPoolExecutor
+    worker_args = (args.degrade, args.blur_ksize, args.noise_std, args.patch_expand)
+    n_done = 0
+    n_fail = 0
 
-            if result is None:
-                n_fail += 1
-                continue
-
-            fut = write_pool.submit(write_pair_outputs, pair, result)
-            pending_futures.append(fut)
-            n_done += 1
-
-        if n_done - last_report >= 100:
-            elapsed = time.time() - t_start
-            rate = n_done / elapsed if elapsed > 0 else 0
-            print(f"  [{n_done} done, {n_skip} skipped, {n_fail} failed] "
-                  f"({rate:.1f} pairs/s)")
-            last_report = n_done
-
-    # Wait for all writes to complete
-    for fut in pending_futures:
-        fut.result()
-    write_pool.shutdown(wait=True)
+    ctx = get_context("fork")
+    with ProcessPoolExecutor(max_workers=args.workers, mp_context=ctx) as pool:
+        futures = {
+            pool.submit(_process_segment, seg_key, pairs, worker_args): (seg_key, pairs)
+            for seg_key, pairs in work_items
+        }
+        for fut in futures:
+            done, fail = fut.result()
+            n_done += done
+            n_fail += fail
+            if (n_done + n_fail) % 200 == 0 or n_done + n_fail == len(futures):
+                elapsed = time.time() - t_start
+                rate = n_done / elapsed if elapsed > 0 else 0
+                print(f"  [{n_done} done, {n_skip} skipped, {n_fail} failed] "
+                      f"({rate:.1f} pairs/s)", flush=True)
 
     # Write metadata.csv per split
     split_meta: dict[str, list[dict]] = {"train": [], "eval": []}
