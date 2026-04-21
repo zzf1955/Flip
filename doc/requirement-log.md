@@ -224,3 +224,26 @@
 
 **创建的任务：**
 - [017] GPU 直接加载 — 消除所有 CPU 中转
+
+## 2026-04-21
+
+**用户原始需求：**
+> 文档有点乱，整理一下。CLAUDE.md 写重要内容和子文档引导，注明走 /develop skill 并及时更新文档。doc 按 step_x 分阶段，按模块分类（数据/视频inpaint/Human渲染/Seedance API/微调算法）。训练 infra 单独拿出来。
+
+**创建的任务：**
+- [018] 文档整理：CLAUDE.md 精简 + 训练 infra 独立 + 模块化索引
+
+---
+
+**用户原始需求：**
+> 看一下当前数据加载的模块，不希望使用 epoch 作为统计口径，难以精准控制。能不能纯用 step 来控制？适配当前 Mitty 的两种训练（恒等和外观替换）。
+
+讨论要点：
+- `train.py` 用 `--epochs` + `--repeat` 间接算 total_steps，epoch 边界丢尾部 batch，步数不精确
+- legacy `train_mitty.py` / `train_rf.py` 已经是纯 step-based，接口不一致
+- 方案：`train.py` 改用 `--max-steps` + `infinite_file_batches()`，删除 `--epochs` / `--repeat`
+- `--repeat` 完全砍掉（用户确认），数据量纯靠 `--max-steps` 控制
+- 恒等和外观替换两种训练不受影响（区别仅在数据目录和 `--init-lora`）
+
+**创建的任务：**
+- [019] train.py: epoch-based → 纯 step-based 训练控制
