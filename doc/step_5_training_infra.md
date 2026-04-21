@@ -8,11 +8,19 @@
 ### 模型加载
 
 `wan_loader.py` 所有加载函数直接读到目标 GPU，不经过 CPU 中转：
-- `load_dit()`: safetensors `safe_open(device="cuda:X")` (~10GB)
+- `load_dit()`: safetensors 直接到 GPU (~10GB bf16)
 - `load_vae()`: `torch.load(map_location=device)` / safetensors (~0.67GB)
 - `load_text_encoder()`: `torch.load(map_location=device)` (~5.5GB，仅 mitty_cache 用)
 - 训练样本 cache: `load_sample(path, device=device)` 直接到 GPU
-- DDP 各 rank 并行加载互不干扰，无需错峰
+
+**DiT bf16 预转换**：上游 safetensors 是 FP32 (20GB)，一次性转 bf16 (10GB):
+```bash
+python -m src.tools.convert_dit_bf16
+```
+`build_dit_shard_list()` 自动优先使用 bf16 单文件。
+
+**DDP broadcast 加载**：rank 0 独占读盘，其他 rank 通过 `dist.broadcast` 接收权重。
+`load_dit(skip_load=True)` 分配空壳，`train.py` 中 broadcast `model.pipe.dit` 全部参数。
 
 ## LoRA 微调流程
 
