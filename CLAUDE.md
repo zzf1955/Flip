@@ -398,18 +398,20 @@ torchrun --nproc_per_node=4 -m src.pipeline.train \
   --cache-train output/mitty_cache_1s/train \
   --cache-eval  output/mitty_cache_1s/eval \
   --cache-ood   output/mitty_cache_1s/ood_eval \
-  --epochs 3 --repeat 5 --save-steps 50 --eval-steps 50
+  --max-steps 400 --save-steps 50 --eval-steps 50
 
 # Mitty + hand_patch 加权
 torchrun --nproc_per_node=4 -m src.pipeline.train \
   --backbone mitty --loss hand_patch \
   --patch-dir training_data/pair/1s/train/hand_patch \
-  --cache-train output/mitty_cache_1s/train ...
+  --cache-train output/mitty_cache_1s/train \
+  --max-steps 400
 
 # RectFlow（Route A：source 代替 Gaussian noise）
 torchrun --nproc_per_node=4 -m src.pipeline.train \
   --backbone rectflow --loss uniform \
-  --cache-train output/mitty_cache_1s/train ...
+  --cache-train output/mitty_cache_1s/train \
+  --max-steps 400
 ```
 
 W&B tags 自动 `[backbone, loss, ...wandb-tags]`，消融表按 tag 分面。
