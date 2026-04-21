@@ -282,6 +282,7 @@ data/
 | `doc/step_5_two_stage_training.md` | 两阶段训练策略：恒等重建 → 外观替换 |
 | `doc/step_5_training_infra.md` | DDP / GPU 直接加载 / 数据 cache / W&B / 训练命令 |
 | `doc/step_5_wandb_setup.md` | W&B 代理问题诊断 |
+| `doc/step_5_robot_patch.md` | 全身机器人降质数据生成（外观记忆学习） |
 
 ### 项目管理
 
