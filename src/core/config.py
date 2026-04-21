@@ -141,7 +141,6 @@ SEEDANCE_ADVANCE_DIR = os.path.join(TRAINING_DATA_ROOT, "seedance_advance")
 HAND_PATCH_4S_DIR = os.path.join(TRAINING_DATA_ROOT, "hand_patch", "4s")
 PAIR_DIR = os.path.join(TRAINING_DATA_ROOT, "pair")
 ROBOT_PAIR_DIR = os.path.join(TRAINING_DATA_ROOT, "robot_pair")
-ROBOT_PATCH_DIR = os.path.join(TRAINING_DATA_ROOT, "robot_patch")
 
 # ── Pipeline intermediate outputs ──
 SEGMENT_PIPELINE_DIR = os.path.join(OUTPUT_DIR, "segment_pipeline")
