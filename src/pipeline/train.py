@@ -52,7 +52,7 @@ import torch.distributed as dist
 
 from diffsynth.diffusion.flow_match import FlowMatchScheduler
 
-from src.core.config import MAIN_ROOT, TRAINING_DATA_ROOT
+from src.core.config import MAIN_ROOT, T5_CACHE_DIR, TRAINING_DATA_ROOT
 from src.core.train_utils import (
     CsvLogger,
     WandbLogger,
@@ -60,6 +60,7 @@ from src.core.train_utils import (
     infinite_file_batches,
     load_cached_files,
     load_sample,
+    load_t5_cache,
     log_step_eval_videos,
     reduce_scalar,
     save_lora_ckpt,
@@ -88,7 +89,8 @@ from src.pipeline.train_mitty import (
 @torch.no_grad()
 def eval_loss(model, files: list[str], device: str,
               num_t_samples: int = 5, seed_base: int = 12345,
-              patch_dir: str = "") -> float:
+              patch_dir: str = "",
+              t5_pos: dict = None, t5_neg: torch.Tensor = None) -> float:
     """Eval MSE loss averaged over every file × ``num_t_samples`` timesteps.
 
     The loss function inside the training module samples one random timestep
@@ -104,7 +106,8 @@ def eval_loss(model, files: list[str], device: str,
     try:
         losses = []
         for i, f in enumerate(files):
-            s = load_sample(f, device=device)
+            s = load_sample(f, device=device,
+                            t5_pos=t5_pos, t5_neg=t5_neg)
             if patch_dir:
                 _load_patch_weights(s, f, patch_dir, device=device)
             s = prepare_sample(s, device)
@@ -134,6 +137,8 @@ def generate_eval_videos(
     num_inference_steps: int = 30,
     cfg_scale: float = 5.0,
     log=None,
+    t5_pos: dict = None,
+    t5_neg: torch.Tensor = None,
 ):
     """Shared eval-video shell: backbone supplies the inner denoise loop."""
     pipe = model.pipe
@@ -156,7 +161,8 @@ def generate_eval_videos(
     n = min(num_samples, len(files))
     for idx in range(n):
         t0 = time.time()
-        s = load_sample(files[idx], device=device)
+        s = load_sample(files[idx], device=device,
+                        t5_pos=t5_pos, t5_neg=t5_neg)
 
         if s.get("robot_frames"):
             save_video(s["robot_frames"], str(step_dir / f"gt_{idx:02d}.mp4"))
@@ -250,6 +256,14 @@ def train(args, spec: BackboneSpec):
         eval_files = eval_files[:args.max_eval_files]
     ood_files = load_cached_files(args.cache_ood) if args.cache_ood else []
     info(f"Data: train={len(train_files)} eval={len(eval_files)} ood={len(ood_files)}")
+
+    # ── T5 cache (shared embeddings for new-format VAE-only caches) ──
+    t5_pos, t5_neg = {}, None
+    if args.t5_cache_dir and os.path.isdir(args.t5_cache_dir):
+        t5_pos, t5_neg = load_t5_cache(args.t5_cache_dir, device="cpu")
+        info(f"T5 cache: {len(t5_pos)} prompts + negative from {args.t5_cache_dir}")
+    elif args.t5_cache_dir:
+        info(f"T5 cache dir not found: {args.t5_cache_dir} (old-format cache assumed)")
 
     # ── Patch weights (derived paths for eval/ood mirror the train layout) ──
     patch_dir_eval = ""
@@ -345,7 +359,8 @@ def train(args, spec: BackboneSpec):
     def _prefetch(files):
         out = []
         for f in files:
-            s = load_sample(f, device=args.device)
+            s = load_sample(f, device=args.device,
+                            t5_pos=t5_pos, t5_neg=t5_neg)
             if args.patch_dir:
                 _load_patch_weights(s, f, args.patch_dir, device=args.device)
             out.append(s)
@@ -411,7 +426,8 @@ def train(args, spec: BackboneSpec):
             if eval_files:
                 el = eval_loss(model, eval_files, args.device,
                                num_t_samples=args.eval_t_samples,
-                               patch_dir=patch_dir_eval)
+                               patch_dir=patch_dir_eval,
+                               t5_pos=t5_pos, t5_neg=t5_neg)
                 info(f"  EVAL eval_loss_in_task={el:.4f} "
                      f"({len(eval_files)} samples × {args.eval_t_samples} t)")
                 row_fields["eval_loss_in_task"] = f"{el:.4f}"
@@ -419,7 +435,8 @@ def train(args, spec: BackboneSpec):
             if ood_files:
                 ol = eval_loss(model, ood_files, args.device,
                                num_t_samples=args.eval_t_samples,
-                               patch_dir=patch_dir_ood)
+                               patch_dir=patch_dir_ood,
+                               t5_pos=t5_pos, t5_neg=t5_neg)
                 info(f"  EVAL eval_loss_ood={ol:.4f} "
                      f"({len(ood_files)} samples × {args.eval_t_samples} t)")
                 row_fields["eval_loss_ood"] = f"{ol:.4f}"
@@ -442,6 +459,7 @@ def train(args, spec: BackboneSpec):
                     num_samples=n_in,
                     num_inference_steps=args.num_inference_steps,
                     log=log,
+                    t5_pos=t5_pos, t5_neg=t5_neg,
                 )
                 if args.wandb_log_videos:
                     log_step_eval_videos(
@@ -456,6 +474,7 @@ def train(args, spec: BackboneSpec):
                     num_samples=n_ood,
                     num_inference_steps=args.num_inference_steps,
                     log=log,
+                    t5_pos=t5_pos, t5_neg=t5_neg,
                 )
                 if args.wandb_log_videos:
                     log_step_eval_videos(
@@ -503,6 +522,9 @@ def main():
     ap.add_argument("--cache-train", required=True)
     ap.add_argument("--cache-eval", default="")
     ap.add_argument("--cache-ood", default="")
+    ap.add_argument("--t5-cache-dir", default=T5_CACHE_DIR,
+                    help="shared T5 embedding cache dir "
+                         "(default: training_data/cache/t5/)")
     ap.add_argument("--patch-dir", default="",
                     help="hand_patch weight dir for train split "
                          "(eval/ood auto-derived)")
@@ -572,8 +594,8 @@ def main():
         ap.error("--patch-dir is only valid with --loss hand_patch")
 
     # Resolve relative paths against MAIN_ROOT (worktree-safe; see CLAUDE.md)
-    for attr in ("cache_train", "cache_eval", "cache_ood", "patch_dir",
-                 "output_dir", "init_lora"):
+    for attr in ("cache_train", "cache_eval", "cache_ood", "t5_cache_dir",
+                 "patch_dir", "output_dir", "init_lora"):
         val = getattr(args, attr)
         if val and not os.path.isabs(val):
             setattr(args, attr, os.path.join(MAIN_ROOT, val))

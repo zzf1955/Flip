@@ -142,6 +142,11 @@ HAND_PATCH_4S_DIR = os.path.join(TRAINING_DATA_ROOT, "hand_patch", "4s")
 PAIR_DIR = os.path.join(TRAINING_DATA_ROOT, "pair")
 ROBOT_PAIR_DIR = os.path.join(TRAINING_DATA_ROOT, "robot_pair")
 
+# ── Cache (pre-computed embeddings, under training_data/) ──
+CACHE_ROOT = os.path.join(TRAINING_DATA_ROOT, "cache")
+T5_CACHE_DIR = os.path.join(CACHE_ROOT, "t5")
+VAE_CACHE_DIR = os.path.join(CACHE_ROOT, "vae")
+
 # ── Pipeline intermediate outputs ──
 SEGMENT_PIPELINE_DIR = os.path.join(OUTPUT_DIR, "segment_pipeline")
 
