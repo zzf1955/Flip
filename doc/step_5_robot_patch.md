@@ -110,26 +110,7 @@ python -m src.pipeline.robot_patch --task all --degrade blur --clean
 
 ## 下游训练
 
-生成的数据直接兼容现有 cache + 训练 pipeline：
-
-```bash
-# 1. 编码为 VAE cache
-python -m src.pipeline.mitty_cache \
-  --pair-dir training_data/pair/1s_patch/train \
-  --output output/cache/robot_patch/train --device cuda:0
-
-python -m src.pipeline.mitty_cache \
-  --pair-dir training_data/pair/1s_patch/eval \
-  --output output/cache/robot_patch/eval --device cuda:0
-
-# 2. 训练（robot patch 加权 loss）
-torchrun --nproc_per_node=4 -m src.pipeline.train \
-  --backbone mitty --loss hand_patch \
-  --patch-dir training_data/pair/1s_patch/train/patch \
-  --cache-train output/cache/robot_patch/train \
-  --cache-eval output/cache/robot_patch/eval \
-  --epochs 3 --repeat 5 --save-steps 50 --eval-steps 50
-```
+详见 [`step_5_ffn_lora_merge.md`](step_5_ffn_lora_merge.md)。训练流程：cache 编码 → 合并 identity LoRA → FFN LoRA 训练。
 
 ## 相关文件
 
