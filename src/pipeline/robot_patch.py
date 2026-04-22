@@ -332,10 +332,13 @@ def process_clip(pair: dict, seg_frames: list[np.ndarray],
 
     latent_mask = build_latent_mask(hard_masks, expand=patch_expand)
 
+    mask_frames = [cv2.cvtColor(m, cv2.COLOR_GRAY2BGR) for m in hard_masks]
+
     return {
         "clean_frames": clean_frames,
         "degraded_frames": degraded_frames,
         "latent_mask": latent_mask,
+        "mask_frames": mask_frames,
     }
 
 
@@ -347,6 +350,10 @@ def write_pair_outputs(pair: dict, result: dict):
 
     write_video_from_frames(result["clean_frames"], pair["out_video"])
     write_video_from_frames(result["degraded_frames"], pair["out_ctrl"])
+
+    if "out_mask" in pair:
+        os.makedirs(os.path.dirname(pair["out_mask"]), exist_ok=True)
+        write_video_from_frames(result["mask_frames"], pair["out_mask"])
 
     latent_mask = result["latent_mask"]
     torch.save({
@@ -523,6 +530,9 @@ def main():
         os.makedirs(video_dir, exist_ok=True)
         os.makedirs(ctrl_dir, exist_ok=True)
         os.makedirs(patch_dir, exist_ok=True)
+        if args.mask_source == "sam2":
+            mask_dir = os.path.join(split_dir, "mask")
+            os.makedirs(mask_dir, exist_ok=True)
 
         for idx, p in enumerate(split_pairs_list):
             name = f"pair_{idx:04d}"
@@ -530,6 +540,8 @@ def main():
             p["out_video"] = os.path.join(video_dir, f"{name}.mp4")
             p["out_ctrl"] = os.path.join(ctrl_dir, f"{name}.mp4")
             p["out_patch"] = os.path.join(patch_dir, f"{name}.pth")
+            if args.mask_source == "sam2":
+                p["out_mask"] = os.path.join(mask_dir, f"{name}.mp4")
             p["rel_video"] = f"video/{name}.mp4"
             p["rel_ctrl"] = f"control_video/{name}.mp4"
             source_map[f"{split_name}/{name}.mp4"] = {

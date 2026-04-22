@@ -21,9 +21,11 @@ import fnmatch
 import gc
 import os
 import re
+import shutil
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import av
 import cv2
@@ -173,39 +175,33 @@ def build_caches(link_meshes, hand_type):
     return mesh_cache, part_caches
 
 
-# ── Core: compute masks for one segment ─────────────────────────────
+# ── CPU prep (runs in background thread for pipelining) ────────────
 
-def compute_segment_mask(
+def prepare_segment(
     seg_info: dict,
-    predictor,
-    fk_model, fk_data, part_caches, cam_const,
+    fk_model, fk_data, part_caches,
     hand_type: str,
     prompt_interval: int,
     bbox_margin: int,
     min_visible_area: int,
-    device: str,
-) -> np.ndarray:
-    """Run SAM2 on one segment. Returns (N_frames, H, W) uint8 mask array."""
+) -> tuple[list[np.ndarray], str, list[tuple], int]:
+    """CPU-only prep: read video, write JPEGs, compute FK bbox prompts.
 
-    video_path = seg_info["video_path"]
-    parquet_path = seg_info["parquet_path"]
-
-    # Read video frames
-    container = av.open(video_path)
+    Returns (frames, jpeg_dir, all_prompts, n_frames).
+    Runs in a background thread to overlap with GPU SAM2 work.
+    """
+    container = av.open(seg_info["video_path"])
     stream = container.streams.video[0]
     frames = [f.to_ndarray(format="bgr24") for f in container.decode(stream)]
     container.close()
     n_frames = len(frames)
 
-    # Read parquet
-    df = pd.read_parquet(parquet_path)
+    df = pd.read_parquet(seg_info["parquet_path"])
 
-    # Write frames to temp JPEG dir for SAM2
     jpeg_dir = tempfile.mkdtemp(prefix="sam2_")
     for i, frame in enumerate(frames):
         cv2.imwrite(os.path.join(jpeg_dir, f"{i:05d}.jpg"), frame)
 
-    # Phase A: FK → per-part bbox prompts (only at prompt_interval frames)
     all_prompts = []
     h, w = frames[0].shape[:2]
     n_rows = min(n_frames, len(df))
@@ -227,7 +223,23 @@ def compute_segment_mask(
                 if bbox is not None:
                     all_prompts.append((seq_idx, part_name, bbox))
 
-    # Phase B: SAM2 video propagation
+    return frames, jpeg_dir, all_prompts, n_frames
+
+
+# ── GPU: SAM2 propagation on prepared data ─────────────────────────
+
+def run_sam2(
+    predictor,
+    jpeg_dir: str,
+    all_prompts: list[tuple],
+    n_frames: int,
+    h: int, w: int,
+    device: str,
+) -> np.ndarray:
+    """Run SAM2 init + propagation on pre-prepared JPEG dir and prompts.
+
+    Returns (n_frames, H, W) uint8 mask array.
+    """
     id_to_part = {v: k for k, v in PART_IDS.items()}
     frame_masks = np.zeros((n_frames, h, w), dtype=np.uint8)
     morph_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
@@ -261,14 +273,12 @@ def compute_segment_mask(
     predictor.reset_state(state)
     del state
 
-    # Cleanup temp JPEG dir
-    import shutil
     shutil.rmtree(jpeg_dir, ignore_errors=True)
 
     return frame_masks
 
 
-# ── Main processing loop ────────────────────────────────────────────
+# ── Main processing loop (double-buffered) ─────────────────────────
 
 def process_segments(segments: list[dict], predictor, device: str, args):
     fk_model, fk_data, link_meshes, cam_const = load_fk_models()
@@ -279,16 +289,17 @@ def process_segments(segments: list[dict], predictor, device: str, args):
     n_skip = 0
     n_fail = 0
 
-    for i, seg in enumerate(segments):
+    workable: list[tuple[dict, str, str, tuple]] = []
+    for seg in segments:
         task_full = f"G1_WBT_{seg['task']}"
         hand_type = get_hand_type(task_full)
         out_dir = os.path.join(args.output, seg["task"], seg["episode"])
         out_path = os.path.join(out_dir, f"{seg['seg']}.npz")
+        seg_id = f"{seg['task']}/{seg['episode']}/{seg['seg']}"
 
         if args.resume and os.path.isfile(out_path):
             n_skip += 1
             continue
-
         if not os.path.isfile(seg["parquet_path"]):
             print(f"  WARN: parquet not found: {seg['parquet_path']}")
             n_fail += 1
@@ -298,37 +309,54 @@ def process_segments(segments: list[dict], predictor, device: str, args):
             cache_by_hand[hand_type] = build_caches(link_meshes, hand_type)
         _, part_caches = cache_by_hand[hand_type]
 
-        seg_id = f"{seg['task']}/{seg['episode']}/{seg['seg']}"
-        t0 = time.time()
+        workable.append((seg, seg_id, out_path, part_caches, hand_type))
 
-        masks = compute_segment_mask(
-            seg, predictor,
-            fk_model, fk_data, part_caches, cam_const,
-            hand_type,
-            args.prompt_interval, args.bbox_margin, args.min_visible_area,
-            device,
-        )
-
-        os.makedirs(out_dir, exist_ok=True)
-        np.savez_compressed(out_path, masks=masks)
-
-        n_done += 1
-        dt = time.time() - t0
+    if not workable:
         elapsed = time.time() - t_start
-        rate = n_done / elapsed if elapsed > 0 else 0
+        print(f"\nDone. {n_done} processed, {n_skip} skipped, {n_fail} failed. "
+              f"{elapsed:.1f}s ({elapsed/3600:.1f}h)")
+        return
 
-        if n_done % 10 == 0 or n_done <= 3:
-            remaining = len(segments) - n_skip - n_done - n_fail
-            eta = remaining / rate if rate > 0 else 0
-            print(f"  [{n_done}/{len(segments)}] {seg_id} "
-                  f"{dt:.1f}s ({masks.shape[0]} frames, "
-                  f"{os.path.getsize(out_path)/1024:.0f}KB) "
-                  f"rate={rate:.2f}/s eta={eta/3600:.1f}h")
+    def _submit_prep(idx):
+        seg, _, _, pc, ht = workable[idx]
+        return prepare_segment(
+            seg, fk_model, fk_data, pc, ht,
+            args.prompt_interval, args.bbox_margin, args.min_visible_area)
 
-        if n_done % 50 == 0:
-            if device.startswith("cuda"):
-                torch.cuda.empty_cache()
-            gc.collect()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        next_future = pool.submit(_submit_prep, 0)
+
+        for idx, (seg, seg_id, out_path, part_caches, hand_type) in enumerate(workable):
+            t0 = time.time()
+            frames, jpeg_dir, all_prompts, n_frames = next_future.result()
+
+            if idx + 1 < len(workable):
+                next_future = pool.submit(_submit_prep, idx + 1)
+
+            h, w = frames[0].shape[:2]
+            masks = run_sam2(predictor, jpeg_dir, all_prompts, n_frames, h, w, device)
+
+            out_dir = os.path.dirname(out_path)
+            os.makedirs(out_dir, exist_ok=True)
+            np.savez_compressed(out_path, masks=masks)
+
+            n_done += 1
+            dt = time.time() - t0
+            elapsed = time.time() - t_start
+            rate = n_done / elapsed if elapsed > 0 else 0
+
+            if n_done % 10 == 0 or n_done <= 3:
+                remaining = len(workable) - n_done
+                eta = remaining / rate if rate > 0 else 0
+                print(f"  [{n_done}/{len(workable)}] {seg_id} "
+                      f"{dt:.1f}s ({masks.shape[0]} frames, "
+                      f"{os.path.getsize(out_path)/1024:.0f}KB) "
+                      f"rate={rate:.2f}/s eta={eta/3600:.1f}h")
+
+            if n_done % 50 == 0:
+                if device.startswith("cuda"):
+                    torch.cuda.empty_cache()
+                gc.collect()
 
     elapsed = time.time() - t_start
     print(f"\nDone. {n_done} processed, {n_skip} skipped, {n_fail} failed. "
