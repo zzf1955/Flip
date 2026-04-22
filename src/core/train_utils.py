@@ -129,8 +129,46 @@ def load_cached_files(cache_dir: str, recursive: bool = False) -> list[str]:
     return files
 
 
-def load_sample(path: str, device: str = "cpu"):
-    return torch.load(path, map_location=device, weights_only=False)
+def load_t5_cache(
+    t5_dir: str, device: str = "cpu",
+) -> tuple[dict[str, torch.Tensor], torch.Tensor | None]:
+    """Load shared T5 embeddings from cache directory.
+
+    Returns (pos_map, neg_emb):
+      pos_map: {prompt_text: embedding_tensor}
+      neg_emb: negative prompt embedding, or None
+    """
+    pos_map: dict[str, torch.Tensor] = {}
+    neg_emb = None
+    for p in sorted(glob.glob(os.path.join(t5_dir, "*.pth"))):
+        data = torch.load(p, map_location=device, weights_only=False)
+        if os.path.basename(p) == "negative.pth":
+            neg_emb = data["embedding"]
+        else:
+            pos_map[data["prompt"]] = data["embedding"]
+    return pos_map, neg_emb
+
+
+def load_sample(
+    path: str,
+    device: str = "cpu",
+    t5_pos: dict[str, torch.Tensor] | None = None,
+    t5_neg: torch.Tensor | None = None,
+):
+    """Load a cached sample (.pth).
+
+    For new-format caches (VAE-only, no context_posi/context_nega), pass
+    t5_pos/t5_neg from load_t5_cache() to inject T5 embeddings.
+    Old-format caches with embedded T5 work without extra args.
+    """
+    data = torch.load(path, map_location=device, weights_only=False)
+    if "context_posi" not in data and t5_pos is not None:
+        prompt = data.get("prompt", "")
+        if prompt in t5_pos:
+            data["context_posi"] = t5_pos[prompt]
+        if t5_neg is not None:
+            data["context_nega"] = t5_neg
+    return data
 
 
 def infinite_file_batches(
