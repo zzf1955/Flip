@@ -204,11 +204,6 @@ def generate_eval_videos(
         ctx_posi = s["context_posi"].to(device=device, dtype=torch.bfloat16)
         ctx_nega = s["context_nega"].to(device=device, dtype=torch.bfloat16)
 
-        if s.get("robot_frames"):
-            save_video(s["robot_frames"], str(step_dir / f"gt_{idx:02d}.mp4"))
-        if s.get("human_frames"):
-            save_video(s["human_frames"], str(step_dir / f"ctrl_{idx:02d}.mp4"))
-
         # RF: initialize from source latent (not noise)
         latents = source_lat.clone()
 
@@ -235,8 +230,19 @@ def generate_eval_videos(
 
         pipe.load_models_to_device(["vae"])
         video = vae.decode(latents, device=device, tiled=False)
-        frames = tensor_to_frames(video)
-        save_video(frames, str(step_dir / f"gen_{idx:02d}.mp4"))
+        save_video(tensor_to_frames(video), str(step_dir / f"gen_{idx:02d}.mp4"))
+
+        if s.get("robot_frames"):
+            save_video(s["robot_frames"], str(step_dir / f"gt_{idx:02d}.mp4"))
+        else:
+            gt_vid = vae.decode(s["robot_latent"], device=device, tiled=False)
+            save_video(tensor_to_frames(gt_vid), str(step_dir / f"gt_{idx:02d}.mp4"))
+
+        if s.get("human_frames"):
+            save_video(s["human_frames"], str(step_dir / f"ctrl_{idx:02d}.mp4"))
+        else:
+            ctrl_vid = vae.decode(s["human_latent"], device=device, tiled=False)
+            save_video(tensor_to_frames(ctrl_vid), str(step_dir / f"ctrl_{idx:02d}.mp4"))
 
         if log:
             log.info(f"  EVAL VIDEO [{idx+1}/{n}] → {step_dir} ({time.time() - t0:.0f}s)")
