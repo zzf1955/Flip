@@ -205,8 +205,12 @@ def train(args):
     if ddp_device is not None:
         args.device = ddp_device  # override --device with LOCAL_RANK
 
-    # ── Output directory (rank 0 only) ──
-    run_name = build_run_name("lora", args)
+    # ── Data (loaded early so n_train is available for run_name) ──
+    all_files = load_cached_files(args.cache_dir, recursive=True)
+    train_files, eval_files = split_train_eval(all_files, args.eval_ratio, args.seed)
+
+    # ── Run name + dirs ──
+    run_name = build_run_name("lora", args, n_train=len(train_files))
     run_dir = os.path.join(args.output_dir, run_name)
     ckpt_dir = os.path.join(run_dir, "ckpt")
     eval_dir = os.path.join(run_dir, "eval")
@@ -232,7 +236,10 @@ def train(args):
         project=args.wandb_project if is_main else None,
         run_name=args.wandb_run_name or run_name,
         config=vars(args),
-        tags=build_wandb_tags("lora", args, extra_tags=args.wandb_tags),
+        tags=build_wandb_tags("lora", args,
+                              n_train=len(train_files),
+                              world_size=world_size,
+                              extra_tags=args.wandb_tags),
         dir=run_dir,
     )
 
@@ -247,10 +254,6 @@ def train(args):
     info(f"Run: {run_dir}")
     info(f"Args: {vars(args)}")
     info(f"DDP: rank={rank}, world_size={world_size}, device={args.device}")
-
-    # ── Data ──
-    all_files = load_cached_files(args.cache_dir, recursive=True)
-    train_files, eval_files = split_train_eval(all_files, args.eval_ratio, args.seed)
     info(f"Data: {len(all_files)} total -> {len(train_files)} train, {len(eval_files)} eval")
 
     # ── Model (DiT + optional VAE) ──

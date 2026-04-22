@@ -202,26 +202,44 @@ def _fmt_lr(lr: float) -> str:
     return f"{base}e{int(exp)}"
 
 
-def build_run_name(prefix: str, args) -> str:
-    """Build a descriptive run name: {prefix}-r{rank}-lr{lr}-{timestamp}."""
-    lr = getattr(args, "lr", None)
-    lora_rank = getattr(args, "lora_rank", None)
+_LOSS_ABBREV = {"hand_patch": "hp"}
+
+
+def build_run_name(prefix: str, args, *, n_train: int = 0) -> str:
+    """Build a descriptive run name used for both local dir and W&B.
+
+    Format: {prefix}[-{loss}]-r{rank}-{steps}s-{n_train}d-{MMDD_HHMM}
+    Example: mitty-r96-500s-1200d-0422_1430
+    """
     parts = [prefix]
+    loss = getattr(args, "loss", None)
+    if loss and loss != "uniform":
+        parts.append(_LOSS_ABBREV.get(loss, loss))
+    lora_rank = getattr(args, "lora_rank", None)
     if lora_rank is not None:
         parts.append(f"r{lora_rank}")
-    if lr is not None:
-        parts.append(f"lr{_fmt_lr(lr)}")
-    parts.append(datetime.now().strftime("%Y-%m-%d_%H%M%S"))
+    max_steps = getattr(args, "max_steps", None)
+    if max_steps is not None:
+        parts.append(f"{max_steps}s")
+    if n_train > 0:
+        parts.append(f"{n_train}d")
+    parts.append(datetime.now().strftime("%m%d_%H%M"))
     return "-".join(parts)
 
 
-def build_wandb_tags(method_tag: str, args,
+def build_wandb_tags(method_tag: str, args, *,
+                     n_train: int = 0,
+                     world_size: int = 1,
                      extra_tags: list[str] | None = None) -> list[str]:
-    """Build W&B tags from args: [method, r{rank}, lr{lr}, bs{N}, ...].
+    """Build comprehensive W&B tags from args.
 
-    Uses getattr for safe extraction across different scripts' arg namespaces.
+    Includes: method, loss, rank, lr, bs, steps, data count, warmup,
+    lora targets, init/merge-lora flags, GPU count, and user extra tags.
     """
     tags = [method_tag]
+    loss = getattr(args, "loss", None)
+    if loss:
+        tags.append(loss)
     lora_rank = getattr(args, "lora_rank", None)
     if lora_rank is not None:
         tags.append(f"r{lora_rank}")
@@ -231,14 +249,23 @@ def build_wandb_tags(method_tag: str, args,
     bs = getattr(args, "batch_size", None)
     if bs is not None and bs > 1:
         tags.append(f"bs{bs}")
-    warmup = getattr(args, "warmup_steps", None)
-    if warmup is not None and warmup > 0:
-        tags.append(f"warmup{warmup}")
     max_steps = getattr(args, "max_steps", None)
     if max_steps is not None:
         tags.append(f"steps{max_steps}")
+    if n_train > 0:
+        tags.append(f"data:{n_train}")
+    warmup = getattr(args, "warmup_steps", None)
+    if warmup is not None and warmup > 0:
+        tags.append(f"warmup{warmup}")
+    targets = getattr(args, "lora_target_modules", None)
+    if targets:
+        tags.append(f"targets:{targets}")
     if getattr(args, "init_lora", ""):
         tags.append("init-lora")
+    if getattr(args, "merge_lora", ""):
+        tags.append("merge-lora")
+    if world_size > 1:
+        tags.append(f"gpu:{world_size}")
     if extra_tags:
         tags.extend(extra_tags)
     return tags
