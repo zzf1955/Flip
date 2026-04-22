@@ -530,6 +530,10 @@ def main():
     ap.add_argument("--loss", choices=["uniform", "hand_patch"], default="uniform",
                     help="loss weighting scheme; hand_patch requires --patch-dir")
 
+    ap.add_argument("--task-name", required=True,
+                    help="training task label for run name & W&B "
+                         "(e.g. identity, directly_transfer, appearance)")
+
     ap.add_argument("--cache-train", required=True)
     ap.add_argument("--cache-eval", default="")
     ap.add_argument("--cache-ood", default="")
