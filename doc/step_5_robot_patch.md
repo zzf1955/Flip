@@ -2,7 +2,7 @@
 
 为外观记忆学习生成训练数据。思路：对机器人全身区域降质，模型从降质 condition 恢复原始外观，从而学会记忆机器人的视觉细节。
 
-与 `hand_patch` 的区别：`hand_patch` 仅处理手部 bounding box，`robot_patch` 使用 FK mesh 渲染的全身 pixel-level mask。
+与 `hand_patch` 的区别：`hand_patch` 仅处理手部 bounding box，`robot_patch` 使用全身 pixel-level mask（FK mesh 或 SAM2 预计算）。
 
 ## 数据结构
 
@@ -35,8 +35,20 @@ training_data/pair/1s_patch/
 - `--patch-expand N`：latent 空间膨胀 N 个 cell（椭圆结构元素），默认 1
 - `weights` key 与 `train.py` 的 `_load_patch_weights` 直接兼容
 
+## Mask 来源
+
+两种 mask 来源通过 `--mask-source` 参数切换：
+
+| 模式 | 精度 | 速度 | 适用场景 |
+|------|------|------|----------|
+| `fk`（默认） | 依赖标定，边界粗糙 | ~2ms/帧 CPU | 快速迭代、无 GPU 时 |
+| `sam2` | pixel-level，边界平滑 | 需预计算（~17s/segment GPU） | 最终训练数据 |
+
+SAM2 模式需先运行 `sam2_precompute.py` 生成 mask（见下方「SAM2 预计算」章节）。
+
 ## 处理流程
 
+### FK 模式（默认）
 ```
 training_data/segment/{task}/ → 4s segments (30fps)
   ↓ 每 segment 切 4 个 1s clip (30帧)
@@ -44,6 +56,18 @@ training_data/segment/{task}/ → 4s segments (30fps)
   ↓ 逐帧 FK → render_mask() → 全身 pixel mask
   ↓ soften_mask() → alpha 混合降质
   ↓ pixel mask → latent mask (5, 30, 40)
+  → video/ + control_video/ + patch/
+```
+
+### SAM2 模式
+```
+training_data/sam2_mask/{task}/ep*/seg*.npz  (预计算)
+  ↓ np.load → precomputed_masks (120, 480, 640)
+  ↓ 每 segment 切 4 个 1s clip
+  ↓ 30fps→16fps 重采样选 17 帧
+  ↓ 按帧索引取 SAM2 mask（跳过 FK）
+  ↓ soften_mask() → alpha 混合降质（不变）
+  ↓ pixel mask → latent mask (5, 30, 40)（不变）
   → video/ + control_video/ + patch/
 ```
 
@@ -105,18 +129,70 @@ python -m src.pipeline.robot_patch --task all --degrade blur --clean
 | `--per-task-eval` | 5 | 每 task 预留 eval 的 segment 数 |
 | `--seed` | 42 | train/eval 划分随机种子 |
 | `--workers` | 4 | 视频写入线程数 |
+| `--mask-source` | `fk` | mask 来源：`fk`（FK mesh）或 `sam2`（预计算 SAM2） |
+| `--sam2-mask-root` | `training_data/sam2_mask` | SAM2 mask npz 根目录 |
+| `--pair-subdir` | `1s_patch` | 输出子目录名（如 `1s_patch_sam2` 避免覆盖） |
 | `--resume` | false | 跳过已存在的输出 |
-| `--clean` | false | 清空 `pair/1s_patch/` 后重新生成 |
+| `--clean` | false | 清空输出目录后重新生成 |
 
 ## 下游训练
 
 详见 [`step_5_ffn_lora_merge.md`](step_5_ffn_lora_merge.md)。训练流程：cache 编码 → 合并 identity LoRA → FFN LoRA 训练。
 
+## SAM2 预计算
+
+将 FK mesh mask 替换为 SAM2 pixel-level mask，提升训练数据质量。
+
+### 架构
+
+```
+Phase A: sam2_precompute.py (GPU)     Phase B: robot_patch.py --mask-source sam2 (CPU)
+─────────────────────────────────     ──────────────────────────────────────────────────
+segment video + joints parquet         precomputed .npz masks
+    │                                      │
+    ├─ FK → per-part bbox prompt           ├─ np.load(seg.npz)["masks"]
+    ├─ SAM2 video propagation              ├─ soften_mask (不变)
+    ├─ combine parts → binary mask         ├─ degrade_* (不变)
+    └─ save .npz                           └─ build_latent_mask (不变)
+```
+
+### 输出格式
+
+`training_data/sam2_mask/{task}/{ep}/{seg}.npz`，含 `masks` 数组 `(120, 480, 640) uint8`，值 0/255。
+单文件 ~200-300KB（npz 压缩），14270 segments 总计约 3-5GB。
+
+### 性能
+
+| 项目 | 数值 |
+|------|------|
+| 单 segment（SAM2 tiny, 4090）| ~17s |
+| FK prompt 仅在每 30 帧计算 | 4/120 帧 |
+| SAM2 tiny 显存 | ~1.8GB |
+| 每 GPU 最大并发 worker | ~12（24GB / 1.8GB） |
+| 4 GPU × 2 worker → 14270 segments | ~6-9h |
+
+### 命令
+
+```bash
+# 单 GPU 预计算
+python -m src.pipeline.sam2_precompute --task all --device cuda:0 --resume
+
+# 多 GPU 调度（4 GPU，每 GPU 2 worker = 8 并行）
+python -m src.pipeline.batch_sam2_precompute \
+    --gpus 0 1 2 3 --workers-per-gpu 2 --task all --resume
+
+# SAM2 mask → robot_patch（输出到独立目录避免覆盖 FK 数据）
+python -m src.pipeline.robot_patch \
+    --task all --mask-source sam2 --pair-subdir 1s_patch_sam2 --degrade blur
+```
+
 ## 相关文件
 
 | 文件 | 作用 |
 |------|------|
-| `src/pipeline/robot_patch.py` | 数据生成主脚本 |
+| `src/pipeline/robot_patch.py` | 数据生成主脚本（FK / SAM2 两种 mask 源） |
+| `src/pipeline/sam2_precompute.py` | SAM2 mask 预计算（单 GPU） |
+| `src/pipeline/batch_sam2_precompute.py` | SAM2 mask 预计算调度（多 GPU） |
 | `src/core/render.py` | `render_mask()` — FK mesh → pixel mask |
 | `src/core/fk.py` | `build_q()` + `do_fk()` + mesh 预加载 |
 | `src/pipeline/mitty_cache.py` | 编码 pair → .pth cache |

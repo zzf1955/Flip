@@ -95,6 +95,9 @@ src/
 │   ├── sam2_segment.py      # SAM2 多部位分割实验
 │   ├── batch_inpaint.py     # 多 GPU 批量调度
 │   ├── video_inpaint.py     # 逐帧 FK + GrabCut + LaMa
+│   ├── sam2_precompute.py    # SAM2 mask 预计算（FK bbox → SAM2 propagation → npz）
+│   ├── batch_sam2_precompute.py # SAM2 预计算多 GPU 调度
+│   ├── robot_patch.py        # 全身降质训练数据（FK/SAM2 mask）
 │   └── retarget_video.py    # retarget 3-panel 视频渲染
 │   # ... 另有 11 个 pipeline（seedance_gen, train_lora 等）
 │   # 完整清单见 doc/scripts_inventory.md
