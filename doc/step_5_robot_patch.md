@@ -61,15 +61,19 @@ training_data/segment/{task}/ → 4s segments (30fps)
 
 ### SAM2 模式
 ```
-training_data/sam2_mask/{task}/ep*/seg*.npz  (预计算)
+training_data/sam2_mask/{task}/ep*/seg*.npz  (预计算，双缓冲流水线)
   ↓ np.load → precomputed_masks (120, 480, 640)
   ↓ 每 segment 切 4 个 1s clip
   ↓ 30fps→16fps 重采样选 17 帧
   ↓ 按帧索引取 SAM2 mask（跳过 FK）
   ↓ soften_mask() → alpha 混合降质（不变）
   ↓ pixel mask → latent mask (5, 30, 40)（不变）
-  → video/ + control_video/ + patch/
+  → video/ + control_video/ + patch/ + mask/ (SAM2 原始 mask 视频)
 ```
+
+### Mask 视频输出
+
+SAM2 模式下额外输出 mask 可视化视频到 `train/mask/` 和 `eval/mask/`（白色 mask + 黑色背景，17 帧 @16fps），便于检查 SAM2 mask 质量。FK 模式不输出 mask 视频。
 
 ### Segment 级批处理
 
@@ -153,7 +157,8 @@ segment video + joints parquet         precomputed .npz masks
     ├─ FK → per-part bbox prompt           ├─ np.load(seg.npz)["masks"]
     ├─ SAM2 video propagation              ├─ soften_mask (不变)
     ├─ combine parts → binary mask         ├─ degrade_* (不变)
-    └─ save .npz                           └─ build_latent_mask (不变)
+    ├─ save .npz                           ├─ build_latent_mask (不变)
+    └─ 双缓冲: CPU prep 与 GPU 重叠       └─ 输出 mask 可视化视频
 ```
 
 ### 输出格式
@@ -165,7 +170,7 @@ segment video + joints parquet         precomputed .npz masks
 
 | 项目 | 数值 |
 |------|------|
-| 单 segment（SAM2 tiny, 4090）| ~17s |
+| 单 segment（SAM2 tiny, 4090）| ~18s（双缓冲流水线，CPU prep 与 GPU 重叠）|
 | FK prompt 仅在每 30 帧计算 | 4/120 帧 |
 | SAM2 tiny 显存 | ~1.8GB |
 | 每 GPU 最大并发 worker | ~12（24GB / 1.8GB） |
