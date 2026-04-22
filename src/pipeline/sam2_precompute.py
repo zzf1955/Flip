@@ -205,42 +205,27 @@ def compute_segment_mask(
     for i, frame in enumerate(frames):
         cv2.imwrite(os.path.join(jpeg_dir, f"{i:05d}.jpg"), frame)
 
-    # Phase A: FK → per-part bbox prompts
+    # Phase A: FK → per-part bbox prompts (only at prompt_interval frames)
     all_prompts = []
-    prev_visible = set()
     h, w = frames[0].shape[:2]
+    n_rows = min(n_frames, len(df))
+    prompt_frames = [i for i in range(n_rows) if i == 0 or i % prompt_interval == 0]
 
-    for seq_idx in range(min(n_frames, len(df))):
+    for seq_idx in prompt_frames:
         row = df.iloc[seq_idx]
         rq = np.array(row["observation.state.robot_q_current"], dtype=np.float64)
         hs = np.array(row["observation.state.hand_state"], dtype=np.float64)
         q = build_q(fk_model, rq, hs, hand_type=hand_type)
         transforms = do_fk(fk_model, fk_data, q)
 
-        cur_visible = set()
-        part_masks = {}
         for part_name, pcache in part_caches.items():
             if not pcache:
                 continue
             m = render_mask_for_links(pcache, transforms, BEST_PARAMS, h, w)
             if np.count_nonzero(m) >= min_visible_area:
-                cur_visible.add(part_name)
-                part_masks[part_name] = m
-
-        is_periodic = (seq_idx == 0 or seq_idx % prompt_interval == 0)
-        newly_appeared = cur_visible - prev_visible
-        parts_to_prompt = set()
-        if is_periodic:
-            parts_to_prompt = cur_visible.copy()
-        if newly_appeared:
-            parts_to_prompt |= newly_appeared
-
-        for part_name in parts_to_prompt:
-            bbox = mask_to_bbox(part_masks[part_name], margin=bbox_margin)
-            if bbox is not None:
-                all_prompts.append((seq_idx, part_name, bbox))
-
-        prev_visible = cur_visible
+                bbox = mask_to_bbox(m, margin=bbox_margin)
+                if bbox is not None:
+                    all_prompts.append((seq_idx, part_name, bbox))
 
     # Phase B: SAM2 video propagation
     id_to_part = {v: k for k, v in PART_IDS.items()}
