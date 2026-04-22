@@ -257,11 +257,15 @@ def process_clip(pair: dict, seg_frames: list[np.ndarray],
                  fk_model, fk_data, mesh_cache, cam_const,
                  hand_type: str, degrade_mode: str,
                  blur_ksize: int, noise_std: float,
-                 patch_expand: int = 0) -> dict | None:
+                 patch_expand: int = 0,
+                 precomputed_masks: np.ndarray | None = None) -> dict | None:
     """Process one 1s clip from pre-loaded segment data.
 
     Returns dict with keys: clean_frames, degraded_frames, latent_mask.
     Returns None if the clip has insufficient data.
+
+    If precomputed_masks is provided (shape (N, H, W) uint8 for the full
+    segment), masks are loaded from the array instead of FK render_mask.
     """
     clip_start = pair["clip_start_30fps"]
     clip_end = clip_start + 30
@@ -269,13 +273,16 @@ def process_clip(pair: dict, seg_frames: list[np.ndarray],
     if len(clip_frames_30) < 17:
         return None
 
-    clip_abs_start = seg_frame_min + clip_start
-    clip_df = seg_df[
-        (seg_df["frame_index"] >= clip_abs_start) &
-        (seg_df["frame_index"] < clip_abs_start + 30)
-    ]
-    if len(clip_df) < 17:
-        return None
+    use_fk = precomputed_masks is None
+
+    if use_fk:
+        clip_abs_start = seg_frame_min + clip_start
+        clip_df = seg_df[
+            (seg_df["frame_index"] >= clip_abs_start) &
+            (seg_df["frame_index"] < clip_abs_start + 30)
+        ]
+        if len(clip_df) < 17:
+            return None
 
     clean_frames = []
     degraded_frames = []
@@ -287,20 +294,29 @@ def process_clip(pair: dict, seg_frames: list[np.ndarray],
             src_idx = len(clip_frames_30) - 1
         frame = clip_frames_30[src_idx]
 
-        abs_frame = clip_abs_start + src_idx
-        row = clip_df[clip_df["frame_index"] == abs_frame]
-        if row.empty:
-            nearest_idx = (clip_df["frame_index"] - abs_frame).abs().idxmin()
-            row = clip_df.loc[[nearest_idx]]
+        if use_fk:
+            clip_abs_start = seg_frame_min + clip_start
+            abs_frame = clip_abs_start + src_idx
+            row = clip_df[clip_df["frame_index"] == abs_frame]
+            if row.empty:
+                nearest_idx = (clip_df["frame_index"] - abs_frame).abs().idxmin()
+                row = clip_df.loc[[nearest_idx]]
 
-        row = row.iloc[0]
-        rq = np.array(row["observation.state.robot_q_current"], dtype=np.float64)
-        hs = np.array(row["observation.state.hand_state"], dtype=np.float64)
-        q = build_q(fk_model, rq, hs, hand_type=hand_type)
-        transforms = do_fk(fk_model, fk_data, q)
+            row = row.iloc[0]
+            rq = np.array(row["observation.state.robot_q_current"], dtype=np.float64)
+            hs = np.array(row["observation.state.hand_state"], dtype=np.float64)
+            q = build_q(fk_model, rq, hs, hand_type=hand_type)
+            transforms = do_fk(fk_model, fk_data, q)
 
-        hard_mask = render_mask(mesh_cache, transforms, BEST_PARAMS,
-                                VIDEO_H, VIDEO_W, cam_const)
+            hard_mask = render_mask(mesh_cache, transforms, BEST_PARAMS,
+                                    VIDEO_H, VIDEO_W, cam_const)
+        else:
+            seg_frame_idx = clip_start + src_idx
+            if seg_frame_idx < len(precomputed_masks):
+                hard_mask = precomputed_masks[seg_frame_idx]
+            else:
+                hard_mask = np.zeros((VIDEO_H, VIDEO_W), dtype=np.uint8)
+
         soft_mask = soften_mask(hard_mask, pixel_expand=patch_expand * VAE_SPATIAL)
         hard_masks.append(hard_mask)
 
@@ -354,17 +370,30 @@ def _get_fk(hand_type: str):
 def _process_segment(seg_key: str, pairs: list[dict],
                      worker_args: tuple) -> tuple[int, int]:
     """Process all clips in one segment. Runs in a worker process."""
-    degrade_mode, blur_ksize, noise_std, patch_expand = worker_args
+    degrade_mode, blur_ksize, noise_std, patch_expand, mask_source, sam2_mask_root = worker_args
     task = pairs[0]["task"]
-    hand_type = get_hand_type(f"G1_WBT_{task}")
-    fk_model, fk_data, mesh_cache, cam_const = _get_fk(hand_type)
-
     ref = pairs[0]
+
     seg_frames = read_all_frames(ref["video_path"])
-    if not os.path.isfile(ref["parquet_path"]):
-        return 0, len(pairs)
-    seg_df = pd.read_parquet(ref["parquet_path"])
-    seg_frame_min = int(seg_df["frame_index"].min())
+
+    precomputed_masks = None
+    fk_model = fk_data = mesh_cache = cam_const = None
+    seg_df = None
+    seg_frame_min = 0
+
+    if mask_source == "sam2":
+        npz_path = os.path.join(
+            sam2_mask_root, task, ref["episode"], f"{ref['seg']}.npz")
+        if not os.path.isfile(npz_path):
+            return 0, len(pairs)
+        precomputed_masks = np.load(npz_path)["masks"]
+    else:
+        hand_type = get_hand_type(f"G1_WBT_{task}")
+        fk_model, fk_data, mesh_cache, cam_const = _get_fk(hand_type)
+        if not os.path.isfile(ref["parquet_path"]):
+            return 0, len(pairs)
+        seg_df = pd.read_parquet(ref["parquet_path"])
+        seg_frame_min = int(seg_df["frame_index"].min())
 
     done = 0
     fail = 0
@@ -372,8 +401,10 @@ def _process_segment(seg_key: str, pairs: list[dict],
         result = process_clip(
             pair, seg_frames, seg_df, seg_frame_min,
             fk_model, fk_data, mesh_cache, cam_const,
-            hand_type, degrade_mode, blur_ksize, noise_std,
+            get_hand_type(f"G1_WBT_{task}") if mask_source == "fk" else "inspire",
+            degrade_mode, blur_ksize, noise_std,
             patch_expand=patch_expand,
+            precomputed_masks=precomputed_masks,
         )
         if result is None:
             fail += 1
@@ -405,6 +436,13 @@ def main():
                     help="parallel worker processes for segment processing")
     ap.add_argument("--patch-expand", type=int, default=1,
                     help="latent-space dilation radius for patch mask (0 = no expansion)")
+    ap.add_argument("--mask-source", choices=["fk", "sam2"], default="fk",
+                    help="mask source: fk (FK mesh) or sam2 (precomputed SAM2)")
+    ap.add_argument("--sam2-mask-root",
+                    default=os.path.join(_MAIN_TRAINING_DATA, "sam2_mask"),
+                    help="root dir for precomputed SAM2 masks")
+    ap.add_argument("--pair-subdir", default="1s_patch",
+                    help="output subdirectory under training_data/pair/")
     ap.add_argument("--resume", action="store_true",
                     help="skip pairs whose outputs already exist")
     ap.add_argument("--clean", action="store_true",
@@ -420,12 +458,15 @@ def main():
     else:
         tasks = [t.strip() for t in args.task.split(",")]
 
-    sec_dir = os.path.join(_PAIR_DIR, "1s_patch")
+    sec_dir = os.path.join(_PAIR_DIR, args.pair_subdir)
     if args.clean and os.path.isdir(sec_dir):
         shutil.rmtree(sec_dir)
 
     print("Robot Patch (full-body degradation for appearance learning)")
     print(f"  tasks:         {tasks}")
+    print(f"  mask-source:   {args.mask_source}")
+    if args.mask_source == "sam2":
+        print(f"  sam2-mask-root: {args.sam2_mask_root}")
     print(f"  degrade:       {args.degrade}")
     if args.degrade == "blur":
         print(f"  blur-ksize:    {args.blur_ksize}")
@@ -529,7 +570,8 @@ def main():
     print(f"  {len(work_items)} segments to process, {n_skip} pairs skipped (resume)")
 
     # Process segments in parallel with ProcessPoolExecutor
-    worker_args = (args.degrade, args.blur_ksize, args.noise_std, args.patch_expand)
+    worker_args = (args.degrade, args.blur_ksize, args.noise_std, args.patch_expand,
+                   args.mask_source, args.sam2_mask_root)
     n_done = 0
     n_fail = 0
 
