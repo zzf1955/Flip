@@ -285,6 +285,7 @@ data/
 | `doc/step_5_training_infra.md` | DDP / GPU 直接加载 / 数据 cache / W&B / 训练命令 |
 | `doc/step_5_wandb_setup.md` | W&B 代理问题诊断 |
 | `doc/step_5_robot_patch.md` | 全身机器人降质数据生成（外观记忆学习） |
+| `doc/step_5_wan22_architecture.md` | Wan 2.2 TI2V-5B DiT 架构详解（层结构 + 参数量） |
 
 ### 项目管理
 
