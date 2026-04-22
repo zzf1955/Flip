@@ -159,11 +159,6 @@ def generate_eval_videos(
         t0 = time.time()
         s = load_sample(files[idx], device=device)
 
-        if s.get("robot_frames"):
-            save_video(s["robot_frames"], str(step_dir / f"gt_{idx:02d}.mp4"))
-        if s.get("human_frames"):
-            save_video(s["human_frames"], str(step_dir / f"ctrl_{idx:02d}.mp4"))
-
         denoised = spec.eval_denoise_fn(
             pipe=pipe, sample=s, sched=sched, device=device,
             cfg_scale=cfg_scale, num_inference_steps=num_inference_steps,
@@ -171,8 +166,19 @@ def generate_eval_videos(
 
         pipe.load_models_to_device(["vae"])
         video = vae.decode(denoised, device=device, tiled=False)
-        frames = tensor_to_frames(video)
-        save_video(frames, str(step_dir / f"gen_{idx:02d}.mp4"))
+        save_video(tensor_to_frames(video), str(step_dir / f"gen_{idx:02d}.mp4"))
+
+        if s.get("robot_frames"):
+            save_video(s["robot_frames"], str(step_dir / f"gt_{idx:02d}.mp4"))
+        else:
+            gt_vid = vae.decode(s["robot_latent"], device=device, tiled=False)
+            save_video(tensor_to_frames(gt_vid), str(step_dir / f"gt_{idx:02d}.mp4"))
+
+        if s.get("human_frames"):
+            save_video(s["human_frames"], str(step_dir / f"ctrl_{idx:02d}.mp4"))
+        else:
+            ctrl_vid = vae.decode(s["human_latent"], device=device, tiled=False)
+            save_video(tensor_to_frames(ctrl_vid), str(step_dir / f"ctrl_{idx:02d}.mp4"))
 
         if log:
             log.info(f"  EVAL VIDEO [{idx+1}/{n}] → {step_dir} "
