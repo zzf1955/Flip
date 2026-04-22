@@ -157,13 +157,17 @@ def load_fk_model(hand_type: str):
 
 # ── Mask processing ──────────────────────────────────────────────────
 
-def soften_mask(mask: np.ndarray) -> np.ndarray:
+def soften_mask(mask: np.ndarray, pixel_expand: int = 0) -> np.ndarray:
     """Smooth + dilate + soft-edge for degradation blending."""
     out = cv2.GaussianBlur(mask, (7, 7), 0)
     out = (out > 128).astype(np.uint8) * 255
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    d = 15 + 2 * pixel_expand
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (d, d))
     out = cv2.dilate(out, kernel)
-    out = cv2.GaussianBlur(out, (21, 21), 0)
+    blur_k = 21 + 2 * (pixel_expand // 2)
+    if blur_k % 2 == 0:
+        blur_k += 1
+    out = cv2.GaussianBlur(out, (blur_k, blur_k), 0)
     return out
 
 
@@ -297,7 +301,7 @@ def process_clip(pair: dict, seg_frames: list[np.ndarray],
 
         hard_mask = render_mask(mesh_cache, transforms, BEST_PARAMS,
                                 VIDEO_H, VIDEO_W, cam_const)
-        soft_mask = soften_mask(hard_mask)
+        soft_mask = soften_mask(hard_mask, pixel_expand=patch_expand * VAE_SPATIAL)
         hard_masks.append(hard_mask)
 
         if degrade_mode == "blur":
