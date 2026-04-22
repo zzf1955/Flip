@@ -137,7 +137,20 @@ def main():
 
     metadata_path = pair_dir / "metadata.csv"
     if not metadata_path.exists():
-        raise FileNotFoundError(f"{metadata_path} not found")
+        video_dir = pair_dir / "video"
+        assert video_dir.is_dir(), \
+            f"Neither metadata.csv nor video/ found in {pair_dir}"
+        files = sorted(f for f in os.listdir(video_dir) if f.endswith(".mp4"))
+        assert files, f"No .mp4 files in {video_dir}"
+        default_prompt = ("A first-person view robot arm performing "
+                          "household tasks flip_v2v")
+        with open(metadata_path, "w", newline="") as fh:
+            w = csv.writer(fh)
+            w.writerow(["video", "prompt", "control_video"])
+            for fn in files:
+                w.writerow([f"video/{fn}", default_prompt,
+                            f"control_video/{fn}"])
+        print(f"Auto-generated {metadata_path} ({len(files)} entries)")
 
     # Load source_map from sec dir (parent of pair_dir)
     source_map_path = pair_dir.parent / "source_map.json"
