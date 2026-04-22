@@ -9,6 +9,12 @@
 - [026] SAM2 mask 预计算 + robot_patch 集成
 
 **用户原始需求：**
+> 做一下流水线优化，然后输出 pair 视频的时候连 SAM2 原始的 Mask 视频一起输出，输出到 train/mask eval/mask 中，方便检查中间结果。
+
+**创建的任务：**
+- [027] sam2_precompute 流水线优化 + mask 视频输出
+
+**用户原始需求：**
 > 在 LoRA 恒等映射后面加一个阶段的训练。在 FFN 层加 LoRA，重建 1s_patch 中模糊的视频。前一阶段的 identity LoRA 保持不变加到模型上，FFN 加新 LoRA。
 
 **创建的任务：**
