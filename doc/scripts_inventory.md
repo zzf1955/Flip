@@ -5,7 +5,7 @@
 ```
 src/
 ├── core/          8 个基础库模块（不可直接运行）
-├── pipeline/     16 个可执行 pipeline 入口
+├── pipeline/     18 个可执行 pipeline 入口
 └── tools/        17 个实验/调试/可视化工具
 ```
 
@@ -60,6 +60,8 @@ retarget.py        ← config, smplh, fk
 |------|------|------|------|
 | `sam2_inpaint.py` | FK → SAM2 分割 → LaMa/ProPainter 修复 | episode 视频 | `output/inpaint/` |
 | `sam2_segment.py` | SAM2 多部位分割实验 | episode 视频 | `output/inpaint/sam2_segment/` |
+| `sam2_precompute.py` | SAM2 mask 预计算（FK bbox prompt → SAM2 propagation → npz） | segment 视频 | `training_data/sam2_mask/` |
+| `batch_sam2_precompute.py` | sam2_precompute 多 GPU 调度（多 worker/GPU） | 多 task | `training_data/sam2_mask/` |
 | `batch_inpaint.py` | 多 GPU 批量修复调度 | 多 task/episode | 自定义 |
 | `video_inpaint.py` | 逐帧 FK + GrabCut + LaMa | episode 视频 | `output/inpaint/per_frame_lama/` |
 
@@ -76,6 +78,7 @@ retarget.py        ← config, smplh, fk
 | 脚本 | 功能 | 输入 | 输出 |
 |------|------|------|------|
 | `make_pair.py` | 匹配 robot+human 视频，重采样 16fps，4k+1 帧 | segment + seedance/overlay | `training_data/pair/{1s,2s,4s}/` |
+| `robot_patch.py` | 全身降质数据（FK mesh 或 SAM2 mask → blur/noise/mean） | segment + parquet/sam2_mask | `training_data/pair/1s_patch/` |
 
 ### LoRA 训练
 
@@ -173,6 +176,16 @@ G1 第一人称视频 (LeRobot dataset, 30fps)
 │       ├── control_video/pair_NNNN.mp4 (human, 17帧@16fps)
 │       └── metadata.csv
 │
+├─ [sam2_precompute.py / batch_sam2_precompute.py]  (FK bbox → SAM2 pixel mask)
+│   → training_data/sam2_mask/<task>/ep*/seg*.npz  (masks: uint8 (120,480,640))
+│
+├─ [robot_patch.py]  (全身降质: FK/SAM2 mask → blur/noise/mean)
+│   → training_data/pair/1s_patch/
+│       ├── video/pair_NNNN.mp4        (clean robot, 17帧@16fps)
+│       ├── control_video/pair_NNNN.mp4 (degraded robot, 17帧@16fps)
+│       ├── patch/pair_NNNN.pth        (latent mask + weights)
+│       └── metadata.csv
+│
 ├─ [DiffSynth data_process]  (阶段 1: T5+CLIP+VAE embedding 缓存)
 │   → output/data_cache_80/0/*.pth  (80 样本, ~50MB/个, 共 3.9GB)
 │
@@ -222,10 +235,13 @@ output/                          # per-worktree 实验产物
 
 training_data/                   # per-worktree 训练数据
 ├── segment/                     # 4s robot segments
+├── sam2_mask/                   # SAM2 预计算 mask (sam2_precompute 输出)
+│   └── <task>/ep*/seg*.npz      # masks: uint8 (120, 480, 640), 0/255
 ├── seedance_direct/             # Seedance human videos
 ├── overlay/                     # SMPLH overlay human videos
-├── pair/                        # 配对训练数据 (make_pair 输出)
-│   └── 1s/{video/, control_video/, metadata.csv}
+├── pair/                        # 配对训练数据
+│   ├── 1s/{video/, control_video/, metadata.csv}  (make_pair 输出)
+│   └── 1s_patch/{video/, control_video/, patch/, metadata.csv}  (robot_patch 输出)
 ├── compare/                     # 对比视频
 └── log/                         # train_lora.py 训练输出
     └── YYYY-MM-DD_HHMMSS/{ckpt/, eval/, train.log}
