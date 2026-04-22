@@ -265,10 +265,15 @@ def train(args, spec: BackboneSpec):
         info("Patch weights: disabled (uniform loss)")
 
     # ── Model (rank 0 loads from disk; others allocate empty + receive via broadcast) ──
-    info("Loading model...")
+    # All ranks print during loading so we can diagnose stalls.
+    def info_all(msg):
+        print(f"[rank {rank}] {msg}", flush=True)
+
+    info_all("Loading model...")
     t0 = time.time()
     load_vae = is_main and args.eval_video_steps > 0
     skip_dit = world_size > 1 and rank != 0
+    info_all(f"skip_dit={skip_dit}, load_vae={load_vae}, device={args.device}")
     model = spec.training_module_factory(
         device=args.device,
         lora_rank=args.lora_rank,
@@ -278,26 +283,32 @@ def train(args, spec: BackboneSpec):
         init_lora_path=args.init_lora,
         skip_dit_load=skip_dit,
     )
-    info(f"Model {'allocated (empty)' if skip_dit else 'loaded from disk'}"
-         f" in {time.time() - t0:.1f}s (load_vae={load_vae})")
+    info_all(f"Model {'allocated (empty)' if skip_dit else 'loaded from disk'}"
+             f" in {time.time() - t0:.1f}s")
     if getattr(model, "_init_lora_n", 0):
         info(f"Loaded {model._init_lora_n} LoRA tensors from {args.init_lora}")
 
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     n_total = sum(p.numel() for p in model.parameters())
-    info(f"Params: {n_total:,} total, {n_trainable:,} trainable "
-         f"({n_trainable / 1e6:.1f}M)")
+    info_all(f"Params: {n_total:,} total, {n_trainable:,} trainable "
+             f"({n_trainable / 1e6:.1f}M)")
 
     if world_size > 1:
+        info_all("Waiting at broadcast barrier...")
+        dist.barrier()
+        info_all("Starting DiT broadcast...")
         t_bc = time.time()
         dit = model.pipe.dit
-        for p in dit.parameters():
+        n_params = sum(1 for _ in dit.parameters())
+        for i, p in enumerate(dit.parameters()):
             dist.broadcast(p.data, src=0)
+            if (i + 1) % 50 == 0:
+                info_all(f"  broadcast {i+1}/{n_params} params")
         for b in dit.buffers():
             dist.broadcast(b, src=0)
         bc_gb = sum(p.numel() for p in dit.parameters()) * 2 / 1e9
-        info(f"DiT weights broadcast from rank 0 in {time.time() - t_bc:.1f}s "
-             f"({bc_gb:.2f} GB bf16)")
+        info_all(f"DiT broadcast done in {time.time() - t_bc:.1f}s "
+                 f"({bc_gb:.2f} GB bf16)")
 
     optimizer = torch.optim.AdamW(
         model.trainable_modules(), lr=args.lr, weight_decay=args.weight_decay,
