@@ -41,7 +41,6 @@ import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
 from pathlib import Path
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -56,6 +55,8 @@ from src.core.config import MAIN_ROOT, TRAINING_DATA_ROOT
 from src.core.train_utils import (
     CsvLogger,
     WandbLogger,
+    build_run_name,
+    build_wandb_tags,
     cleanup_distributed,
     infinite_file_batches,
     load_cached_files,
@@ -197,7 +198,18 @@ def train(args, spec: BackboneSpec):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed + rank)
 
-    run_name = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    # ── Data (loaded early so n_train is available for run_name) ──
+    if args.eval_video_steps == -1:
+        args.eval_video_steps = args.eval_steps
+
+    train_files = load_cached_files(args.cache_train)
+    eval_files = load_cached_files(args.cache_eval) if args.cache_eval else []
+    if args.max_eval_files and len(eval_files) > args.max_eval_files:
+        eval_files = eval_files[:args.max_eval_files]
+    ood_files = load_cached_files(args.cache_ood) if args.cache_ood else []
+
+    # ── Run name + dirs ──
+    run_name = build_run_name(spec.name, args, n_train=len(train_files))
     run_dir = Path(args.output_dir) / run_name
     ckpt_dir = run_dir / "ckpt"
     eval_dir = run_dir / "eval"
@@ -222,7 +234,10 @@ def train(args, spec: BackboneSpec):
         project=args.wandb_project if is_main else None,
         run_name=args.wandb_run_name or run_name,
         config=vars(args),
-        tags=(args.wandb_tags or []) + [spec.wandb_tag, args.loss],
+        tags=build_wandb_tags(spec.wandb_tag, args,
+                              n_train=len(train_files),
+                              world_size=world_size,
+                              extra_tags=args.wandb_tags),
         dir=str(run_dir),
     )
 
@@ -239,16 +254,6 @@ def train(args, spec: BackboneSpec):
     info(f"Run: {run_dir}")
     info(f"Args: {vars(args)}")
     info(f"DDP: rank={rank}, world_size={world_size}, device={args.device}")
-
-    # ── Data ──
-    if args.eval_video_steps == -1:
-        args.eval_video_steps = args.eval_steps
-
-    train_files = load_cached_files(args.cache_train)
-    eval_files = load_cached_files(args.cache_eval) if args.cache_eval else []
-    if args.max_eval_files and len(eval_files) > args.max_eval_files:
-        eval_files = eval_files[:args.max_eval_files]
-    ood_files = load_cached_files(args.cache_ood) if args.cache_ood else []
     info(f"Data: train={len(train_files)} eval={len(eval_files)} ood={len(ood_files)}")
 
     # ── Patch weights (derived paths for eval/ood mirror the train layout) ──
@@ -577,8 +582,8 @@ def main():
     ap.add_argument("--num-inference-steps", type=int, default=30)
 
     # W&B
-    ap.add_argument("--wandb-project", default=None,
-                    help="W&B project name; unset = disabled")
+    ap.add_argument("--wandb-project", default="Flip",
+                    help="W&B project name (default: 'Flip'; set to '' to disable)")
     ap.add_argument("--wandb-run-name", default=None,
                     help="W&B run name (default: timestamp)")
     ap.add_argument("--wandb-tags", nargs="+", default=[],

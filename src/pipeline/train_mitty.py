@@ -404,7 +404,18 @@ def train(args):
     if ddp_device is not None:
         args.device = ddp_device
 
-    run_name = build_run_name("mitty", args)
+    # ── Data (loaded early so n_train is available for run_name) ──
+    if args.eval_video_steps == -1:
+        args.eval_video_steps = args.eval_steps
+
+    train_files = load_cached_files(args.cache_train)
+    eval_files = load_cached_files(args.cache_eval) if args.cache_eval else []
+    if args.max_eval_files and len(eval_files) > args.max_eval_files:
+        eval_files = eval_files[:args.max_eval_files]
+    ood_files = load_cached_files(args.cache_ood) if args.cache_ood else []
+
+    # ── Run name + dirs ──
+    run_name = build_run_name("mitty", args, n_train=len(train_files))
     run_dir = Path(args.output_dir) / run_name
     ckpt_dir = run_dir / "ckpt"
     eval_dir = run_dir / "eval"
@@ -431,7 +442,10 @@ def train(args):
         project=args.wandb_project if is_main else None,
         run_name=args.wandb_run_name or run_name,
         config=vars(args),
-        tags=build_wandb_tags("mitty", args, extra_tags=args.wandb_tags),
+        tags=build_wandb_tags("mitty", args,
+                              n_train=len(train_files),
+                              world_size=world_size,
+                              extra_tags=args.wandb_tags),
         dir=str(run_dir),
     )
 
@@ -446,16 +460,6 @@ def train(args):
     info(f"Run: {run_dir}")
     info(f"Args: {vars(args)}")
     info(f"DDP: rank={rank}, world_size={world_size}, device={args.device}")
-
-    # ── Data ──
-    if args.eval_video_steps == -1:
-        args.eval_video_steps = args.eval_steps
-
-    train_files = load_cached_files(args.cache_train)
-    eval_files = load_cached_files(args.cache_eval) if args.cache_eval else []
-    if args.max_eval_files and len(eval_files) > args.max_eval_files:
-        eval_files = eval_files[:args.max_eval_files]
-    ood_files = load_cached_files(args.cache_ood) if args.cache_ood else []
     info(f"Data: train={len(train_files)} eval={len(eval_files)} ood={len(ood_files)}")
 
     # ── Patch weights ──
