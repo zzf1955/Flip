@@ -709,6 +709,10 @@ def train(args):
 def main():
     ap = argparse.ArgumentParser(description="Mitty LoRA training (Wan 2.2 TI2V-5B)")
 
+    ap.add_argument("--task-name", required=True,
+                    help="training task label for run name & W&B "
+                         "(e.g. identity, directly_transfer, appearance)")
+
     ap.add_argument("--cache-train", required=True)
     ap.add_argument("--cache-eval", default="")
     ap.add_argument("--cache-ood", default="")
