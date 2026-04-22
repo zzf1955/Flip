@@ -3,6 +3,12 @@
 ## 2026-04-22
 
 **用户原始需求：**
+> 看一下当前 Mitty appearance 的数据构造方式。目前是直接使用机器人的 Mesh 来进行模糊，不是很准。能不能复用 inpaint pipeline 中 SAM2 的 Mask，得到高质量的机器人 patch。需要并行加速优化。
+
+**创建的任务：**
+- [026] SAM2 mask 预计算 + robot_patch 集成
+
+**用户原始需求：**
 > 在 LoRA 恒等映射后面加一个阶段的训练。在 FFN 层加 LoRA，重建 1s_patch 中模糊的视频。前一阶段的 identity LoRA 保持不变加到模型上，FFN 加新 LoRA。
 
 **创建的任务：**
