@@ -436,6 +436,10 @@ def main():
     ap = argparse.ArgumentParser(
         description="Custom LoRA training for Wan 2.1 FunControl")
 
+    ap.add_argument("--task-name", default="",
+                    help="training task label for run name & W&B "
+                         "(e.g. identity, directly_transfer, appearance)")
+
     # Data
     ap.add_argument("--cache-dir", required=True,
                     help="Cached .pth directory (from DiffSynth data_process)")
