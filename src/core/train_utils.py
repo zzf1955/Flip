@@ -202,29 +202,39 @@ def _fmt_lr(lr: float) -> str:
     return f"{base}e{int(exp)}"
 
 
-_LOSS_ABBREV = {"hand_patch": "hp"}
+_BACKBONE_DISPLAY = {
+    "mitty": "Mitty",
+    "rectflow": "RF",
+    "rf": "RF",
+    "lora": "Lora",
+}
 
 
 def build_run_name(prefix: str, args, *, n_train: int = 0) -> str:
     """Build a descriptive run name used for both local dir and W&B.
 
-    Format: {prefix}[-{loss}]-r{rank}-{steps}s-{n_train}d-{MMDD_HHMM}
-    Example: mitty-r96-500s-1200d-0422_1430
+    Format: {Backbone}-{task_name}-{n_train}d_{params}_{MMDD_HHMM}
+    Example: Mitty-identity-1200d_r96_500s_0422_1430
     """
-    parts = [prefix]
-    loss = getattr(args, "loss", None)
-    if loss and loss != "uniform":
-        parts.append(_LOSS_ABBREV.get(loss, loss))
+    backbone = _BACKBONE_DISPLAY.get(prefix, prefix.capitalize())
+    task_name = getattr(args, "task_name", "")
+
+    head = [backbone]
+    if task_name:
+        head.append(task_name)
+    if n_train > 0:
+        head.append(f"{n_train}d")
+
+    detail = []
     lora_rank = getattr(args, "lora_rank", None)
     if lora_rank is not None:
-        parts.append(f"r{lora_rank}")
+        detail.append(f"r{lora_rank}")
     max_steps = getattr(args, "max_steps", None)
     if max_steps is not None:
-        parts.append(f"{max_steps}s")
-    if n_train > 0:
-        parts.append(f"{n_train}d")
-    parts.append(datetime.now().strftime("%m%d_%H%M"))
-    return "-".join(parts)
+        detail.append(f"{max_steps}s")
+    detail.append(datetime.now().strftime("%m%d_%H%M"))
+
+    return "-".join(head) + "_" + "_".join(detail)
 
 
 def build_wandb_tags(method_tag: str, args, *,
@@ -237,6 +247,9 @@ def build_wandb_tags(method_tag: str, args, *,
     lora targets, init/merge-lora flags, GPU count, and user extra tags.
     """
     tags = [method_tag]
+    task_name = getattr(args, "task_name", "")
+    if task_name:
+        tags.append(task_name)
     loss = getattr(args, "loss", None)
     if loss:
         tags.append(loss)
