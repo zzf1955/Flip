@@ -9,6 +9,12 @@
 - [023] FFN LoRA 训练：合并 identity LoRA + FFN 层重建
 
 **用户原始需求：**
+> 看一下当前恒等映射/FFN 外观补全的训练代码，其中 eval 没有输出 GT 和 Control，加上
+
+**创建的任务：**
+- [025] eval 输出 GT 和 Control 视频（latent fallback）
+
+**用户原始需求：**
 > 统一本地 log 目录和 W&B run name，保持一致，带日期、任务名、max step、lora rank、数据规模。规范 W&B tag 记录详细信息。尽可能不需要手动指定命名。
 
 **创建的任务：**
