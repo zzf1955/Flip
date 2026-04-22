@@ -79,6 +79,46 @@ DEFAULT_VAE = os.path.join(MANUAL_DIR, "Wan2.2_VAE.pth")
 DEFAULT_TOKENIZER = os.path.join(MANUAL_DIR, "google", "umt5-xxl")
 
 
+# ── LoRA merge ─────────────────────────────────────────────────────────
+
+def merge_lora_into_weights(model, lora_path: str, lora_rank: int,
+                            lora_alpha: int | None = None) -> int:
+    """Merge a pre-trained LoRA checkpoint into the model's base weights.
+
+    Computes delta = (lora_alpha / lora_rank) * lora_B @ lora_A for each
+    LoRA pair and adds it to the corresponding base Linear weight in-place.
+    Returns the number of merged LoRA pairs.
+    """
+    if lora_alpha is None:
+        lora_alpha = lora_rank
+    scaling = lora_alpha / lora_rank
+
+    from safetensors.torch import load_file
+    device_str = str(next(model.parameters()).device)
+    sd = load_file(lora_path, device=device_str)
+
+    if any(".module." in k for k in sd):
+        sd = {k.replace(".module.", ".", 1): v for k, v in sd.items()}
+
+    base_params = dict(model.named_parameters())
+    merged = 0
+    for key in sd:
+        if "lora_A" not in key:
+            continue
+        base_key = key.replace(".lora_A.default.weight", ".weight")
+        lora_B_key = key.replace("lora_A", "lora_B")
+        assert base_key in base_params, \
+            f"Cannot find base param {base_key} for LoRA key {key}"
+        assert lora_B_key in sd, \
+            f"Missing lora_B for {key}"
+        lora_A = sd[key]
+        lora_B = sd[lora_B_key]
+        delta = (lora_B @ lora_A) * scaling
+        base_params[base_key].data.add_(delta.to(base_params[base_key].dtype))
+        merged += 1
+    return merged
+
+
 # ── Model ──────────────────────────────────────────────────────────────
 
 def build_pipe(device: str, dit_dir: str, vae_path: str,
@@ -113,11 +153,20 @@ class MittyTrainingModule(DiffusionTrainingModule):
         load_vae: bool = True,
         init_lora_path: str = "",
         skip_dit_load: bool = False,
+        merge_lora_path: str = "",
+        merge_lora_rank: int = 96,
     ):
         super().__init__()
         self.pipe = build_pipe(device, dit_dir, vae_path, tokenizer_dir,
                                load_vae=load_vae, skip_dit_load=skip_dit_load)
         self.pipe.scheduler.set_timesteps(1000, training=True)
+
+        # Merge pre-trained LoRA into base weights before freeze + new LoRA
+        if merge_lora_path:
+            self._merge_n = merge_lora_into_weights(
+                self.pipe.dit, merge_lora_path, merge_lora_rank)
+        else:
+            self._merge_n = 0
 
         # Freeze everything
         for name, module in self.pipe.named_children():
@@ -433,8 +482,13 @@ def train(args):
         use_gradient_checkpointing=True,
         load_vae=load_vae,
         init_lora_path=args.init_lora,
+        merge_lora_path=args.merge_lora,
+        merge_lora_rank=args.merge_lora_rank,
     )
     info(f"Model loaded in {time.time() - t0:.1f}s (load_vae={load_vae})")
+    if model._merge_n:
+        info(f"Merged {model._merge_n} LoRA pairs into base weights"
+             f" from {args.merge_lora}")
     if model._init_lora_n:
         info(f"Loaded {model._init_lora_n} LoRA tensors from {args.init_lora}")
 
@@ -669,6 +723,11 @@ def main():
     ap.add_argument("--lora-target-modules", default="q,k,v,o")
     ap.add_argument("--init-lora", default="",
                     help="path to .safetensors LoRA checkpoint to initialize from")
+    ap.add_argument("--merge-lora", default="",
+                    help="path to LoRA checkpoint to merge into base weights "
+                         "before training (e.g. identity LoRA from stage 1)")
+    ap.add_argument("--merge-lora-rank", type=int, default=96,
+                    help="rank of the LoRA to merge (for alpha/rank scaling)")
 
     # Training
     ap.add_argument("--lr", type=float, default=1e-4)
@@ -714,7 +773,7 @@ def main():
 
     # Resolve relative paths
     for attr in ("cache_train", "cache_eval", "cache_ood", "patch_dir", "output_dir",
-                 "init_lora"):
+                 "init_lora", "merge_lora"):
         val = getattr(args, attr)
         if val and not os.path.isabs(val):
             setattr(args, attr, os.path.join(MAIN_ROOT, val))
