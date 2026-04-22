@@ -384,8 +384,8 @@ def _process_segment(seg_key: str, pairs: list[dict],
     if mask_source == "sam2":
         npz_path = os.path.join(
             sam2_mask_root, task, ref["episode"], f"{ref['seg']}.npz")
-        assert os.path.isfile(npz_path), \
-            f"SAM2 mask not found: {npz_path}"
+        if not os.path.isfile(npz_path):
+            return 0, len(pairs)
         precomputed_masks = np.load(npz_path)["masks"]
     else:
         hand_type = get_hand_type(f"G1_WBT_{task}")
@@ -441,6 +441,8 @@ def main():
     ap.add_argument("--sam2-mask-root",
                     default=os.path.join(_MAIN_TRAINING_DATA, "sam2_mask"),
                     help="root dir for precomputed SAM2 masks")
+    ap.add_argument("--pair-subdir", default="1s_patch",
+                    help="output subdirectory under training_data/pair/")
     ap.add_argument("--resume", action="store_true",
                     help="skip pairs whose outputs already exist")
     ap.add_argument("--clean", action="store_true",
@@ -456,7 +458,7 @@ def main():
     else:
         tasks = [t.strip() for t in args.task.split(",")]
 
-    sec_dir = os.path.join(_PAIR_DIR, "1s_patch")
+    sec_dir = os.path.join(_PAIR_DIR, args.pair_subdir)
     if args.clean and os.path.isdir(sec_dir):
         shutil.rmtree(sec_dir)
 
