@@ -1,11 +1,16 @@
 """Multi-GPU launcher for sam2_precompute.py.
 
-Spawns one sam2_precompute subprocess per GPU, each handling a shard of
-the full segment list. All subprocesses run in parallel.
+Spawns N workers across M GPUs, each handling a shard of the full segment
+list. Multiple workers can share a GPU (SAM2 tiny uses ~1.8GB, 4090 has 24GB).
 
 Usage:
+  # 1 worker per GPU (4 total)
   python -m src.pipeline.batch_sam2_precompute \
-      --gpus 0 1 2 3 --task all --sam2-model tiny --resume
+      --gpus 0 1 2 3 --task all --resume
+
+  # 2 workers per GPU (8 total)
+  python -m src.pipeline.batch_sam2_precompute \
+      --gpus 0 1 2 3 --workers-per-gpu 2 --task all --resume
 """
 
 import argparse
@@ -22,6 +27,8 @@ def main():
         description="Multi-GPU launcher for SAM2 mask precompute")
     ap.add_argument("--gpus", nargs="+", type=int, required=True,
                     help="GPU indices, e.g. 0 1 2 3")
+    ap.add_argument("--workers-per-gpu", type=int, default=1,
+                    help="number of parallel workers per GPU (default: 1)")
     ap.add_argument("--task", default="all",
                     help="task filter (passed to sam2_precompute)")
     ap.add_argument("--sam2-model", default="tiny",
@@ -33,7 +40,7 @@ def main():
     ap.add_argument("--max-segments", type=int, default=0)
     args = ap.parse_args()
 
-    num_shards = len(args.gpus)
+    num_shards = len(args.gpus) * args.workers_per_gpu
     log_dir = os.path.join(
         args.output or os.path.join(BASE_DIR, "training_data", "sam2_mask"),
         "_logs")
@@ -45,42 +52,46 @@ def main():
     env.setdefault("no_proxy", "localhost,127.0.0.1")
 
     procs = []
-    for shard_idx, gpu in enumerate(args.gpus):
-        cmd = [
-            sys.executable, "-m", "src.pipeline.sam2_precompute",
-            "--task", args.task,
-            "--sam2-model", args.sam2_model,
-            "--prompt-interval", str(args.prompt_interval),
-            "--device", "cuda:0",
-            "--shard-index", str(shard_idx),
-            "--num-shards", str(num_shards),
-        ]
-        if args.output:
-            cmd += ["--output", args.output]
-        if args.resume:
-            cmd += ["--resume"]
-        if args.max_segments > 0:
-            cmd += ["--max-segments", str(args.max_segments)]
+    shard_idx = 0
+    for gpu in args.gpus:
+        for w in range(args.workers_per_gpu):
+            cmd = [
+                sys.executable, "-m", "src.pipeline.sam2_precompute",
+                "--task", args.task,
+                "--sam2-model", args.sam2_model,
+                "--prompt-interval", str(args.prompt_interval),
+                "--device", "cuda:0",
+                "--shard-index", str(shard_idx),
+                "--num-shards", str(num_shards),
+            ]
+            if args.output:
+                cmd += ["--output", args.output]
+            if args.resume:
+                cmd += ["--resume"]
+            if args.max_segments > 0:
+                cmd += ["--max-segments", str(args.max_segments)]
 
-        sub_env = dict(env)
-        sub_env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+            sub_env = dict(env)
+            sub_env["CUDA_VISIBLE_DEVICES"] = str(gpu)
 
-        log_path = os.path.join(log_dir, f"gpu{gpu}.log")
-        log_fh = open(log_path, "w")
-        log_fh.write(f"$ CUDA_VISIBLE_DEVICES={gpu} {' '.join(cmd)}\n\n")
-        log_fh.flush()
+            log_path = os.path.join(log_dir, f"shard{shard_idx}_gpu{gpu}.log")
+            log_fh = open(log_path, "w")
+            log_fh.write(f"$ CUDA_VISIBLE_DEVICES={gpu} {' '.join(cmd)}\n\n")
+            log_fh.flush()
 
-        proc = subprocess.Popen(
-            cmd, stdout=log_fh, stderr=subprocess.STDOUT,
-            env=sub_env, cwd=BASE_DIR)
-        procs.append({
-            "proc": proc, "gpu": gpu, "shard": shard_idx,
-            "log_path": log_path, "log_fh": log_fh, "t0": time.time(),
-        })
-        print(f"[launch] gpu={gpu} shard={shard_idx}/{num_shards} "
-              f"-> {log_path}", flush=True)
+            proc = subprocess.Popen(
+                cmd, stdout=log_fh, stderr=subprocess.STDOUT,
+                env=sub_env, cwd=BASE_DIR)
+            procs.append({
+                "proc": proc, "gpu": gpu, "shard": shard_idx,
+                "log_path": log_path, "log_fh": log_fh, "t0": time.time(),
+            })
+            print(f"[launch] gpu={gpu} shard={shard_idx}/{num_shards} "
+                  f"-> {log_path}", flush=True)
+            shard_idx += 1
 
-    print(f"\n{num_shards} workers running. Waiting...\n")
+    print(f"\n{num_shards} workers on {len(args.gpus)} GPUs "
+          f"({args.workers_per_gpu}/gpu). Waiting...\n")
 
     while procs:
         time.sleep(5)
