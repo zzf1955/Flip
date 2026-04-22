@@ -445,14 +445,19 @@ def main():
         by_task: dict[str, list[dict]] = {}
         for s in all_segs:
             by_task.setdefault(s["task"], []).append(s)
+        n_tasks = len(by_task)
+        per_task = args.max_segments // n_tasks
+        remainder = args.max_segments % n_tasks
         sampled = []
-        for task in sorted(by_task.keys()):
+        for i, task in enumerate(sorted(by_task.keys())):
             segs = by_task[task]
+            quota = per_task + (1 if i < remainder else 0)
             rng = random.Random(f"{args.seed}:sample:{task}")
             rng.shuffle(segs)
-            sampled.extend(segs[:args.max_segments])
+            sampled.extend(segs[:quota])
         all_segs = sampled
-        print(f"  sampled → {len(all_segs)} segments")
+        print(f"  sampled → {len(all_segs)} segments "
+              f"({per_task}+{remainder} per task)")
 
     all_pairs = make_pairs(all_segs)
     if not all_pairs:
