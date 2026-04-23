@@ -91,35 +91,44 @@ from src.pipeline.train_mitty import (
 def eval_loss(model, files: list[str], device: str,
               num_t_samples: int = 5, seed_base: int = 12345,
               patch_dir: str = "",
-              t5_pos: dict = None, t5_neg: torch.Tensor = None) -> float:
+              t5_pos: dict = None, t5_neg: torch.Tensor = None,
+              rank: int = 0, world_size: int = 1) -> float:
     """Eval MSE loss averaged over every file × ``num_t_samples`` timesteps.
 
-    The loss function inside the training module samples one random timestep
-    per call, so a single eval pass on 5-8 samples has high variance. We call
-    it ``num_t_samples`` times per sample with deterministic seeds so the
-    metric is both low-variance and reproducible across checkpoints.
-
-    RNG state is saved and restored so this does not perturb training.
+    When ``world_size > 1``, files are sharded across ranks and the result is
+    all-reduced.  RNG seeds use the **global** file index so the result is
+    identical regardless of world_size.
     """
     torch_state = torch.get_rng_state()
     cuda_state = (torch.cuda.get_rng_state(device)
                   if torch.cuda.is_available() else None)
     try:
-        losses = []
-        for i, f in enumerate(files):
+        my_indices = list(range(rank, len(files), world_size))
+        loss_sum = 0.0
+        count = len(my_indices)
+        for gi in my_indices:
+            f = files[gi]
             s = load_sample(f, device=device,
                             t5_pos=t5_pos, t5_neg=t5_neg)
             if patch_dir:
                 _load_patch_weights(s, f, patch_dir, device=device)
             s = prepare_sample(s, device)
-            sub = []
+            sub = 0.0
             for k in range(num_t_samples):
-                torch.manual_seed(seed_base + i * num_t_samples + k)
+                seed = seed_base + gi * num_t_samples + k
+                torch.manual_seed(seed)
                 if torch.cuda.is_available():
-                    torch.cuda.manual_seed_all(seed_base + i * num_t_samples + k)
-                sub.append(model(s).item())
-            losses.append(sum(sub) / num_t_samples)
-        return sum(losses) / max(1, len(losses))
+                    torch.cuda.manual_seed_all(seed)
+                sub += model(s).item()
+            loss_sum += sub / num_t_samples
+
+        if world_size > 1:
+            t_sum = torch.tensor(loss_sum, device=device)
+            t_cnt = torch.tensor(count, device=device)
+            dist.all_reduce(t_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(t_cnt, op=dist.ReduceOp.SUM)
+            return t_sum.item() / max(1, t_cnt.item())
+        return loss_sum / max(1, count)
     finally:
         torch.set_rng_state(torch_state)
         if cuda_state is not None:
@@ -140,8 +149,14 @@ def generate_eval_videos(
     log=None,
     t5_pos: dict = None,
     t5_neg: torch.Tensor = None,
+    rank: int = 0,
+    world_size: int = 1,
 ):
-    """Shared eval-video shell: backbone supplies the inner denoise loop."""
+    """Shared eval-video shell: backbone supplies the inner denoise loop.
+
+    When ``world_size > 1``, samples are sharded across ranks. File indices
+    are global so all output files land in the same ``step_dir``.
+    """
     pipe = model.pipe
     vae = getattr(pipe, "vae", None)
     if vae is None:
@@ -160,7 +175,8 @@ def generate_eval_videos(
     pipe.dit.eval()
 
     n = min(num_samples, len(files))
-    for idx in range(n):
+    my_indices = list(range(rank, n, world_size))
+    for idx in my_indices:
         t0 = time.time()
         s = load_sample(files[idx], device=device,
                         t5_pos=t5_pos, t5_neg=t5_neg)
@@ -296,7 +312,7 @@ def train(args, spec: BackboneSpec):
 
     info_all("Loading model...")
     t0 = time.time()
-    load_vae = is_main and args.eval_video_steps > 0
+    load_vae = args.eval_video_steps > 0
     skip_dit = world_size > 1 and rank != 0
     info_all(f"skip_dit={skip_dit}, load_vae={load_vae}, device={args.device}")
     extra_kwargs = {}
@@ -451,30 +467,34 @@ def train(args, spec: BackboneSpec):
             info(f"  SAVE {p} ({n} tensors)")
             row_fields["save_ckpt"] = p.name
 
-        if hit_eval and is_main:
+        if hit_eval:
             eval_payload = {}
             if eval_files:
                 el = eval_loss(model, eval_files, args.device,
                                num_t_samples=args.eval_t_samples,
                                patch_dir=patch_dir_eval,
-                               t5_pos=t5_pos, t5_neg=t5_neg)
-                info(f"  EVAL eval_loss_in_task={el:.4f} "
-                     f"({len(eval_files)} samples × {args.eval_t_samples} t)")
-                row_fields["eval_loss_in_task"] = f"{el:.4f}"
-                eval_payload["train/eval_loss_in_task"] = el
+                               t5_pos=t5_pos, t5_neg=t5_neg,
+                               rank=rank, world_size=world_size)
+                if is_main:
+                    info(f"  EVAL eval_loss_in_task={el:.4f} "
+                         f"({len(eval_files)} samples × {args.eval_t_samples} t)")
+                    row_fields["eval_loss_in_task"] = f"{el:.4f}"
+                    eval_payload["train/eval_loss_in_task"] = el
             if ood_files:
                 ol = eval_loss(model, ood_files, args.device,
                                num_t_samples=args.eval_t_samples,
                                patch_dir=patch_dir_ood,
-                               t5_pos=t5_pos, t5_neg=t5_neg)
-                info(f"  EVAL eval_loss_ood={ol:.4f} "
-                     f"({len(ood_files)} samples × {args.eval_t_samples} t)")
-                row_fields["eval_loss_ood"] = f"{ol:.4f}"
-                eval_payload["train/eval_loss_ood"] = ol
-            if eval_payload:
+                               t5_pos=t5_pos, t5_neg=t5_neg,
+                               rank=rank, world_size=world_size)
+                if is_main:
+                    info(f"  EVAL eval_loss_ood={ol:.4f} "
+                         f"({len(ood_files)} samples × {args.eval_t_samples} t)")
+                    row_fields["eval_loss_ood"] = f"{ol:.4f}"
+                    eval_payload["train/eval_loss_ood"] = ol
+            if is_main and eval_payload:
                 wb.log(eval_payload, step=step)
 
-        if hit_eval_video and is_main:
+        if hit_eval_video:
             n_in = (args.eval_video_samples_in_task
                     if args.eval_video_samples_in_task > 0
                     else len(eval_files))
@@ -490,12 +510,8 @@ def train(args, spec: BackboneSpec):
                     num_inference_steps=args.num_inference_steps,
                     log=log,
                     t5_pos=t5_pos, t5_neg=t5_neg,
+                    rank=rank, world_size=world_size,
                 )
-                if args.wandb_log_videos:
-                    log_step_eval_videos(
-                        wb, str(eval_dir / "in_task" / f"step-{step:04d}"),
-                        step, split_tag="in_task",
-                    )
             if ood_files:
                 generate_eval_videos(
                     spec, model, ood_files,
@@ -505,18 +521,24 @@ def train(args, spec: BackboneSpec):
                     num_inference_steps=args.num_inference_steps,
                     log=log,
                     t5_pos=t5_pos, t5_neg=t5_neg,
+                    rank=rank, world_size=world_size,
                 )
-                if args.wandb_log_videos:
+            if world_size > 1:
+                dist.barrier()
+            if is_main:
+                if eval_files and args.wandb_log_videos:
+                    log_step_eval_videos(
+                        wb, str(eval_dir / "in_task" / f"step-{step:04d}"),
+                        step, split_tag="in_task",
+                    )
+                if ood_files and args.wandb_log_videos:
                     log_step_eval_videos(
                         wb, str(eval_dir / "ood" / f"step-{step:04d}"),
                         step, split_tag="ood",
                     )
-            row_fields["eval_video"] = f"step-{step:04d}"
+                row_fields["eval_video"] = f"step-{step:04d}"
 
         write_csv_row(**row_fields)
-
-        if world_size > 1 and (hit_eval or hit_eval_video):
-            dist.barrier()
 
     prefetch_ex.shutdown(wait=False)
 
