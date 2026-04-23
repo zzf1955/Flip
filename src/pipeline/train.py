@@ -316,8 +316,8 @@ def train(args, spec: BackboneSpec):
     skip_dit = world_size > 1 and rank != 0
     info_all(f"skip_dit={skip_dit}, load_vae={load_vae}, device={args.device}")
     extra_kwargs = {}
-    if getattr(args, "merge_lora", ""):
-        extra_kwargs["merge_lora_path"] = args.merge_lora
+    if args.merge_lora:
+        extra_kwargs["merge_lora_paths"] = args.merge_lora
         extra_kwargs["merge_lora_rank"] = args.merge_lora_rank
     model = spec.training_module_factory(
         device=args.device,
@@ -333,7 +333,7 @@ def train(args, spec: BackboneSpec):
              f" in {time.time() - t0:.1f}s")
     if getattr(model, "_merge_n", 0):
         info(f"Merged {model._merge_n} LoRA pairs into base weights"
-             f" from {args.merge_lora}")
+             f" from {len(args.merge_lora)} checkpoint(s)")
     if getattr(model, "_init_lora_n", 0):
         info(f"Loaded {model._init_lora_n} LoRA tensors from {args.init_lora}")
 
@@ -601,11 +601,11 @@ def main():
     ap.add_argument("--lora-target-modules", default="q,k,v,o")
     ap.add_argument("--init-lora", default="",
                     help="path to .safetensors LoRA checkpoint to initialize from")
-    ap.add_argument("--merge-lora", default="",
-                    help="path to LoRA checkpoint to merge into base weights "
-                         "before training (e.g. identity LoRA from stage 1)")
+    ap.add_argument("--merge-lora", action="append", default=None,
+                    help="LoRA checkpoint to merge into base weights "
+                         "(can be specified multiple times)")
     ap.add_argument("--merge-lora-rank", type=int, default=96,
-                    help="rank of the LoRA to merge (for alpha/rank scaling)")
+                    help="rank of the LoRA(s) to merge (for alpha/rank scaling)")
 
     # Training
     ap.add_argument("--lr", type=float, default=1e-4)
@@ -656,10 +656,15 @@ def main():
 
     # Resolve relative paths against MAIN_ROOT (worktree-safe; see CLAUDE.md)
     for attr in ("cache_train", "cache_eval", "cache_ood", "t5_cache_dir",
-                 "patch_dir", "output_dir", "init_lora", "merge_lora"):
+                 "patch_dir", "output_dir", "init_lora"):
         val = getattr(args, attr)
         if val and not os.path.isabs(val):
             setattr(args, attr, os.path.join(MAIN_ROOT, val))
+    if args.merge_lora:
+        args.merge_lora = [
+            os.path.join(MAIN_ROOT, p) if not os.path.isabs(p) else p
+            for p in args.merge_lora
+        ]
 
     spec = get_backbone(args.backbone)
     train(args, spec)

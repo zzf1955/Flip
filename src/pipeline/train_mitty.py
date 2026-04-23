@@ -154,7 +154,7 @@ class MittyTrainingModule(DiffusionTrainingModule):
         load_vae: bool = True,
         init_lora_path: str = "",
         skip_dit_load: bool = False,
-        merge_lora_path: str = "",
+        merge_lora_paths: list[str] | None = None,
         merge_lora_rank: int = 96,
     ):
         super().__init__()
@@ -162,12 +162,11 @@ class MittyTrainingModule(DiffusionTrainingModule):
                                load_vae=load_vae, skip_dit_load=skip_dit_load)
         self.pipe.scheduler.set_timesteps(1000, training=True)
 
-        # Merge pre-trained LoRA into base weights before freeze + new LoRA
-        if merge_lora_path:
-            self._merge_n = merge_lora_into_weights(
-                self.pipe.dit, merge_lora_path, merge_lora_rank)
-        else:
-            self._merge_n = 0
+        # Merge pre-trained LoRA(s) into base weights before freeze + new LoRA
+        self._merge_n = 0
+        for p in (merge_lora_paths or []):
+            self._merge_n += merge_lora_into_weights(
+                self.pipe.dit, p, merge_lora_rank)
 
         # Freeze everything
         for name, module in self.pipe.named_children():
@@ -502,13 +501,13 @@ def train(args):
         use_gradient_checkpointing=True,
         load_vae=load_vae,
         init_lora_path=args.init_lora,
-        merge_lora_path=args.merge_lora,
+        merge_lora_paths=args.merge_lora,
         merge_lora_rank=args.merge_lora_rank,
     )
     info(f"Model loaded in {time.time() - t0:.1f}s (load_vae={load_vae})")
     if model._merge_n:
         info(f"Merged {model._merge_n} LoRA pairs into base weights"
-             f" from {args.merge_lora}")
+             f" from {len(args.merge_lora)} checkpoint(s)")
     if model._init_lora_n:
         info(f"Loaded {model._init_lora_n} LoRA tensors from {args.init_lora}")
 
@@ -754,11 +753,11 @@ def main():
     ap.add_argument("--lora-target-modules", default="q,k,v,o")
     ap.add_argument("--init-lora", default="",
                     help="path to .safetensors LoRA checkpoint to initialize from")
-    ap.add_argument("--merge-lora", default="",
-                    help="path to LoRA checkpoint to merge into base weights "
-                         "before training (e.g. identity LoRA from stage 1)")
+    ap.add_argument("--merge-lora", action="append", default=None,
+                    help="LoRA checkpoint to merge into base weights "
+                         "(can be specified multiple times)")
     ap.add_argument("--merge-lora-rank", type=int, default=96,
-                    help="rank of the LoRA to merge (for alpha/rank scaling)")
+                    help="rank of the LoRA(s) to merge (for alpha/rank scaling)")
 
     # Training
     ap.add_argument("--lr", type=float, default=1e-4)
@@ -804,10 +803,15 @@ def main():
 
     # Resolve relative paths
     for attr in ("cache_train", "cache_eval", "cache_ood", "t5_cache_dir",
-                 "patch_dir", "output_dir", "init_lora", "merge_lora"):
+                 "patch_dir", "output_dir", "init_lora"):
         val = getattr(args, attr)
         if val and not os.path.isabs(val):
             setattr(args, attr, os.path.join(MAIN_ROOT, val))
+    if args.merge_lora:
+        args.merge_lora = [
+            os.path.join(MAIN_ROOT, p) if not os.path.isabs(p) else p
+            for p in args.merge_lora
+        ]
 
     train(args)
 
