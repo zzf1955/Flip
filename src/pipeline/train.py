@@ -52,6 +52,7 @@ import torch.distributed as dist
 from diffsynth.diffusion.flow_match import FlowMatchScheduler
 
 from src.core.config import MAIN_ROOT, T5_CACHE_DIR, TRAINING_DATA_ROOT
+from src.core.eval_metrics import OnlineMetrics
 from src.core.train_utils import (
     CsvLogger,
     WandbLogger,
@@ -253,6 +254,10 @@ def train(args, spec: BackboneSpec):
     csv_headers = [
         "step", "train_loss", "lr", "time_s",
         "eval_loss_in_task", "eval_loss_ood",
+        "eval_psnr_in_task", "eval_ssim_in_task",
+        "eval_lpips_in_task", "eval_clip_in_task",
+        "eval_psnr_ood", "eval_ssim_ood",
+        "eval_lpips_ood", "eval_clip_ood",
         "save_ckpt", "eval_video",
     ]
     csv_logger = CsvLogger(str(run_dir / "train.csv"),
@@ -385,6 +390,8 @@ def train(args, spec: BackboneSpec):
         )
     else:
         lr_scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0)
+
+    online_metrics = OnlineMetrics(args.device) if is_main else None
 
     info(f"Plan: {len(train_files)} train files, {total_steps} steps,"
          f" effective_bs={effective_bs}")
@@ -537,6 +544,27 @@ def train(args, spec: BackboneSpec):
                         step, split_tag="ood",
                     )
                 row_fields["eval_video"] = f"step-{step:04d}"
+
+                metrics_payload = {}
+                for split_name, has_files in [
+                    ("in_task", bool(eval_files)),
+                    ("ood", bool(ood_files)),
+                ]:
+                    if not has_files:
+                        continue
+                    sd = str(eval_dir / split_name / f"step-{step:04d}")
+                    m = online_metrics.compute_step(sd)
+                    if not m:
+                        continue
+                    for k, v in m.items():
+                        csv_key = f"eval_{k}_{split_name}"
+                        row_fields[csv_key] = f"{v:.4f}"
+                        metrics_payload[f"eval/{k}_{split_name}"] = v
+                    info(f"  METRICS [{split_name}] "
+                         f"PSNR={m['psnr']:.2f} SSIM={m['ssim']:.4f} "
+                         f"LPIPS={m['lpips']:.4f} CLIP={m['clip_score']:.4f}")
+                if metrics_payload:
+                    wb.log(metrics_payload, step=step)
 
         write_csv_row(**row_fields)
 
