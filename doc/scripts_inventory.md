@@ -4,7 +4,7 @@
 
 ```
 src/
-├── core/          8 个基础库模块（不可直接运行）
+├── core/          9 个基础库模块（不可直接运行）
 ├── pipeline/     18 个可执行 pipeline 入口
 └── tools/        17 个实验/调试/可视化工具
 ```
@@ -26,6 +26,7 @@ render.py          ← camera
 mask.py            ← (独立)
 smplh.py           ← config, torch, pinocchio
 retarget.py        ← config, smplh, fk
+eval_metrics.py    ← torch, skimage, transformers (CLIP)
 ```
 
 ### 模块说明
@@ -40,6 +41,7 @@ retarget.py        ← config, smplh, fk
 | `mask.py` | mask 后处理 + LaMa | `postprocess_mask()`, `init_lama()`, `run_lama()` |
 | `smplh.py` | SMPLH 模型 + IK 求解器 | `SMPLHForIK`, `IKSolver` |
 | `retarget.py` | G1→SMPLH retarget | `retarget_frame()`, `refine_arms()` |
+| `eval_metrics.py` | 训练在线评估指标 (PSNR/SSIM/LPIPS/CLIP Score) | `OnlineMetrics` |
 
 ---
 

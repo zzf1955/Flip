@@ -88,7 +88,8 @@ src/
 │   ├── render.py            # mask/overlay/Lambertian 渲染
 │   ├── mask.py              # mask 后处理 + LaMa/GrabCut
 │   ├── smplh.py             # SMPLH 模型 + IK 求解器
-│   └── retarget.py          # G1→SMPLH retarget 算法
+│   ├── retarget.py          # G1→SMPLH retarget 算法
+│   └── eval_metrics.py      # 训练在线评估指标 (PSNR/SSIM/LPIPS/CLIP Score)
 │
 ├── pipeline/                # 可执行主 pipeline
 │   ├── sam2_inpaint.py      # FK → SAM2 → LaMa/ProPainter（主入口）
@@ -226,6 +227,8 @@ data/
 
 **注意**：`videos_16fps/` 目录的降采样视频与 parquet state 的帧对应关系**全是错的**，所有脚本仅使用原始 30fps 视频。
 
+**注意**：当前**只使用 Inspire 手**的数据。不使用 Brainco 的数据。
+
 ## 相机模型
 
 使用 pinhole 模型（畸变已确认可忽略，k1-k4=0）。头部相机为外置 UVC 双目 RGB（非 D435i），125° FOV。
@@ -336,13 +339,3 @@ python -m src.tools.retarget_diag --episode 0 --frame 30 \
 详见 [`doc/step_5_training_infra.md`](doc/step_5_training_infra.md)（DDP / GPU 直接加载 / 数据 cache / 训练命令 / 目录结构）。
 
 训练时，统一使用 step 作为数据统计口径，**不使用 epoch 作为统计单位**
-
-现在要进一步训练。微调模型的任务需要分为三部分，一部分是恒等映射，一部分是目标外观记忆，一部分是目标外观替换。
-
-目前的训练是双阶段的，第一阶段是在大规模视频上学习恒等映射和目标的外观。这部分是直接重建目标。
-第二阶段是在少量样本上进行微调，学习 Human2Robot 的外观替换。
-目前的做法是 LoRA 微调，但是我怀疑LoRA 的容量无法记住机器人的细节，所以我想放开一些层来微调。
-
-思路是，先做全量微调的预实验，一个做替换任务，一个做恒等映射任务。然后算各个层的梯度方向夹角，或者计算微调相同 step 之后，层权重的距离。这样得到哪些层是学习了外观部分。
-
-得到外观层之后，仅开放外观层，进行某些层的微调，让这些层记住外观。
