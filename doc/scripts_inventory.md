@@ -105,6 +105,17 @@ LD_PRELOAD=/home/leadtek/miniconda3/envs/flip/lib/libjpeg.so.8 \
   python -m src.pipeline.<script_name> [args]
 ```
 
+GPU / CUDA 命令优先走统一入口，便于 Codex 按子命令保存越权批准规则：
+
+```bash
+scripts/flip_run.sh mitty_cache --cuda 0 -- <mitty_cache args>
+scripts/flip_run.sh sam2_precompute --cuda 0 -- <sam2_precompute args>
+scripts/flip_run.sh train_mitty --cuda 2,3 --nproc 2 -- <train_mitty args>
+scripts/flip_run.sh nvidia-smi
+```
+
+当前 Codex 可使用 `danger-full-access` 直接访问 GPU；`scripts/flip_run.sh` 仍作为统一环境与白名单入口保留。Bash 高危命令由 `scripts/codex_pre_tool_use_guard.py` 通过 Codex `PreToolUse` hook 做最佳努力拦截。
+
 ---
 
 ## 三、tools/ — 实验/调试工具
