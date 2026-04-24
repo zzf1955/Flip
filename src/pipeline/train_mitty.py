@@ -38,6 +38,7 @@ from diffsynth.diffusion.flow_match import FlowMatchScheduler
 from diffsynth.diffusion.training_module import DiffusionTrainingModule
 
 from src.core.config import MAIN_ROOT, T5_CACHE_DIR, TRAINING_DATA_ROOT
+from src.core.eval_metrics import OnlineMetrics
 from src.core.wan_loader import (
     SimplePipe,
     build_dit_shard_list,
@@ -439,6 +440,10 @@ def train(args):
     csv_headers = [
         "step", "train_loss", "lr", "time_s",
         "eval_loss_in_task", "eval_loss_ood",
+        "eval_psnr_in_task", "eval_ssim_in_task",
+        "eval_lpips_in_task", "eval_clip_in_task",
+        "eval_psnr_ood", "eval_ssim_ood",
+        "eval_lpips_ood", "eval_clip_ood",
         "save_ckpt", "eval_video",
     ]
     csv_logger = CsvLogger(str(run_dir / "train.csv"),
@@ -549,6 +554,9 @@ def train(args):
         )
     else:
         lr_scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0)
+
+    online_metrics = (OnlineMetrics(args.device)
+                      if is_main and args.eval_video_metrics else None)
 
     info(f"Plan: {total_steps} steps, {len(train_files)} train files, cycling infinitely")
     info(f"DDP: world_size={world_size}, batch_size={args.batch_size},"
@@ -695,6 +703,28 @@ def train(args):
                     )
             row_fields["eval_video"] = f"step-{step:04d}"
 
+            if online_metrics is not None:
+                metrics_payload = {}
+                for split_name, has_files in [
+                    ("in_task", bool(eval_files)),
+                    ("ood", bool(ood_files)),
+                ]:
+                    if not has_files:
+                        continue
+                    sd = str(eval_dir / split_name / f"step-{step:04d}")
+                    m = online_metrics.compute_step(sd)
+                    if not m:
+                        continue
+                    for k, v in m.items():
+                        metric_name = "clip" if k == "clip_score" else k
+                        row_fields[f"eval_{metric_name}_{split_name}"] = f"{v:.4f}"
+                        metrics_payload[f"eval/{metric_name}_{split_name}"] = v
+                    info(f"  METRICS [{split_name}] "
+                         f"PSNR={m['psnr']:.2f} SSIM={m['ssim']:.4f} "
+                         f"LPIPS={m['lpips']:.4f} CLIP={m['clip_score']:.4f}")
+                if metrics_payload:
+                    wb.log(metrics_payload, step=step)
+
         write_csv_row(**row_fields)
 
         if world_size > 1 and (hit_eval or hit_eval_video):
@@ -784,6 +814,9 @@ def main():
                     help="N in-task eval videos per trigger (-1 = all)")
     ap.add_argument("--eval-video-samples-ood", type=int, default=2,
                     help="N OOD eval videos per trigger (-1 = all)")
+    ap.add_argument("--eval-video-metrics", action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help="compute PSNR/SSIM/LPIPS/CLIP after eval video generation")
     ap.add_argument("--max-eval-files", type=int, default=0,
                     help="cap eval file count (0=no cap)")
     ap.add_argument("--num-inference-steps", type=int, default=30)
