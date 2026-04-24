@@ -21,7 +21,7 @@ sys.stdout.reconfigure(line_buffering=True)
 
 import pandas as pd
 
-from src.core.config import (G1_URDF, MESH_DIR, SKIP_MESHES, DATASET_ROOT, OUTPUT_DIR,
+from src.core.config import (G1_URDF, MESH_DIR, SKIP_MESHES, DATASET_ROOT, TMP_DIR,
                      get_hand_type, get_skip_meshes, CAMERA_MODEL, BEST_PARAMS)
 from src.core.camera import get_model
 from src.core.fk import build_q, do_fk, parse_urdf_meshes, preload_meshes
@@ -47,7 +47,7 @@ def main():
     parser.add_argument("--duration", type=int, default=5, help="Seconds per clip")
     args = parser.parse_args()
 
-    out_dir = os.path.join(OUTPUT_DIR, "tmp", "overlay_check")
+    out_dir = os.path.join(TMP_DIR, "overlay_check")
     os.makedirs(out_dir, exist_ok=True)
 
     # ── Use config BEST_PARAMS ──

@@ -86,7 +86,7 @@ eval_metrics.py    ← torch, skimage, transformers (CLIP)
 
 | 脚本 | 功能 | 输入 | 输出 |
 |------|------|------|------|
-| `train_lora.py` | 自写 Wan 2.1 LoRA 训练（train/eval split + loss 日志 + eval 视频） | `output/data_cache_*/*.pth` | `training_data/log/<date>/` |
+| `train.py` | Mitty / Wan2.2 LoRA 正式训练入口 | `training_data/cache/vae/...` + `training_data/cache/t5` | `training_data/log/` 或 `tmp/` smoke |
 
 ### 人体重绘（Step 4 本地方案）
 
@@ -127,8 +127,8 @@ scripts/flip_run.sh nvidia-smi
 | `calibrate_mask.py` | PSO mask Dice 标定 | `output/calibration/mask_dice/` |
 | `calibrate_keypoints.py` | PSO/Adam 关键点标定 | `output/calibration/kp_optim/` |
 | `estimate_focal.py` | 焦距解析估计 | stdout |
-| `distortion_analysis.py` | 畸变分析 | `output/tmp/distortion/` |
-| `verify_extrinsics.py` | URDF 外参验证 | `output/tmp/urdf_verify/` |
+| `distortion_analysis.py` | 畸变分析 | `tmp/distortion/` |
+| `verify_extrinsics.py` | URDF 外参验证 | `tmp/urdf_verify/` |
 | `verify_mesh.py` | STL/URDF 尺寸验证 | stdout |
 
 ### 人体 retarget
@@ -144,11 +144,11 @@ scripts/flip_run.sh nvidia-smi
 
 | 脚本 | 功能 | 输出路径 |
 |------|------|----------|
-| `render_3view.py` | G1 三视图渲染 | `output/tmp/3view/` |
-| `render_overlay_check.py` | 多视频 overlay 泛化 | `output/tmp/overlay_check/` |
-| `render_lit_overlay.py` | Lambertian overlay | `output/tmp/lit_overlay/` |
-| `demo_mesh_scale.py` | mesh 缩放对比 | `output/tmp/mesh_scale/` |
-| `debug_keypoints.py` | 关键点可视化 | `output/tmp/kp_debug/` |
+| `render_3view.py` | G1 三视图渲染 | `tmp/3view/` |
+| `render_overlay_check.py` | 多视频 overlay 泛化 | `tmp/overlay_check/` |
+| `render_lit_overlay.py` | Lambertian overlay | `tmp/lit_overlay/` |
+| `demo_mesh_scale.py` | mesh 缩放对比 | `tmp/mesh_scale/` |
+| `debug_keypoints.py` | 关键点可视化 | `tmp/kp_debug/` |
 
 ### 工具
 
@@ -199,14 +199,15 @@ G1 第一人称视频 (LeRobot dataset, 30fps)
 │       ├── patch/pair_NNNN.pth        (latent mask + weights)
 │       └── metadata.csv
 │
-├─ [DiffSynth data_process]  (阶段 1: T5+CLIP+VAE embedding 缓存)
-│   → output/data_cache_80/0/*.pth  (80 样本, ~50MB/个, 共 3.9GB)
+├─ [mitty_cache.py]  (T5 + VAE cache)
+│   → training_data/cache/{t5,vae}/...
 │
-└─ [train_lora.py]  (阶段 2: 自写训练循环)
-    → training_data/log/YYYY-MM-DD_HHMMSS/
-        ├── ckpt/step-NNNN.safetensors  (LoRA 权重, ~147MB)
-        ├── eval/step-NNNN/             (gt + ctrl + gen 视频)
-        └── train.log                   (每步 loss + eval)
+└─ [train.py]  (Mitty / Wan2.2 LoRA 训练)
+    → training_data/log/<run-name>/
+        ├── ckpt/step-NNNN.safetensors
+        ├── eval/step-NNNN/
+        ├── train.csv
+        └── train.log
 ```
 
 ### 训练数据格式要求
@@ -227,7 +228,7 @@ G1 第一人称视频 (LeRobot dataset, 30fps)
 | Overlay (4s human) | 53 | 64 MB |
 | Seedance (1s human) | 80 | 15 MB |
 | Training pairs (1s) | 120 对 | 37 MB |
-| Cached embeddings | 80 | 3.9 GB |
+| Cached embeddings | 按 split 生成 | `training_data/cache/{t5,vae}/` |
 
 ---
 
@@ -242,9 +243,7 @@ output/                          # per-worktree 实验产物
 │   ├── cosmos_prepare/
 │   └── cosmos_regen/
 ├── segment_pipeline/            # 主 pipeline 中间产物
-├── data_cache_80/               # DiffSynth embedding 缓存
-├── lora_funcontrol_*/           # DiffSynth baseline 训练输出
-└── tmp/                         # 一次性验证
+└── human/                       # 人体重绘 / 中间可视化输出
 
 training_data/                   # per-worktree 训练数据
 ├── segment/                     # 4s robot segments
@@ -256,6 +255,10 @@ training_data/                   # per-worktree 训练数据
 │   ├── 1s/{video/, control_video/, metadata.csv}  (make_pair 输出)
 │   └── 1s_patch/{video/, control_video/, patch/, metadata.csv}  (robot_patch 输出)
 ├── compare/                     # 对比视频
-└── log/                         # train_lora.py 训练输出
-    └── YYYY-MM-DD_HHMMSS/{ckpt/, eval/, train.log}
+├── cache/{t5,vae}/              # Mitty / Wan2.2 训练 cache
+└── log/                         # train.py / train_mitty.py 训练输出
+    └── <run-name>/{ckpt/, eval/, train.csv, train.log}
+
+tmp/                             # smoke / 一次性验证，可删除
+└── <task>/...
 ```

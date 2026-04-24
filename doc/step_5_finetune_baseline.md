@@ -1,5 +1,7 @@
 # Wan 2.1 FunControl 14B LoRA 微调 Baseline
 
+> **归档说明（2026-04-24 / T032）**：FunControl baseline 已退出当前维护主线，`src.pipeline.train_lora` 已删除。本文仅作为历史记录保留，不要按本文命令启动新实验。当前训练入口见 [`step_5_training_infra.md`](step_5_training_infra.md)。
+
 ## 概述
 
 使用 DiffSynth-Studio 框架对 Wan 2.1 FunControl 14B 进行 LoRA 微调，实现 human→robot V2V 视频转换。
@@ -210,6 +212,8 @@ FP8↔BF16 转换 buffer:     ~2.5 GB   (forward 时临时类型转换)
 
 ## 自写训练脚本 (train_lora.py)
 
+> T032 后该脚本已删除；以下内容仅解释历史实现。
+
 DiffSynth baseline 的训练可观测性为零，因此自写了 `src/pipeline/train_lora.py`。
 
 ### 与 DiffSynth baseline 的关系
@@ -243,6 +247,8 @@ model({}, inputs=cached_data)
 | 多卡 | accelerate DDP | 单卡（不用 accelerate） |
 
 ### 用法
+
+> 以下命令已废弃，不能在当前代码中运行。
 
 ```bash
 # 阶段 1 仍然使用 DiffSynth（见上方「阶段 1」）

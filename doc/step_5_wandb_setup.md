@@ -90,7 +90,7 @@ LD_PRELOAD=/home/leadtek/miniconda3/envs/flip/lib/libjpeg.so.8 \
 
 ## 训练代码约定
 
-`src/core/train_utils.py:WandbLogger` 在 rank 0 调用 `wandb.init(project=...)`，其他 rank `project=None` 即禁用。`train_mitty.py` 和 `train_lora.py` 都经过这条路径。
+`src/core/train_utils.py:WandbLogger` 在 rank 0 调用 `wandb.init(project=...)`，其他 rank `project=None` 即禁用。当前维护的 `train.py` / `train_mitty.py` 都经过这条路径。
 
 ## 已知副作用
 
