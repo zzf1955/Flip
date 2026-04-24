@@ -14,7 +14,11 @@ Usage:
     python -m src.pipeline.mitty_cache \\
         --pair-dir training_data/pair/1s/train \\
         --output   training_data/cache/vae/pair_1s/train \\
-        --device   cuda:0
+        --device   cuda:0 \\
+        --batch-size 4 \\
+        --prefetch-workers 8 \\
+        --prefetch-batches 2 \\
+        --save-workers 1
 
     # T5 cache is written to --t5-cache-dir (default: training_data/cache/t5/)
     # and only encoded once per unique prompt.
@@ -33,6 +37,8 @@ import json
 import os
 import sys
 import time
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -70,6 +76,40 @@ def load_video_as_pil(path: str) -> list[Image.Image]:
     return frames
 
 
+def load_video_as_rgb_array(path: str) -> np.ndarray:
+    """Decode video to uint8 RGB array with shape (T, H, W, 3)."""
+    c = av.open(path)
+    frames = [f.to_ndarray(format="rgb24") for f in c.decode(video=0)]
+    c.close()
+    return np.stack(frames, axis=0)
+
+
+def parse_cpu_affinity(spec: str) -> set[int]:
+    """Parse Linux taskset-style CPU list, e.g. "0-17,72-89"."""
+    cpus: set[int] = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start, end = part.split("-", 1)
+            cpus.update(range(int(start), int(end) + 1))
+        else:
+            cpus.add(int(part))
+    if not cpus:
+        raise ValueError(f"Invalid --cpu-affinity: {spec!r}")
+    return cpus
+
+
+def apply_cpu_affinity(spec: str):
+    """Bind this process and subsequently-created worker threads."""
+    if not spec:
+        return
+    cpus = parse_cpu_affinity(spec)
+    os.sched_setaffinity(0, cpus)
+    print(f"CPU affinity: {spec} ({len(cpus)} CPUs)")
+
+
 def build_models(device: str, skip_t5: bool = False):
     """Load T5 + VAE directly to GPU (no DiffSynth pipeline)."""
     t5 = tokenizer = seq_len = None
@@ -91,6 +131,15 @@ def _preprocess_video(frames: list[Image.Image], device: str,
         t = t.permute(2, 0, 1)  # (C, H, W)
         tensors.append(t)
     return torch.stack(tensors, dim=1).unsqueeze(0)  # (1, C, T, H, W)
+
+
+def _preprocess_video_arrays(videos: list[np.ndarray], device: str,
+                             dtype=torch.bfloat16) -> torch.Tensor:
+    """uint8 RGB videos (T,H,W,C) → (B,C,T,H,W) in [-1,1] on GPU."""
+    arr = np.stack(videos, axis=0)
+    tensor = torch.from_numpy(arr).to(device=device, dtype=dtype)
+    tensor = tensor.permute(0, 4, 1, 2, 3).contiguous()
+    return tensor.mul_(2.0 / 255.0).sub_(1.0)
 
 
 @torch.no_grad()
@@ -120,6 +169,70 @@ def encode_video(vae, frames: list[Image.Image], device: str) -> torch.Tensor:
     video_tensor = _preprocess_video(frames, device)
     latent = vae.encode(video_tensor, device=device)
     return latent.to(dtype=torch.bfloat16)
+
+
+@torch.no_grad()
+def encode_video_batch(vae, videos: list[list[Image.Image]],
+                       device: str) -> torch.Tensor:
+    """VAE-encode multiple videos in one forward pass.
+
+    480x640 / 17-frame clips → (B, 48, 5, 30, 40).
+    """
+    batch = torch.cat([_preprocess_video(frames, device) for frames in videos], dim=0)
+    latent = vae.single_encode(batch, device=device)
+    return latent.to(dtype=torch.bfloat16)
+
+
+@torch.no_grad()
+def encode_video_array_batch(vae, videos: list[np.ndarray],
+                             device: str) -> torch.Tensor:
+    """VAE-encode predecoded uint8 RGB videos."""
+    batch = _preprocess_video_arrays(videos, device)
+    latent = vae.single_encode(batch, device=device)
+    return latent.to(dtype=torch.bfloat16)
+
+
+def encode_pair_batch(vae, human_videos: list[np.ndarray],
+                      robot_videos: list[np.ndarray],
+                      device: str) -> tuple[torch.Tensor, torch.Tensor]:
+    """Encode human and robot batches separately after CPU predecode."""
+    human_lats = encode_video_array_batch(vae, human_videos, device).cpu()
+    robot_lats = encode_video_array_batch(vae, robot_videos, device).cpu()
+    return human_lats, robot_lats
+
+
+BatchItem = tuple[int, dict, Path, str]
+DecodedItem = tuple[BatchItem, np.ndarray, np.ndarray]
+DecodedBatch = tuple[list[BatchItem], list[np.ndarray], list[np.ndarray]]
+
+
+def decode_item(pair_dir: Path, item: BatchItem) -> DecodedItem:
+    """Decode one paired sample on CPU for later batch assembly."""
+    _, row, _, _ = item
+    human_video = load_video_as_rgb_array(str(pair_dir / row["control_video"]))
+    robot_video = load_video_as_rgb_array(str(pair_dir / row["video"]))
+    return item, human_video, robot_video
+
+
+def decode_batch(pair_dir: Path, batch_items: list[BatchItem]) -> DecodedBatch:
+    """Decode a batch of paired videos on CPU for later GPU VAE encoding."""
+    decoded = [decode_item(pair_dir, item) for item in batch_items]
+    items = [item for item, _, _ in decoded]
+    human_videos = [human_video for _, human_video, _ in decoded]
+    robot_videos = [robot_video for _, _, robot_video in decoded]
+    return items, human_videos, robot_videos
+
+
+def assemble_decoded_batch(decoded: list[DecodedItem]) -> DecodedBatch:
+    """Assemble decoded per-sample items into one ordered batch."""
+    batch_items = [item for item, _, _ in decoded]
+    human_videos = [human_video for _, human_video, _ in decoded]
+    robot_videos = [robot_video for _, _, robot_video in decoded]
+    return batch_items, human_videos, robot_videos
+
+
+def save_cache_item(out_path: Path, data: dict):
+    torch.save(data, str(out_path))
 
 
 def _prompt_filename(prompt: str) -> str:
@@ -173,7 +286,35 @@ def main():
                     help="write old format (embedded T5 + optional PIL frames)")
     ap.add_argument("--no-frames", action="store_true",
                     help="(legacy mode only) skip saving PIL frames")
+    ap.add_argument("--batch-size", type=int, default=1,
+                    help="number of samples to VAE-encode per forward pass")
+    ap.add_argument("--prefetch-workers", type=int, default=0,
+                    help="CPU decode workers per process (0 = synchronous)")
+    ap.add_argument("--prefetch-batches", type=int, default=2,
+                    help="max decoded batches buffered ahead of GPU encode")
+    ap.add_argument("--save-workers", type=int, default=1,
+                    help="threads for async .pth writes in new cache format")
+    ap.add_argument("--cpu-affinity", default="",
+                    help="optional CPU list for this process, e.g. 0-17,72-89")
     args = ap.parse_args()
+
+    if args.batch_size < 1:
+        raise ValueError("--batch-size must be >= 1")
+    if args.prefetch_workers < 0:
+        raise ValueError("--prefetch-workers must be >= 0")
+    if args.prefetch_batches < 1:
+        raise ValueError("--prefetch-batches must be >= 1")
+    if args.save_workers < 1:
+        raise ValueError("--save-workers must be >= 1")
+    if args.legacy and (
+        args.batch_size != 1 or args.prefetch_workers != 0 or args.save_workers != 1
+    ):
+        raise ValueError(
+            "--legacy only supports --batch-size 1, --prefetch-workers 0, "
+            "and --save-workers 1"
+        )
+
+    apply_cpu_affinity(args.cpu_affinity)
 
     # Resolve relative paths against MAIN_ROOT
     if not os.path.isabs(args.pair_dir):
@@ -219,6 +360,9 @@ def main():
     print(f"Format:   {'legacy (embedded T5)' if args.legacy else 'new (separate T5)'}")
     print(f"Prompts:  {len(prompts)} unique")
     print(f"Device:   {args.device}")
+    print(f"Batch:    {args.batch_size}")
+    print(f"Prefetch: workers={args.prefetch_workers} batches={args.prefetch_batches}")
+    print(f"Save:     workers={args.save_workers}")
 
     # In new mode, T5 is only needed if cache files don't exist yet
     need_t5 = args.legacy or not all(
@@ -252,27 +396,29 @@ def main():
 
     # VAE encoding
     skipped = 0
-    for idx, row in enumerate(rows):
-        name = Path(row["video"]).stem  # pair_NNNN
-        out_path = output_dir / f"{name}.pth"
-        if args.resume and out_path.exists():
-            skipped += 1
-            continue
+    encoded = 0
 
-        t0 = time.time()
-        human_path = pair_dir / row["control_video"]
-        robot_path = pair_dir / row["video"]
+    if args.legacy:
+        for idx, row in enumerate(rows):
+            name = Path(row["video"]).stem  # pair_NNNN
+            out_path = output_dir / f"{name}.pth"
+            if args.resume and out_path.exists():
+                skipped += 1
+                continue
 
-        human_frames = load_video_as_pil(str(human_path))
-        robot_frames = load_video_as_pil(str(robot_path))
+            t0 = time.time()
+            human_path = pair_dir / row["control_video"]
+            robot_path = pair_dir / row["video"]
 
-        human_lat = encode_video(vae, human_frames, args.device).cpu()
-        robot_lat = encode_video(vae, robot_frames, args.device).cpu()
+            human_frames = load_video_as_pil(str(human_path))
+            robot_frames = load_video_as_pil(str(robot_path))
 
-        source_key = f"{split_name}/{Path(row['video']).name}"
-        source_id = source_map.get(source_key, {}).get("source_id", "")
+            human_lat = encode_video(vae, human_frames, args.device).cpu()
+            robot_lat = encode_video(vae, robot_frames, args.device).cpu()
 
-        if args.legacy:
+            source_key = f"{split_name}/{Path(row['video']).name}"
+            source_id = source_map.get(source_key, {}).get("source_id", "")
+
             data = {
                 "human_latent": human_lat,
                 "robot_latent": robot_lat,
@@ -284,21 +430,117 @@ def main():
             if not args.no_frames:
                 data["human_frames"] = human_frames
                 data["robot_frames"] = robot_frames
-        else:
-            data = {
-                "human_latent": human_lat,
-                "robot_latent": robot_lat,
-                "prompt": row["prompt"],
-                "source_id": source_id,
-            }
-        torch.save(data, str(out_path))
+            torch.save(data, str(out_path))
+            encoded += 1
 
-        dt = time.time() - t0
-        if (idx + 1) % 10 == 0 or idx == len(rows) - 1:
-            print(f"  [{idx+1}/{len(rows)}] {name} shapes "
-                  f"h={tuple(human_lat.shape)} r={tuple(robot_lat.shape)} ({dt:.1f}s)")
+            dt = time.time() - t0
+            if (idx + 1) % 10 == 0 or idx == len(rows) - 1:
+                print(f"  [{idx+1}/{len(rows)}] {name} shapes "
+                      f"h={tuple(human_lat.shape)} r={tuple(robot_lat.shape)} ({dt:.1f}s)")
+    else:
+        batches: list[list[BatchItem]] = []
+        pending: list[BatchItem] = []
+        for idx, row in enumerate(rows):
+            name = Path(row["video"]).stem  # pair_NNNN
+            out_path = output_dir / f"{name}.pth"
+            if args.resume and out_path.exists():
+                skipped += 1
+                continue
+            pending.append((idx, row, out_path, name))
+            if len(pending) == args.batch_size:
+                batches.append(pending)
+                pending = []
+        if pending:
+            batches.append(pending)
 
-    print(f"\nDone. {len(rows) - skipped} encoded, {skipped} skipped → {output_dir}")
+        save_futures: deque[Future] = deque()
+        save_limit = args.save_workers * 8
+
+        def submit_cache_save(save_pool: ThreadPoolExecutor, out_path: Path,
+                              data: dict):
+            save_futures.append(save_pool.submit(save_cache_item, out_path, data))
+            while len(save_futures) >= save_limit:
+                save_futures.popleft().result()
+
+        def process_decoded_batch(save_pool: ThreadPoolExecutor,
+                                  decoded: DecodedBatch):
+            nonlocal encoded
+            batch_items, human_videos, robot_videos = decoded
+            t0 = time.time()
+            human_lats = encode_video_array_batch(vae, human_videos, args.device).cpu()
+            t_human = time.time()
+            robot_lats = encode_video_array_batch(vae, robot_videos, args.device).cpu()
+            t_robot = time.time()
+
+            for batch_idx, (_, row, out_path, _) in enumerate(batch_items):
+                source_key = f"{split_name}/{Path(row['video']).name}"
+                source_id = source_map.get(source_key, {}).get("source_id", "")
+                data = {
+                    "human_latent": human_lats[batch_idx:batch_idx + 1],
+                    "robot_latent": robot_lats[batch_idx:batch_idx + 1],
+                    "prompt": row["prompt"],
+                    "source_id": source_id,
+                }
+                submit_cache_save(save_pool, out_path, data)
+            t_submit = time.time()
+
+            encoded += len(batch_items)
+            last_idx, _, _, name = batch_items[-1]
+            dt = t_submit - t0
+            if (last_idx + 1) % 10 == 0 or last_idx == len(rows) - 1:
+                print(
+                    f"  [{last_idx+1}/{len(rows)}] {name} "
+                    f"batch={len(batch_items)} shapes "
+                    f"h={tuple(human_lats.shape)} r={tuple(robot_lats.shape)} "
+                    f"({dt:.1f}s human={t_human-t0:.1f}s "
+                    f"robot={t_robot-t_human:.1f}s submit={t_submit-t_robot:.1f}s)"
+                )
+
+        with ThreadPoolExecutor(max_workers=args.save_workers) as save_pool:
+            if args.prefetch_workers == 0:
+                for batch_items in batches:
+                    process_decoded_batch(
+                        save_pool, decode_batch(pair_dir, batch_items))
+            else:
+                with ThreadPoolExecutor(
+                    max_workers=args.prefetch_workers,
+                    thread_name_prefix="mitty_decode",
+                ) as decode_pool:
+                    items = [item for batch_items in batches for item in batch_items]
+                    item_iter = iter(items)
+                    item_futures: deque[Future] = deque()
+                    prefetch_items = args.prefetch_batches * args.batch_size
+                    for _ in range(prefetch_items):
+                        try:
+                            item = next(item_iter)
+                        except StopIteration:
+                            break
+                        item_futures.append(
+                            decode_pool.submit(decode_item, pair_dir, item))
+
+                    decoded_batch: list[DecodedItem] = []
+                    while item_futures:
+                        decoded_batch.append(item_futures.popleft().result())
+                        try:
+                            item = next(item_iter)
+                        except StopIteration:
+                            item = None
+                        if item is not None:
+                            item_futures.append(
+                                decode_pool.submit(decode_item, pair_dir, item))
+                        if len(decoded_batch) == args.batch_size:
+                            process_decoded_batch(
+                                save_pool, assemble_decoded_batch(decoded_batch))
+                            decoded_batch = []
+
+                    if decoded_batch:
+                        process_decoded_batch(
+                            save_pool, assemble_decoded_batch(decoded_batch))
+
+            while save_futures:
+                save_futures.popleft().result()
+
+    print(f"\nDone. {encoded} encoded, {skipped} skipped → {output_dir}")
 
 
 if __name__ == "__main__":
