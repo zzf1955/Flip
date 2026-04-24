@@ -59,7 +59,11 @@ T5 embedding 不再嵌入每个样本文件，而是从共享 `t5/` 目录按 pr
 python -m src.pipeline.mitty_cache \
   --pair-dir training_data/pair/1s/train \
   --output   training_data/cache/vae/pair_1s/train \
-  --device cuda:0
+  --device cuda:0 \
+  --batch-size 4 \
+  --prefetch-workers 8 \
+  --prefetch-batches 2 \
+  --save-workers 1
 
 # 旧格式（嵌入 T5 + 可选 frames）
 python -m src.pipeline.mitty_cache \
@@ -69,6 +73,8 @@ python -m src.pipeline.mitty_cache \
 ```
 
 T5 cache 在首次运行时自动编码并保存到 `--t5-cache-dir`（默认 `training_data/cache/t5/`），后续运行会跳过已存在的文件。
+
+`mitty_cache.py` 的新格式支持 CPU/GPU 流水线：`--prefetch-workers` 为每个 GPU 进程分配 CPU 解码线程，`--prefetch-batches` 控制预解码队列深度，`--save-workers` 异步写 `.pth`，`--cpu-affinity` 可绑定该进程及其 worker 到指定 CPU 核（例如 `0-17,72-89`）。旧格式 `--legacy` 保持同步单样本路径，不支持这些并行参数。
 
 ### config.py 路径常量
 
