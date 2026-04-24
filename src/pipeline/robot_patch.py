@@ -489,6 +489,14 @@ def main():
     all_segs = find_segments(tasks)
     print(f"  found {len(all_segs)} segments across {len(tasks)} tasks")
 
+    if args.mask_source == "sam2":
+        before = len(all_segs)
+        all_segs = [s for s in all_segs
+                    if os.path.isfile(os.path.join(
+                        args.sam2_mask_root, s["task"], s["episode"],
+                        f"{s['seg']}.npz"))]
+        print(f"  SAM2 filter: {before} → {len(all_segs)} segments with masks")
+
     if args.max_segments > 0:
         by_task: dict[str, list[dict]] = {}
         for s in all_segs:

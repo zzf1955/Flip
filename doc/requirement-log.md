@@ -1,5 +1,28 @@
 # 需求日志
 
+## 2026-04-24
+
+**用户原始需求：**
+> 当前 Codex sandbox 无法访问 `nvidia-smi` / GPU，需要说明 sandbox 机制，并记录哪些命令应该越权执行。
+
+讨论要点：
+- 当前项目切换为 `danger-full-access` + `approval_policy=never`，让 GPU 查询、CUDA 推理、训练、多卡 DDP 直接访问宿主 `/dev/nvidia*`。
+- `sandbox_mode` 和 `approval_policy` 必须放在 `~/.codex/config.toml` 顶层；`[projects."/disk_n/zzf/flip"]` 只保留 `trust_level = "trusted"`。
+- `writable_roots` 已包含项目目录、`/tmp`、HuggingFace cache 和 pip cache，作为回退到 `workspace-write` 时的写入白名单保留。
+- Linux `workspace-write` sandbox 使用 bwrap 风格隔离，`/dev` 是最小设备目录，不透传 `/dev/nvidia*`；如回退到该模式，GPU 命令仍需要越权或改回 full access。
+- full access 下依赖 Codex `PreToolUse` hook 做高危 Bash 命令的最佳努力拦截；hook matcher 已放宽为兼容 shell/Bash/exec 工具名。
+
+**完成改动（文档更新）：**
+- `doc/codex_migration.md`：更新当前 Codex 配置、Linux sandbox 现状、GPU 限制和越权执行准则。
+- `AGENTS.md`：补充 full access + Codex hooks 的 GPU/训练安全边界，以及统一 GPU 命令入口。
+- `scripts/flip_run.sh`：新增统一 GPU/训练入口，支持按子命令保存 Codex prefix rule。
+- `doc/scripts_inventory.md`：补充 GPU 命令统一入口用法。
+- `scripts/codex_pre_tool_use_guard.py`：新增 Codex Bash `PreToolUse` hook 护栏，阻止 `sudo`、危险删除和危险 Git 操作等。
+- `~/.codex/config.toml`：切换为 `danger-full-access` + `approval_policy=never` 并启用 `codex_hooks`；备份为 `/home/leadtek/.codex/config.toml.bak-fullaccess-hooks-20260424`。
+- `~/.codex/hooks.json`：配置全局 `PreToolUse` hook 指向项目护栏脚本，matcher 使用 `Bash|exec_command|shell|exec_command`；已验证 `sudo -n true` 会被 hook 拦截。
+
+---
+
 ## 2026-04-23
 
 **用户原始需求：**
