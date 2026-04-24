@@ -1,38 +1,31 @@
-"""Unified LoRA training entry for Wan 2.2 TI2V-5B.
+"""Canonical Mitty LoRA training entry for Wan 2.2 TI2V-5B.
 
-Supports two backbones and two loss variants via CLI flags:
+The maintained training path is Mitty-style in-context appearance transfer with
+either uniform or hand-patch loss weighting:
 
-  --backbone {mitty,rectflow}   # which forward + loss formulation
-  --loss     {uniform,hand_patch}  # weighting of the MSE reduction
+  --loss {uniform,hand_patch}
 
-Hand-patch loss requires ``--patch-dir``; uniform loss rejects it.
-
-This script is a behavior-equivalent superset of
-``src/pipeline/train_mitty.py`` and ``src/pipeline/train_rf.py`` — those
-legacy scripts are retained for backward compatibility but new runs should
-go through here for ablation convenience.
+FunControl, RectFlow/Dxxx Flow, and direct-noise replacement experiments are no
+longer exposed from this entry. Historical files may remain in task records, but
+new runs should use this script plus `mitty_cache.py`.
 
 Usage:
-  # Single GPU smoke: Mitty, uniform loss
-  CUDA_VISIBLE_DEVICES=2 python -m src.pipeline.train \\
-    --backbone mitty --loss uniform \\
-    --cache-train output/mitty_cache_1s/train \\
-    --cache-eval  output/mitty_cache_1s/eval \\
-    --cache-ood   output/mitty_cache_1s/ood_eval \\
-    --max-steps 10 --save-steps 10 --eval-steps 10 --eval-video-steps 20
+  # Single GPU smoke on card 2; write all transient outputs under ./tmp
+  CUDA_VISIBLE_DEVICES=2 python -m src.pipeline.train \
+    --loss uniform \
+    --task-name smoke \
+    --cache-train training_data/cache/vae/pair_1s/train \
+    --cache-eval  training_data/cache/vae/pair_1s/eval \
+    --output-dir tmp/t032/train_smoke \
+    --max-steps 10 --save-steps 10 --eval-steps 10 --eval-video-steps 0
 
-  # DDP 4 GPUs: Mitty + hand_patch weighting
-  torchrun --nproc_per_node=4 -m src.pipeline.train \\
-    --backbone mitty --loss hand_patch \\
-    --patch-dir output/hand_patch_1s/train \\
-    --cache-train output/mitty_cache_1s/train \\
-    --cache-eval  output/mitty_cache_1s/eval \\
-    --max-steps 400
-
-  # RectFlow + uniform
-  torchrun --nproc_per_node=4 -m src.pipeline.train \\
-    --backbone rectflow --loss uniform \\
-    --cache-train output/mitty_cache_1s/train \\
+  # Mitty + hand_patch weighting
+  torchrun --nproc_per_node=4 -m src.pipeline.train \
+    --loss hand_patch \
+    --task-name appearance \
+    --patch-dir training_data/pair/1s/train/hand_patch \
+    --cache-train training_data/cache/vae/pair_1s/train \
+    --cache-eval  training_data/cache/vae/pair_1s/eval \
     --max-steps 400
 """
 
@@ -72,7 +65,7 @@ from src.core.train_utils import (
     sync_gradients,
     tensor_to_frames,
 )
-from src.pipeline.backbones import BackboneSpec, all_names, get as get_backbone
+from src.pipeline.backbones import MethodSpec, get_mitty_spec
 
 # Reuse helpers from the legacy Mitty script (these are generic pipe/IO utils
 # that happen to live there; keeping them there avoids touching legacy scripts).
@@ -138,7 +131,7 @@ def eval_loss(model, files: list[str], device: str,
 
 @torch.no_grad()
 def generate_eval_videos(
-    spec: BackboneSpec,
+    spec: MethodSpec,
     model,
     files: list[str],
     out_dir: str,
@@ -212,16 +205,14 @@ def generate_eval_videos(
 
 # ── Main training loop ─────────────────────────────────────────────────
 
-def train(args, spec: BackboneSpec):
+def train(args, spec: MethodSpec):
     rank, world_size, ddp_device = setup_distributed()
     is_main = rank == 0
     if ddp_device is not None:
         args.device = ddp_device
 
-    # Deterministic timestep sampling inside the loss — the legacy train_mitty /
-    # train_rf left torch.randint seeded by interpreter start time, so loss
-    # values differed run-to-run. Ablation runs need reproducibility across
-    # seeds, so pin the global torch RNG here (rank offset keeps DDP workers
+    # Deterministic timestep sampling inside the loss. Reproducible ablation
+    # runs need a pinned global torch RNG (rank offset keeps DDP workers
     # decorrelated).
     torch.manual_seed(args.seed + rank)
     if torch.cuda.is_available():
@@ -589,13 +580,10 @@ def train(args, spec: BackboneSpec):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Unified LoRA training for Wan 2.2 TI2V-5B "
-                    "(Mitty / Rectified Flow backbones × uniform / hand_patch loss)"
+        description="Mitty LoRA training for Wan 2.2 TI2V-5B "
+                    "(uniform / hand_patch loss)"
     )
 
-    # Backbone + loss (the ablation axes)
-    ap.add_argument("--backbone", choices=all_names(), default="mitty",
-                    help="training backbone (forward + loss formulation)")
     ap.add_argument("--loss", choices=["uniform", "hand_patch"], default="uniform",
                     help="loss weighting scheme; hand_patch requires --patch-dir")
 
@@ -669,7 +657,7 @@ def main():
     ap.add_argument("--wandb-run-name", default=None,
                     help="W&B run name (default: timestamp)")
     ap.add_argument("--wandb-tags", nargs="+", default=[],
-                    help="extra W&B tags (backbone + loss tags added automatically)")
+                    help="extra W&B tags (method + loss tags added automatically)")
     ap.add_argument("--wandb-log-videos", action=argparse.BooleanOptionalAction,
                     default=True,
                     help="upload eval videos to W&B (--no-wandb-log-videos to skip)")
@@ -694,8 +682,7 @@ def main():
             for p in args.merge_lora
         ]
 
-    spec = get_backbone(args.backbone)
-    train(args, spec)
+    train(args, get_mitty_spec())
 
 
 if __name__ == "__main__":

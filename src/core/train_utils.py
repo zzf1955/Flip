@@ -1,7 +1,7 @@
-"""Shared utilities for LoRA training pipelines.
+"""Shared utilities for maintained LoRA training pipelines.
 
-Used by `src/pipeline/train_lora.py` (Wan 2.1 Fun-Control) and
-`src/pipeline/train_mitty.py` (Wan 2.2 TI2V-5B Mitty in-context).
+Used by the Mitty / Wan 2.2 TI2V-5B training path. Deprecated FunControl and
+RectFlow scripts are intentionally not part of the maintained surface.
 
 Contains:
   - DDP helpers: setup_distributed / cleanup_distributed / sync_gradients / reduce_scalar
@@ -117,8 +117,8 @@ class CsvLogger:
 def load_cached_files(cache_dir: str, recursive: bool = False) -> list[str]:
     """Scan cache directory for .pth files.
 
-    `recursive=True` mirrors DiffSynth `sft:data_process` layout (cache_dir/0/*.pth);
-    `recursive=False` mirrors Mitty's flat-dir layout.
+    `recursive=True` supports nested cache layouts (cache_dir/**/.pth);
+    `recursive=False` mirrors the canonical flat Mitty cache layout.
     """
     if recursive:
         files = sorted(glob.glob(os.path.join(cache_dir, "**", "*.pth"), recursive=True))
@@ -242,9 +242,9 @@ def _fmt_lr(lr: float) -> str:
 
 _BACKBONE_DISPLAY = {
     "mitty": "Mitty",
-    "rectflow": "RF",
-    "rf": "RF",
-    "lora": "Lora",
+    "lora_stage1": "LoraStage1",
+    "lora_stage2": "LoraStage2",
+    "lora_stage3": "LoraStage3",
 }
 
 

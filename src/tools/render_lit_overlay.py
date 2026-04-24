@@ -22,7 +22,7 @@ import pandas as pd
 
 sys.stdout.reconfigure(line_buffering=True)
 
-from src.core.config import (G1_URDF, MESH_DIR, DATASET_ROOT, OUTPUT_DIR,
+from src.core.config import (G1_URDF, MESH_DIR, DATASET_ROOT, TMP_DIR,
                      get_hand_type, get_skip_meshes, CAMERA_MODEL, BEST_PARAMS)
 from src.core.camera import get_model, project_points_cv
 from src.core.fk import (build_q, do_fk, parse_urdf_meshes, preload_meshes)
@@ -254,7 +254,7 @@ def main():
         container_in.seek(max(target_pts, 0), stream=stream_in)
 
     # Output
-    out_dir = os.path.join(OUTPUT_DIR, "tmp", "lit_overlay")
+    out_dir = os.path.join(TMP_DIR, "lit_overlay")
     os.makedirs(out_dir, exist_ok=True)
     tag = f"{task.split('G1_WBT_')[-1]}_ep{args.episode}"
     if joint_offsets is not None:

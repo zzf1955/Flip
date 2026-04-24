@@ -17,7 +17,7 @@ from scipy.spatial.transform import Rotation
 np.set_printoptions(precision=6, suppress=True)
 
 from src.core.config import (G1_URDF, MESH_DIR, BEST_PARAMS, DATASET_ROOT,
-                     OUTPUT_DIR, get_hand_type, get_skip_meshes, CAMERA_MODEL)
+                     TMP_DIR, get_hand_type, get_skip_meshes, CAMERA_MODEL)
 from src.core.camera import get_model, build_K, build_D, model_is_fisheye, project_points_cv
 from src.core.fk import (build_q, do_fk, parse_urdf_meshes, preload_meshes)
 from src.core.camera import make_camera, make_camera_const
@@ -636,7 +636,7 @@ for i, (name, link, offset) in enumerate(available_kps):
     print(f"  {name}: {kp_world[i]} (link={link})")
 
 # \u7ed8\u5236\u5bf9\u6bd4\u56fe
-out_dir = os.path.join(OUTPUT_DIR, "tmp", "urdf_verify")
+out_dir = os.path.join(TMP_DIR, "urdf_verify")
 os.makedirs(out_dir, exist_ok=True)
 
 colors = [

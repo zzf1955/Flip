@@ -12,8 +12,8 @@ import os
 import sys
 
 # ── Paths ──
-from src.core.config import OUTPUT_DIR, DATASET_ROOT
-DIST_DIR = os.path.join(OUTPUT_DIR, "tmp", "distortion")
+from src.core.config import TMP_DIR, DATASET_ROOT
+DIST_DIR = os.path.join(TMP_DIR, "distortion")
 os.makedirs(DIST_DIR, exist_ok=True)
 
 # Try head_stereo_left first (Brainco), fallback to cam_0 (Inspire)
