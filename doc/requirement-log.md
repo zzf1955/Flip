@@ -319,3 +319,11 @@
 
 **创建的任务：**
 - [019] train.py: epoch-based → 纯 step-based 训练控制
+
+## 2026-04-24
+
+**用户原始需求：**
+> 新建一个 worktree,按照 /develop 的 skill 进行. 你可以在 worktree 中进行大幅度重构. 当前项目中: FunControl 的部分不用留了；直接替换噪声那部分不用管了, 这个实验是废弃的；主要的训练 pipeline 是直接外观替换(Mitty) 和三阶段的 LoRA 训练。
+
+**创建的任务：**
+- [031] 训练主线重构：清理废弃实验并聚焦 Mitty 与三阶段 LoRA
