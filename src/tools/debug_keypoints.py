@@ -25,7 +25,7 @@ from scipy import ndimage
 sys.stdout.reconfigure(line_buffering=True)
 
 from src.core.config import (G1_URDF, MESH_DIR, SKIP_MESHES, BEST_PARAMS, DATASET_ROOT,
-                     OUTPUT_DIR, MAIN_ROOT, get_hand_type, get_skip_meshes)
+                     TMP_DIR, MAIN_ROOT, get_hand_type, get_skip_meshes)
 from src.core.fk import build_q, do_fk, parse_urdf_meshes
 from src.core.camera import make_camera
 
@@ -667,7 +667,7 @@ def main():
     if args.hand_debug:
         if args.task is None:
             parser.error("--hand-debug requires --task")
-        out_dir = os.path.join(OUTPUT_DIR, "tmp", "kp_debug")
+        out_dir = os.path.join(TMP_DIR, "kp_debug")
         render_hand_debug(args.task, args.episode, args.frame,
                           model, data_pin, link_meshes, out_dir)
         return
@@ -688,7 +688,7 @@ def main():
     manifest_dir = os.path.dirname(manifest_path)
     print(f"Manifest: {n_frames} frames, {n_kp} keypoints: {KP_NAMES}")
 
-    out_dir = os.path.join(OUTPUT_DIR, "tmp", "kp_debug")
+    out_dir = os.path.join(TMP_DIR, "kp_debug")
     os.makedirs(out_dir, exist_ok=True)
 
     # 3 mesh view angles: front (facing robot), side (from right), top (from above)

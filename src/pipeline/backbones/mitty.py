@@ -1,8 +1,4 @@
-"""Mitty in-context backbone spec.
-
-Wraps the existing ``MittyTrainingModule`` (living in ``train_mitty.py``) and
-supplies the eval-time denoise loop extracted from ``train_mitty.py``.
-"""
+"""Mitty in-context method spec."""
 
 from __future__ import annotations
 
@@ -10,7 +6,7 @@ import torch
 
 from src.pipeline.train_mitty import MittyTrainingModule
 
-from . import BackboneSpec, register
+from . import MethodSpec
 
 
 @torch.no_grad()
@@ -52,11 +48,11 @@ def _eval_denoise(pipe, sample, sched, device, cfg_scale, num_inference_steps):
     return robot_noisy
 
 
-register(BackboneSpec(
+SPEC = MethodSpec(
     name="mitty",
     wandb_tag="mitty",
     log_name="train_mitty",
     description="Mitty LoRA training (Wan 2.2 TI2V-5B)",
     training_module_factory=MittyTrainingModule,
     eval_denoise_fn=_eval_denoise,
-))
+)

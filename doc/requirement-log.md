@@ -350,3 +350,28 @@
 
 **创建的任务：**
 - [031] 训练主线重构：清理废弃实验并聚焦 Mitty 与三阶段 LoRA
+
+## 2026-04-24 — 仓库级重构：收敛训练主线、数据规范与配置命名
+
+### 需求
+
+> 走 develop 流程重新规划重构；不沿用旧 T031。去掉 Fun Control、Dxxx/RectFlow 等废弃方法，重点规范数据管理、命名规范和 config；测试产物统一放 `./tmp`；Codex 只用卡 2 测试，卡 3 留给用户实验；新重构不要依赖外部 DiffSynth 训练脚本。
+
+### 决策
+
+- 新建 T032：`doc/tasks/active/032.md`，分支 `feat/t032-repo-refactor`，worktree `.worktrees/t032`。
+- 取消旧未完成任务：T005、T006、T011、T021、T031，后续由 T032 统一收敛。
+- 删除正式入口中的 FunControl / RectFlow / Dxxx Flow 暴露，不再维护 `train_lora.py`、`train_rf.py`、`rf_model_fn.py`、`backbones/rectflow.py`。
+- 新增 `TMP_DIR = ./tmp` 配置约定；smoke/测试默认写入 `tmp/`。
+- 文档更新 `doc/step_5_training_infra.md`，明确保留入口、移除入口、DiffSynth 边界、GPU 分配与验证命令。
+
+### 相关任务
+
+- [032] 仓库级重构：收敛训练主线、数据规范与配置命名
+
+### 验证补充
+
+- 新增 `scripts/smoke_t032_refactor.py`，统一执行 T032 轻量冒烟：`compileall`、保留流程入口 `--help`、废弃训练模块不可 import。
+- 验证日志写入 `tmp/t032/smoke/`；使用 `CUDA_VISIBLE_DEVICES=2` 确认 Codex 只看到卡 2，卡 3 未使用。
+
+- 新增 `scripts/smoke_t032_gpu.py`，在 `CUDA_VISIBLE_DEVICES=2` 下复制 1 条 pair 到 `tmp/t032/gpu_smoke/`，完成 `mitty_cache` 真实 VAE cache 生成和 `train.py` 1-step 训练/eval。

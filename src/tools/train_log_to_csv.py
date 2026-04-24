@@ -1,4 +1,4 @@
-"""Convert train.log produced by train_mitty / train_lora to a train.csv.
+"""Convert train.log produced by Mitty training scripts to train.csv.
 
 Useful for runs that were launched before the live-CSV feature was added.
 The script is idempotent and can be run while training is still going — it

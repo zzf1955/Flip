@@ -131,6 +131,11 @@ def get_skip_meshes(hand_type=None):
 # don't overwrite each other's experiment results.
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 
+# ── Temporary outputs ─────────────────────────────────────────────────
+# Smoke tests, debugging probes, and one-off validation artifacts must write
+# here.  Nothing under TMP_DIR is considered an experiment result.
+TMP_DIR = os.path.join(BASE_DIR, "tmp")
+
 # ── Training data root (per-worktree) ──
 TRAINING_DATA_ROOT = os.path.join(BASE_DIR, "training_data")
 SEGMENT_DIR = os.path.join(TRAINING_DATA_ROOT, "segment")
@@ -154,6 +159,6 @@ SEGMENT_PIPELINE_DIR = os.path.join(OUTPUT_DIR, "segment_pipeline")
 COSMOS_PREPARE_DIR = os.path.join(OUTPUT_DIR, "human", "cosmos_prepare")
 COSMOS_REGEN_DIR = os.path.join(OUTPUT_DIR, "human", "cosmos_regen")
 
-# ── ComfyUI / Wan 2.1 ──
+# ── ComfyUI / interactive generation ──
 COMFYUI_ROOT = "/disk_n/zzf/ComfyUI"
 WAN_REGEN_DIR = os.path.join(OUTPUT_DIR, "human", "wan_regen")
