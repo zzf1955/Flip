@@ -109,7 +109,7 @@ def main():
     ap.add_argument("--low-vram", action="store_true",
                     help="use disk offload (slower but avoids OOM)")
     ap.add_argument("--skip-i2v", action="store_true")
-    ap.add_argument("--output-dir", default="/disk_n/zzf/flip/output/wan22_smoke")
+    ap.add_argument("--output-dir", default="tmp/wan22_smoke")
     args = ap.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)

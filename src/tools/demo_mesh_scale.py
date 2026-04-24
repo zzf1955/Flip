@@ -9,7 +9,7 @@ import os, json
 import numpy as np
 import cv2
 
-from src.core.config import G1_URDF, MESH_DIR, SKIP_MESHES, DATASET_ROOT, OUTPUT_DIR, CALIB_5POINT_DIR, get_hand_type
+from src.core.config import G1_URDF, MESH_DIR, SKIP_MESHES, DATASET_ROOT, TMP_DIR, CALIB_5POINT_DIR, get_hand_type
 from src.core.camera import project_points_cv
 from src.core.fk import build_q, do_fk, parse_urdf_meshes, preload_meshes
 from src.core.camera import make_camera
@@ -183,7 +183,7 @@ def main():
     # Horizontal concatenation
     combined = np.concatenate(panels, axis=1)
 
-    out_path = os.path.join(OUTPUT_DIR, "tmp", "mesh_scale",
+    out_path = os.path.join(TMP_DIR, "mesh_scale",
         "f090_scale_compare.png")
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     cv2.imwrite(out_path, combined)

@@ -331,7 +331,7 @@ def main():
     run_dir = TRAINING_LOG_ROOT / args.run
     eval_dir = run_dir / "eval"
     if not eval_dir.exists():
-        # flat layout fallback (train_lora.py style: eval/step-NNNN/ without split subdirs)
+        # flat layout fallback: eval/step-NNNN/ without split subdirs
         if not run_dir.exists():
             print(f"ERROR: {run_dir} not found")
             sys.exit(1)

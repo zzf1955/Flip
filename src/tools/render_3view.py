@@ -1,13 +1,13 @@
 """
 Render G1 robot 3-view orthographic + oblique perspective with keypoints.
-Outputs: output/tmp/3view/g1_3view.png, g1_closeup.png, g1_keypoints_oblique.png
+Outputs: tmp/3view/g1_3view.png, g1_closeup.png, g1_keypoints_oblique.png
 """
 import os
 import numpy as np
 import pinocchio as pin
 from stl import mesh as stl_mesh
 
-from src.core.config import G1_URDF, MESH_DIR, SKIP_MESHES, OUTPUT_DIR
+from src.core.config import G1_URDF, MESH_DIR, SKIP_MESHES, TMP_DIR
 from src.core.fk import parse_urdf_meshes
 
 import matplotlib
@@ -157,7 +157,7 @@ def main():
         print(f"  {label}: world={world_pos}")
     kp_world = np.array(kp_world)
 
-    out_dir = os.path.join(OUTPUT_DIR, "tmp", "3view")
+    out_dir = os.path.join(TMP_DIR, "3view")
     os.makedirs(out_dir, exist_ok=True)
 
     # ── Oblique view ──
