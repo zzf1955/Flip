@@ -12,11 +12,15 @@ Each split gets its own pair_NNNN.mp4 numbering and metadata.csv. A top-level
 pair/<second>/source_map.json records the mapping back to (task, episode, seg).
 
 Usage:
+  # Formal training data: --task all expands to TRAINING_TASKS only.
   python -m src.pipeline.make_pair --task all --second 1s --clean
 
   python -m src.pipeline.make_pair --task all --second 1s \
     --human-source seedance_advance --hand-patch --hand-weight 3.0 \
-    --ood-tasks Inspire_Pickup_Pillow_MainCamOnly --per-task-eval 1
+    --ood-tasks "" --per-task-eval 1
+
+  # Historical/debug data outside TRAINING_TASKS must be requested explicitly.
+  python -m src.pipeline.make_pair --task inspire --second 1s --clean
 """
 
 import argparse
@@ -41,6 +45,7 @@ sys.stdout.reconfigure(line_buffering=True)
 from src.core.config import (
     ALL_TASKS, MAIN_ROOT,
     PAIR_DIR, TRAINING_DATA_ROOT,
+    TRAINING_TASKS,
 )
 
 _MAIN_TRAINING_DATA = os.path.join(MAIN_ROOT, "training_data")
@@ -82,13 +87,16 @@ def _ffmpeg(args: list[str]):
 
 def make_robot_clip(segment_video: str, out_path: str,
                     start: float, duration: float,
-                    num_frames: int | None = None):
+                    num_frames: int | None = None,
+                    hflip: bool = False):
     """Cut a segment from the robot video and resample to TARGET_FPS."""
     args = [
         "-ss", f"{start:.3f}", "-i", segment_video,
         "-t", f"{duration + 0.5:.3f}",  # generous cut, rely on -frames:v
         "-r", str(TARGET_FPS),
     ]
+    if hflip:
+        args += ["-vf", "hflip"]
     if num_frames is not None:
         args += ["-frames:v", str(num_frames)]
     args += ["-c:v", "libx264", "-crf", "18", "-preset", "fast",
@@ -169,13 +177,44 @@ def compute_clip_weight_map(hand_df: pd.DataFrame,
 
 # ── matching ───────────────────────────────────────────────────────────
 
+def _load_clip_manifest(human_dir: str) -> dict[str, dict]:
+    """Load optional seedance_clip manifest keyed by task-relative clip path."""
+    manifest_path = os.path.join(human_dir, "manifest.jsonl")
+    if not os.path.isfile(manifest_path):
+        return {}
+
+    records = {}
+    with open(manifest_path) as f:
+        for line in f:
+            record = json.loads(line)
+            clip_rel = record["clip"]
+            parts = clip_rel.split(os.sep, 2)
+            if len(parts) != 3:
+                raise ValueError(f"invalid clip path in manifest: {clip_rel}")
+            records[parts[2]] = record
+    return records
+
+
+def _expand_task_spec(task_spec: str, default_tasks: list[str]) -> list[str]:
+    """Resolve CLI task spec to short task names used by pair generators."""
+    task_groups = {
+        "all": default_tasks,
+        "training": default_tasks,
+        "inspire": [t for t in ALL_TASKS if "G1_WBT_Inspire_" in t],
+        "brainco": [t for t in ALL_TASKS if "G1_WBT_Brainco_" in t],
+    }
+    key = task_spec.lower()
+    if key in task_groups:
+        return [t.replace("G1_WBT_", "") for t in task_groups[key]]
+    return [t.strip() for t in task_spec.split(",") if t.strip()]
+
+
 def collect_pairs(task: str, second: str, human_root: str,
                   source_second: str | None = None) -> list[dict]:
     """Find all (human, robot) pairs for a given task and clip duration.
 
-    When *source_second* differs from *second* (e.g. source_second="4s",
-    second="1s"), walks the source_second directory and cuts each source
-    video into floor(source_dur/target_dur) non-overlapping clips.
+    For pre-cut Seedance direct 1s clips, reads manifest.jsonl when present so
+    overlapping windows and hflip augmentation keep their true source time.
 
     Returns list of dicts with keys:
       task, human_src, robot_src, clip_start, clip_dur, source_id, episode, seg, clip_idx
@@ -190,6 +229,7 @@ def collect_pairs(task: str, second: str, human_root: str,
     src_dur = {"1s": 1.0, "2s": 2.0, "4s": 4.0}[src_sec]
     cross_cut = (src_sec != second)
     clips_per_seg = int(src_dur / dur_sec) if cross_cut else 1
+    manifest = _load_clip_manifest(human_dir) if not cross_cut else {}
     pairs = []
 
     for root, _, files in os.walk(human_dir):
@@ -218,10 +258,12 @@ def collect_pairs(task: str, second: str, human_root: str,
                         "clip_idx": ci,
                         "human_src": human_src,
                         "robot_src": robot_src,
-                        "clip_start": ci * dur_sec,
-                        "clip_dur": dur_sec,
-                        "source_id": f"{task}/{ep_dir}/{seg}_clip{ci:02d}",
-                    })
+                    "clip_start": ci * dur_sec,
+                    "human_clip_start": ci * dur_sec,
+                    "clip_dur": dur_sec,
+                    "source_segment_id": f"{task}/{ep_dir}/{seg}",
+                    "source_id": f"{task}/{ep_dir}/{seg}_clip{ci:02d}",
+                })
             elif src_sec == "4s":
                 m = re.match(r"(seg\d+)_human\.mp4$", fname)
                 if not m:
@@ -239,7 +281,9 @@ def collect_pairs(task: str, second: str, human_root: str,
                     "human_src": human_src,
                     "robot_src": robot_src,
                     "clip_start": 0.0,
+                    "human_clip_start": 0.0,
                     "clip_dur": dur_sec,
+                    "source_segment_id": f"{task}/{ep_dir}/{seg}",
                     "source_id": f"{task}/{ep_dir}/{seg}",
                 })
             else:
@@ -248,21 +292,39 @@ def collect_pairs(task: str, second: str, human_root: str,
                     continue
                 seg = m.group(1)
                 clip_idx = int(m.group(2))
-                clip_start = clip_idx * dur_sec
+                clip_rel = os.path.relpath(human_src, human_dir)
+                manifest_record = manifest.get(clip_rel)
+                if manifest_record:
+                    clip_start = float(manifest_record["start"])
+                    clip_dur = float(manifest_record["duration"])
+                    augment = manifest_record.get("augment", "normal")
+                    window_idx = manifest_record.get("window_idx", clip_idx)
+                else:
+                    clip_start = clip_idx * dur_sec
+                    clip_dur = dur_sec
+                    augment = "normal"
+                    window_idx = clip_idx
                 robot_src = os.path.join(_MAIN_SEGMENT, task, ep_dir,
                                          f"{seg}_video.mp4")
                 if not os.path.isfile(robot_src):
                     continue
+                source_suffix = f"clip{clip_idx:02d}"
+                if augment != "normal":
+                    source_suffix += f"_{augment}"
                 pairs.append({
                     "task": task,
                     "episode": ep_dir,
                     "seg": seg,
                     "clip_idx": clip_idx,
+                    "window_idx": window_idx,
+                    "augment": augment,
                     "human_src": human_src,
                     "robot_src": robot_src,
                     "clip_start": clip_start,
-                    "clip_dur": dur_sec,
-                    "source_id": f"{task}/{ep_dir}/{seg}_clip{clip_idx:02d}",
+                    "human_clip_start": 0.0 if manifest_record else clip_start,
+                    "clip_dur": clip_dur,
+                    "source_segment_id": f"{task}/{ep_dir}/{seg}",
+                    "source_id": f"{task}/{ep_dir}/{seg}_{source_suffix}",
                 })
 
     pairs.sort(key=lambda p: p["source_id"])
@@ -272,29 +334,63 @@ def collect_pairs(task: str, second: str, human_root: str,
 # ── splitting ──────────────────────────────────────────────────────────
 
 def split_by_task(all_pairs: list[dict], ood_tasks: set[str],
-                  per_task_eval: int, split_seed: int
+                  per_task_eval: int, split_seed: int,
+                  max_ood_per_task: int = 0,
+                  per_task_eval_clips: int = 0,
                   ) -> dict[str, list[dict]]:
     """Partition pairs into {train, eval, ood_eval} by task.
 
-    - OOD tasks: every clip → ood_eval
-    - Non-OOD tasks: seed-deterministic shuffle, first `per_task_eval` → eval,
-      rest → train
+    - OOD tasks: every source segment → ood_eval
+    - Non-OOD tasks: split by source segment, so overlapping windows and hflip
+      variants from one 4s source never leak across train/eval
     """
-    by_task: dict[str, list[dict]] = {}
+    by_task: dict[str, dict[str, list[dict]]] = {}
     for p in all_pairs:
-        by_task.setdefault(p["task"], []).append(p)
+        segment_id = p.get("source_segment_id") or f"{p['task']}/{p['episode']}/{p['seg']}"
+        by_task.setdefault(p["task"], {}).setdefault(segment_id, []).append(p)
 
     splits: dict[str, list[dict]] = {"train": [], "eval": [], "ood_eval": []}
-    for task, clips in sorted(by_task.items()):
+    for task, segment_groups in sorted(by_task.items()):
         if task in ood_tasks:
+            clips = [
+                clip
+                for segment_id in sorted(segment_groups)
+                for clip in sorted(segment_groups[segment_id],
+                                   key=lambda p: p["source_id"])
+            ]
+            if max_ood_per_task > 0:
+                clips = clips[:max_ood_per_task]
             splits["ood_eval"].extend(clips)
             continue
         rng = random.Random(f"{split_seed}:{task}")
-        shuffled = list(clips)
-        rng.shuffle(shuffled)
-        n_eval = min(per_task_eval, max(0, len(shuffled) - 1))  # keep >=1 for train
-        splits["eval"].extend(shuffled[:n_eval])
-        splits["train"].extend(shuffled[n_eval:])
+        segment_ids = sorted(segment_groups)
+        rng.shuffle(segment_ids)
+        if per_task_eval_clips > 0:
+            remaining_eval = per_task_eval_clips
+            heldout_segments = set()
+            for segment_id in segment_ids:
+                if remaining_eval == 0:
+                    break
+                segment_clips = sorted(segment_groups[segment_id],
+                                       key=lambda p: p["source_id"])
+                take = min(remaining_eval, len(segment_clips))
+                splits["eval"].extend(segment_clips[:take])
+                heldout_segments.add(segment_id)
+                remaining_eval -= take
+            if remaining_eval != 0:
+                raise RuntimeError(
+                    f"task {task} has insufficient clips for "
+                    f"per_task_eval_clips={per_task_eval_clips}")
+            for segment_id in segment_ids:
+                if segment_id in heldout_segments:
+                    continue
+                splits["train"].extend(segment_groups[segment_id])
+        else:
+            n_eval = min(per_task_eval, max(0, len(segment_ids) - 1))
+            eval_segments = set(segment_ids[:n_eval])
+            for segment_id in segment_ids:
+                bucket = "eval" if segment_id in eval_segments else "train"
+                splits[bucket].extend(segment_groups[segment_id])
 
     for name in splits:
         splits[name].sort(key=lambda p: p["source_id"])
@@ -315,12 +411,14 @@ def process_pair(p: dict, do_compare: bool, resume: bool,
     if not (resume and os.path.isfile(p["out_robot"])):
         make_robot_clip(p["robot_src"], p["out_robot"],
                         p["clip_start"], p["clip_dur"],
-                        num_frames=num_frames)
+                        num_frames=num_frames,
+                        hflip=p.get("augment") == "hflip")
 
     # human → control_video/ (condition)
     if not (resume and os.path.isfile(p["out_human"])):
         make_human_clip(p["human_src"], p["out_human"],
-                        start=p["clip_start"], duration=p["clip_dur"],
+                        start=p.get("human_clip_start", p["clip_start"]),
+                        duration=p["clip_dur"],
                         num_frames=num_frames)
 
     # compare
@@ -332,13 +430,14 @@ def process_pair(p: dict, do_compare: bool, resume: bool,
     # hand patch weight map
     if hand_patch and p.get("hand_df") is not None:
         hand_df = p["hand_df"]
-        clip_idx = p.get("clip_idx") or 0
         seg_start = int(hand_df["frame_idx"].min())
-        clip_start_frame = seg_start + int(clip_idx * p["clip_dur"] * SEGMENT_FPS)
+        clip_start_frame = seg_start + int(p["clip_start"] * SEGMENT_FPS)
         clip_frames = int(p["clip_dur"] * SEGMENT_FPS)
         weights = compute_clip_weight_map(
             p["hand_df"], clip_start_frame, clip_frames, hand_weight)
         if weights is not None:
+            if p.get("augment") == "hflip":
+                weights = torch.flip(weights, dims=[2])
             split_dir = os.path.dirname(os.path.dirname(p["out_robot"]))
             patch_dir = os.path.join(split_dir, "hand_patch")
             os.makedirs(patch_dir, exist_ok=True)
@@ -395,7 +494,12 @@ def main():
                     help="comma-separated task short names routed entirely to "
                          "ood_eval split")
     ap.add_argument("--per-task-eval", type=int, default=1,
-                    help="clips per non-OOD task to reserve for in-task eval")
+                    help="source segments per non-OOD task reserved for eval")
+    ap.add_argument("--per-task-eval-clips", type=int, default=0,
+                    help="exact eval clip budget per non-OOD task; keeps whole "
+                         "source segments and skips segments that would exceed budget")
+    ap.add_argument("--max-ood-per-task", type=int, default=0,
+                    help="max clips per OOD task routed to ood_eval (0 = all)")
     ap.add_argument("--split-seed", type=int, default=42)
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--hand-patch", action="store_true",
@@ -407,14 +511,7 @@ def main():
     human_root = HUMAN_SOURCE_MAP[args.human_source]
     seconds = ["1s", "2s", "4s"] if args.second == "all" else [args.second]
 
-    TASK_GROUPS = {"all": None, "inspire": "Inspire_", "brainco": "Brainco_"}
-    key = args.task.lower()
-    if key in TASK_GROUPS:
-        prefix = TASK_GROUPS[key]
-        short = [t.replace("G1_WBT_", "") for t in ALL_TASKS]
-        tasks = [t for t in short if prefix is None or t.startswith(prefix)]
-    else:
-        tasks = [t.strip() for t in args.task.split(",")]
+    tasks = _expand_task_spec(args.task, TRAINING_TASKS)
 
     ood_tasks = {t.strip() for t in args.ood_tasks.split(",") if t.strip()}
 
@@ -427,6 +524,8 @@ def main():
     print(f"  workers:       {args.workers}")
     print(f"  ood tasks:     {sorted(ood_tasks)}")
     print(f"  per-task eval: {args.per_task_eval}")
+    print(f"  per-task eval clips: {args.per_task_eval_clips or '(disabled)'}")
+    print(f"  max OOD per task: {args.max_ood_per_task or '(all)'}")
     print(f"  split seed:    {args.split_seed}")
     print(f"  source-second: {args.source_second or '(same as --second)'}")
     print(f"  clean:         {args.clean}")
@@ -472,6 +571,8 @@ def main():
 
         splits = split_by_task(
             all_pairs, ood_tasks, args.per_task_eval, args.split_seed,
+            max_ood_per_task=args.max_ood_per_task,
+            per_task_eval_clips=args.per_task_eval_clips,
         )
 
         print(f"\n[{sec}] {len(all_pairs)} pairs -> "
@@ -505,6 +606,11 @@ def main():
                     "episode": p["episode"],
                     "seg": p["seg"],
                     "clip_idx": p["clip_idx"],
+                    "window_idx": p.get("window_idx"),
+                    "augment": p.get("augment", "normal"),
+                    "clip_start": p["clip_start"],
+                    "clip_dur": p["clip_dur"],
+                    "source_segment_id": p.get("source_segment_id"),
                     "source_id": p["source_id"],
                     "human_src": p["human_src"],
                     "robot_src": p["robot_src"],

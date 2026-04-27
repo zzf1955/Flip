@@ -13,10 +13,14 @@ Output format is identical to make_pair.py so mitty_cache.py can be reused
 directly without modification.
 
 Usage:
+  # Formal identity data: --task all expands to TRAINING_TASKS only.
   python -m src.pipeline.make_robot_pair --task all --max-segments 500 --clean
 
   python -m src.pipeline.make_robot_pair --task all --max-segments 50 \
     --per-task-eval 3 --workers 8
+
+  # Historical/debug data outside TRAINING_TASKS must be requested explicitly.
+  python -m src.pipeline.make_robot_pair --task inspire --max-segments 50
 """
 
 import argparse
@@ -33,7 +37,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 sys.stdout.reconfigure(line_buffering=True)
 
-from src.core.config import ALL_TASKS, SEGMENT_DIR, ROBOT_PAIR_DIR
+from src.core.config import ALL_TASKS, SEGMENT_DIR, ROBOT_PAIR_DIR, TRAINING_TASKS
 
 FFMPEG = os.environ.get(
     "FFMPEG_BIN",
@@ -89,6 +93,20 @@ def find_segments(tasks: list[str]) -> list[dict]:
                 })
     segments.sort(key=lambda s: f"{s['task']}/{s['episode']}/{s['seg']}")
     return segments
+
+
+def _expand_task_spec(task_spec: str, default_tasks: list[str]) -> list[str]:
+    """Resolve CLI task spec to short task names used by pair generators."""
+    task_groups = {
+        "all": default_tasks,
+        "training": default_tasks,
+        "inspire": [t for t in ALL_TASKS if "G1_WBT_Inspire_" in t],
+        "brainco": [t for t in ALL_TASKS if "G1_WBT_Brainco_" in t],
+    }
+    key = task_spec.lower()
+    if key in task_groups:
+        return [t.replace("G1_WBT_", "") for t in task_groups[key]]
+    return [t.strip() for t in task_spec.split(",") if t.strip()]
 
 
 def make_pairs_from_segments(segments: list[dict]) -> list[dict]:
@@ -174,14 +192,7 @@ def main():
                     help="remove existing robot_pair/1s/ before writing")
     args = ap.parse_args()
 
-    key = args.task.lower()
-    task_groups = {"all": None, "inspire": "Inspire_", "brainco": "Brainco_"}
-    if key in task_groups:
-        prefix = task_groups[key]
-        short = [t.replace("G1_WBT_", "") for t in ALL_TASKS]
-        tasks = [t for t in short if prefix is None or t.startswith(prefix)]
-    else:
-        tasks = [t.strip() for t in args.task.split(",")]
+    tasks = _expand_task_spec(args.task, TRAINING_TASKS)
 
     sec_dir = os.path.join(ROBOT_PAIR_DIR, "1s")
     if args.clean and os.path.isdir(sec_dir):

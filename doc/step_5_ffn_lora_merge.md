@@ -62,56 +62,56 @@ training_data/pair/1s_patch/
 # train split
 LD_PRELOAD=/home/leadtek/miniconda3/envs/flip/lib/libjpeg.so.8 \
   python -m src.pipeline.mitty_cache \
-    --pair-dir training_data/pair/1s_patch/train \
-    --output   training_data/cache/1s_patch/train \
-    --device cuda:0 --no-frames
+  --pair-dir training_data/pair/1s_patch/train \
+  --output   training_data/cache/1s_patch/train \
+  --device cuda:0 --no-frames
 
 # eval split
 LD_PRELOAD=/home/leadtek/miniconda3/envs/flip/lib/libjpeg.so.8 \
   python -m src.pipeline.mitty_cache \
-    --pair-dir training_data/pair/1s_patch/eval \
-    --output   training_data/cache/1s_patch/eval \
-    --device cuda:0 --no-frames
+  --pair-dir training_data/pair/1s_patch/eval \
+  --output   training_data/cache/1s_patch/eval \
+  --device cuda:0 --no-frames
 ```
 
 ### 2. 训练
 
 ```bash
-LD_PRELOAD=/home/leadtek/miniconda3/envs/flip/lib/libjpeg.so.8 \
-  CUDA_VISIBLE_DEVICES=2,3 \
-  torchrun --nproc_per_node=2 -m src.pipeline.train_mitty \
-    --merge-lora training_data/log/identity-mitty-bs8-2k/ckpt/step-4850.safetensors \
-    --merge-lora-rank 96 \
-    --lora-target-modules "ffn.0,ffn.2" \
-    --lora-rank 96 \
-    --cache-train training_data/cache/vae/1s_patch/train \
-    --cache-eval  training_data/cache/vae/1s_patch/eval \
-    --patch-dir   training_data/pair/1s_patch/train/patch \
-    --max-steps 2000 --save-steps 100 --eval-steps 100 \
-    --eval-video-steps 200 --eval-video-samples-in-task 4 \
-    --lr 1e-4 --warmup-steps 50 \
-    --wandb-run-name ffn-patch-mitty-bs2-2k \
-    --wandb-tags ffn_lora patch_recon
+scripts/flip_run.sh train --cuda 2,3 --nproc 2 -- \
+  --task-name ffn_patch \
+  --loss hand_patch \
+  --merge-lora training_data/log/identity-mitty-bs8-2k/ckpt/step-4850.safetensors \
+  --merge-lora-rank 96 \
+  --lora-target-modules "ffn.0,ffn.2" \
+  --lora-rank 96 \
+  --cache-train training_data/cache/vae/1s_patch/train \
+  --cache-eval  training_data/cache/vae/1s_patch/eval \
+  --patch-dir   training_data/pair/1s_patch/train/patch \
+  --max-steps 2000 --save-steps 100 --eval-steps 100 \
+  --eval-video-steps 100 --eval-video-samples-in-task 4 \
+  --lr 1e-4 --warmup-steps 50 \
+  --wandb-run-name ffn-patch-mitty-bs2-2k \
+  --wandb-tags ffn_lora patch_recon
 ```
 
-推荐通过统一入口 `train.py`：
+推荐通过统一入口 `scripts/flip_run.sh train`：
 
 ```bash
-LD_PRELOAD=/home/leadtek/miniconda3/envs/flip/lib/libjpeg.so.8 \
-  CUDA_VISIBLE_DEVICES=2,3 \
-  torchrun --nproc_per_node=2 -m src.pipeline.train \
-    --loss hand_patch \
-    --merge-lora training_data/log/identity-mitty-bs8-2k/ckpt/step-4850.safetensors \
-    --merge-lora-rank 96 \
-    --lora-target-modules "ffn.0,ffn.2" \
-    --lora-rank 96 \
-    --cache-train training_data/cache/vae/1s_patch/train \
-    --cache-eval  training_data/cache/vae/1s_patch/eval \
-    --patch-dir   training_data/pair/1s_patch/train/patch \
-    --max-steps 2000 --save-steps 100 --eval-steps 100 \
-    --lr 1e-4 --warmup-steps 50 \
-    --wandb-run-name ffn-patch-mitty-bs2-2k \
-    --wandb-tags ffn_lora patch_recon
+scripts/flip_run.sh train --cuda 2,3 --nproc 2 -- \
+  --task-name ffn_patch \
+  --loss hand_patch \
+  --merge-lora training_data/log/identity-mitty-bs8-2k/ckpt/step-4850.safetensors \
+  --merge-lora-rank 96 \
+  --lora-target-modules "ffn.0,ffn.2" \
+  --lora-rank 96 \
+  --cache-train training_data/cache/vae/1s_patch/train \
+  --cache-eval  training_data/cache/vae/1s_patch/eval \
+  --patch-dir   training_data/pair/1s_patch/train/patch \
+  --max-steps 2000 --save-steps 100 --eval-steps 100 \
+  --eval-video-steps 100 \
+  --lr 1e-4 --warmup-steps 50 \
+  --wandb-run-name ffn-patch-mitty-bs2-2k \
+  --wandb-tags ffn_lora patch_recon
 ```
 
 ## 新增 CLI 参数

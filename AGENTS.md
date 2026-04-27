@@ -13,7 +13,7 @@
 - 当前项目为了让 GPU/训练命令直接访问 `/dev/nvidia*`，Codex 可使用 `danger-full-access` + `approval_policy=never`；必须同时启用 Codex hooks，并使用 `scripts/codex_pre_tool_use_guard.py` 作为 Bash `PreToolUse` 护栏。
 - Hook 是最佳努力的命令前拦截，不是强沙箱；禁止依赖它执行高风险系统操作。
 - Hook 必须阻止 `sudo`、`su`、`doas`、`pkexec`、setuid/setgid chmod、chown root、明显的项目外递归删除、危险 git reset/clean/force push 等命令。
-- GPU/训练命令优先通过 `scripts/flip_run.sh <subcommand>` 统一入口执行，例如 `scripts/flip_run.sh train_mitty`、`scripts/flip_run.sh mitty_cache`、`scripts/flip_run.sh sam2_precompute`。
+- GPU/训练命令优先通过 `scripts/flip_run.sh <subcommand>` 统一入口执行，例如 `scripts/flip_run.sh train`、`scripts/flip_run.sh mitty_cache`、`scripts/flip_run.sh sam2_precompute`。
 - 禁止删除项目外文件或目录；如确需清理项目外缓存、模型或临时文件，必须先明确告知用户路径和影响并等待确认。
 - 对项目内的 destructive 操作（如 `rm`、`git reset`、批量覆盖生成结果），除非用户明确要求，也应先说明影响。
 
@@ -47,7 +47,7 @@ LD_PRELOAD=/home/leadtek/miniconda3/envs/flip/lib/libjpeg.so.8 \
 - 需要 GPU / CUDA 的命令优先使用统一入口，便于 Codex 按子命令自动批准越权：
 
 ```bash
-scripts/flip_run.sh train_mitty --cuda 2,3 --nproc 2 -- <train_mitty args>
+scripts/flip_run.sh train --cuda 2,3 --nproc 2 -- <train args>
 scripts/flip_run.sh mitty_cache --cuda 0 -- <mitty_cache args>
 scripts/flip_run.sh sam2_precompute --cuda 0 -- <sam2_precompute args>
 scripts/flip_run.sh nvidia-smi

@@ -44,7 +44,8 @@ from src.core.mask import postprocess_mask, init_lama, run_lama
 from src.core.smplh import SMPLHForIK, extract_g1_targets, R_SMPLH_TO_G1_NP
 from src.core.retarget import (
     retarget_frame, refine_arms,
-    compute_g1_rest_transforms, scale_hands, build_default_hand_pose,
+    compute_g1_rest_transforms, scale_hands, apply_finger_curl_from_g1,
+    DEFAULT_BODY_SCALE, DEFAULT_HAND_SCALE, DEFAULT_ROOT_OFFSET_G1,
 )
 from src.core.data import open_video_writer, write_frame, close_video
 
@@ -144,6 +145,33 @@ def mask_to_bbox(mask, margin=0):
     ], dtype=np.float32)
 
 
+def mask_to_point_prompts(mask, bbox, neg_margin=16):
+    """Build one positive centroid and four outside negative point prompts."""
+    ys, xs = np.nonzero(mask)
+    if len(xs) == 0 or bbox is None:
+        return None, None
+    h, w = mask.shape
+    points = [[float(xs.mean()), float(ys.mean())]]
+    labels = [1]
+
+    x1, y1, x2, y2 = bbox.astype(float)
+    cx = 0.5 * (x1 + x2)
+    cy = 0.5 * (y1 + y2)
+    candidates = [
+        [cx, y1 - neg_margin],
+        [cx, y2 + neg_margin],
+        [x1 - neg_margin, cy],
+        [x2 + neg_margin, cy],
+    ]
+    for x, y in candidates:
+        x = float(np.clip(x, 0, w - 1))
+        y = float(np.clip(y, 0, h - 1))
+        if mask[int(round(y)), int(round(x))] == 0:
+            points.append([x, y])
+            labels.append(0)
+    return np.array(points, dtype=np.float32), np.array(labels, dtype=np.int32)
+
+
 # ── Model loading ──
 
 def load_models(device, sam2_model, inpaint_method, skip_human=False):
@@ -186,12 +214,10 @@ def load_models(device, sam2_model, inpaint_method, skip_human=False):
     if not skip_human:
         print(f"Loading SMPLH (device={device})...")
         smplh = SMPLHForIK(device=device)
-        J_shaped, v_shaped = smplh.shape_blend(None, body_scale=0.75)
-        J_shaped, v_shaped = scale_hands(smplh, J_shaped, v_shaped, 1.3)
-
-        hand_L_np, hand_R_np = build_default_hand_pose()
-        hand_L_t = torch.tensor(hand_L_np, dtype=torch.float64, device=device)
-        hand_R_t = torch.tensor(hand_R_np, dtype=torch.float64, device=device)
+        J_shaped, v_shaped = smplh.shape_blend(
+            None, body_scale=DEFAULT_BODY_SCALE)
+        J_shaped, v_shaped = scale_hands(
+            smplh, J_shaped, v_shaped, DEFAULT_HAND_SCALE)
 
         # Drop head/neck faces
         HEAD_JOINTS = [12, 15]
@@ -206,10 +232,6 @@ def load_models(device, sam2_model, inpaint_method, skip_human=False):
         models["smplh"] = smplh
         models["J_shaped"] = J_shaped
         models["v_shaped"] = v_shaped
-        models["hand_L_np"] = hand_L_np
-        models["hand_R_np"] = hand_R_np
-        models["hand_L_t"] = hand_L_t
-        models["hand_R_t"] = hand_R_t
         models["faces_nohead"] = faces_nohead
         models["rest_transforms"] = rest_transforms
 
@@ -385,7 +407,12 @@ def process_segment(seg_info, task_manifest, models, args):
             for part_name in parts_to_prompt:
                 bbox = mask_to_bbox(part_masks[part_name], margin=args.bbox_margin)
                 if bbox is not None:
-                    all_prompts.append((seq_idx_f, part_name, bbox))
+                    points = labels = None
+                    if args.point_prompts:
+                        points, labels = mask_to_point_prompts(
+                            part_masks[part_name], bbox,
+                            neg_margin=args.negative_point_margin)
+                    all_prompts.append((seq_idx_f, part_name, bbox, points, labels))
                     frame_prompts.append((part_name, bbox))
             per_frame_prompts[seq_idx_f] = frame_prompts
 
@@ -420,10 +447,11 @@ def process_segment(seg_info, task_manifest, models, args):
             state = predictor.init_state(
                 video_path=jpeg_dir, offload_video_to_cpu=True)
 
-            for seq_i, part_name, bbox in all_prompts:
+            for seq_i, part_name, bbox, points, labels in all_prompts:
                 predictor.add_new_points_or_box(
                     inference_state=state, frame_idx=seq_i,
-                    obj_id=PART_IDS[part_name], box=bbox)
+                    obj_id=PART_IDS[part_name], box=bbox,
+                    points=points, labels=labels)
 
             for frame_idx, obj_ids, mask_logits in predictor.propagate_in_video(state):
                 masks = (mask_logits > 0.0).cpu().numpy()
@@ -562,10 +590,6 @@ def process_segment(seg_info, task_manifest, models, args):
         smplh = models["smplh"]
         J_shaped = models["J_shaped"]
         v_shaped = models["v_shaped"]
-        hand_L_np = models["hand_L_np"]
-        hand_R_np = models["hand_R_np"]
-        hand_L_t = models["hand_L_t"]
-        hand_R_t = models["hand_R_t"]
         faces_nohead = models["faces_nohead"]
         rest_transforms = models["rest_transforms"]
 
@@ -582,10 +606,18 @@ def process_segment(seg_info, task_manifest, models, args):
             transforms = do_fk(model_pin, data_pin, q)
             targets = extract_g1_targets(transforms)
 
+            hand_L_np, hand_R_np = apply_finger_curl_from_g1(
+                hs, hand_type=hand_type)
+            hand_L_t = torch.tensor(
+                hand_L_np, dtype=torch.float64, device=device)
+            hand_R_t = torch.tensor(
+                hand_R_np, dtype=torch.float64, device=device)
+
             # Retarget
             root_trans_np, root_orient_np, body_pose_np = retarget_frame(
                 transforms, rest_transforms, smplh, J_shaped,
                 wrist_rot_deg=(0, 0, 0))
+            root_trans_np = root_trans_np + R_SMPLH_TO_G1_NP.T @ DEFAULT_ROOT_OFFSET_G1
 
             root_t = torch.tensor(root_trans_np, dtype=torch.float64, device=device)
             root_o = torch.tensor(root_orient_np, dtype=torch.float64, device=device)
@@ -695,6 +727,10 @@ def parse_args():
                    choices=["tiny", "small", "base", "large"])
     p.add_argument("--prompt-interval", type=int, default=30)
     p.add_argument("--bbox-margin", type=int, default=0)
+    p.add_argument("--point-prompts", action="store_true",
+                   help="Add mesh-mask centroid positive point and outside negative points to each SAM2 box prompt")
+    p.add_argument("--negative-point-margin", type=int, default=16,
+                   help="Pixel distance from bbox edge for SAM2 negative point prompts")
     p.add_argument("--min-visible-area", type=int, default=50)
     p.add_argument("--intermediate-root", type=str,
                    default=DEFAULT_INTERMEDIATE_ROOT,

@@ -26,7 +26,7 @@ Usage:
     --patch-dir training_data/pair/1s/train/hand_patch \
     --cache-train training_data/cache/vae/pair_1s/train \
     --cache-eval  training_data/cache/vae/pair_1s/eval \
-    --max-steps 400
+    --max-steps 400 --eval-steps 100 --eval-video-steps 100
 """
 
 import argparse
@@ -635,7 +635,7 @@ def main():
     ap.add_argument("--batch-size", type=int, default=1,
                     help="per-rank training batch size")
     ap.add_argument("--save-steps", type=int, default=50)
-    ap.add_argument("--eval-steps", type=int, default=50)
+    ap.add_argument("--eval-steps", type=int, default=100)
     ap.add_argument("--eval-t-samples", type=int, default=5,
                     help="timesteps to sample per eval sample (reduces variance)")
 

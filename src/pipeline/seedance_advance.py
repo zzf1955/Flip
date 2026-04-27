@@ -6,7 +6,12 @@ human mesh overlay videos (from segment_pipeline Phase D) as input, asking
 Seedance to enhance the synthetic CG human into a photorealistic one.
 
 Input:   training_data/overlay/4s/<task>/ep<N>/seg<M>_human.mp4
-Output:  training_data/seedance_advance/4s/<task>/ep<N>/seg<M>_human.mp4
+Default output:
+         training_data/seedance_advance/4s/<task>/ep<N>/seg<M>_human.mp4
+
+For prompt-ablation or overlay-guided experiment outputs, pass --output-root,
+for example training_data/seedance_overlay/4s. The directory layout under the
+output root stays identical to training_data/seedance_direct/4s.
 
 Usage:
   ARK_API_KEY="ark-xxx" python -m src.pipeline.seedance_advance \
@@ -14,6 +19,9 @@ Usage:
 
   python -m src.pipeline.seedance_advance \
     --task Inspire_Pickup_Pillow_MainCamOnly --episode 0 --resume
+
+  python -m src.pipeline.seedance_advance \
+    --task all --output-root training_data/seedance_overlay/4s --resume
 
   python -m src.pipeline.seedance_advance --task all --dry-run
 
@@ -184,6 +192,8 @@ def main():
                    help="use fast model (default: standard)")
     p.add_argument("--resolution", default="480p",
                    choices=["480p", "720p", "1080p", "2k"])
+    p.add_argument("--output-root", default=OUTPUT_ROOT,
+                   help="output root, defaults to training_data/seedance_advance/4s")
     p.add_argument("--api-key", default=None,
                    help="Ark API key (or set ARK_API_KEY env)")
     p.add_argument("--workers", type=int, default=3,
@@ -209,12 +219,16 @@ def main():
 
     model = MODEL_FAST if args.fast else MODEL_STANDARD
 
+    output_root = args.output_root
+    if not os.path.isabs(output_root):
+        output_root = os.path.join(os.getcwd(), output_root)
+
     all_videos = []
     for task in tasks:
         videos = collect_overlay_videos(task, episodes)
         for vpath in videos:
             rel = os.path.relpath(vpath, os.path.join(INPUT_ROOT, task))
-            out_path = os.path.join(OUTPUT_ROOT, task, rel)
+            out_path = os.path.join(output_root, task, rel)
             all_videos.append((task, vpath, out_path))
 
     if not all_videos:
@@ -232,7 +246,7 @@ def main():
     ep_str = ",".join(str(e) for e in episodes) if episodes else "all"
     print(f"Seedance Advance Batch Generation")
     print(f"  input:    {INPUT_ROOT}")
-    print(f"  output:   {OUTPUT_ROOT}")
+    print(f"  output:   {output_root}")
     print(f"  tasks:    {', '.join(tasks)}")
     print(f"  episodes: {ep_str}")
     print(f"  model:    {model}")
@@ -289,7 +303,7 @@ def main():
           f"/ {len(results)} total")
     print(f"  tokens: {total_tokens}, time: {elapsed:.0f}s")
 
-    log_path = os.path.join(OUTPUT_ROOT, "batch_log.json")
+    log_path = os.path.join(output_root, "batch_log.json")
     with open(log_path, "w") as f:
         json.dump({
             "tasks": tasks,

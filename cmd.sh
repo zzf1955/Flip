@@ -9,7 +9,15 @@ export https_proxy="http://127.0.0.1:20171"
 export HTTP_PROXY="http://127.0.0.1:20171"
 export HTTPS_PROXY="http://127.0.0.1:20171"
 
+# leadtek2
 
+export http_proxy=http://10.20.1.4:20171
+export https_proxy=http://10.20.1.4:20171
+export HTTP_PROXY=http://10.20.1.4:20171
+export HTTPS_PROXY=http://10.20.1.4:20171
+export no_proxy=localhost,127.0.0.1,10.20.1.0/24
+export NO_PROXY=localhost,127.0.0.1,10.20.1.0/24
+export PACKY_API_KEY="sk-Xg2c9fAFxJ2lXhhqeoKwondPCNycymwVgVB9E0r3aX0vtwxZ"
 
 LD_PRELOAD=/home/leadtek/miniconda3/envs/flip/lib/libjpeg.so.8 \
     /home/leadtek/miniconda3/envs/flip/bin/python -m src.pipeline.robot_patch \

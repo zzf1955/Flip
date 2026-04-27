@@ -71,26 +71,25 @@ pip install wandb==0.26.0
 ### 训练启动示例
 
 ```bash
-LD_PRELOAD=/home/leadtek/miniconda3/envs/flip/lib/libjpeg.so.8 \
-  HTTP_PROXY=http://127.0.0.1:20171 HTTPS_PROXY=http://127.0.0.1:20171 \
+HTTP_PROXY=http://127.0.0.1:20171 HTTPS_PROXY=http://127.0.0.1:20171 \
   NO_PROXY=localhost,127.0.0.1 \
   WANDB_X_DISABLE_SERVICE=true WANDB_CORE=disabled \
-  CUDA_VISIBLE_DEVICES=2,3 \
-  torchrun --nproc_per_node=2 --master-port=29501 \
-    -m src.pipeline.train_mitty \
+  scripts/flip_run.sh train --cuda 2,3 --nproc 2 -- \
+    --task-name appearance \
+    --loss uniform \
     --cache-train output/mitty_cache_1s/train \
     --cache-eval  output/mitty_cache_1s/eval \
     --cache-ood   output/mitty_cache_1s/ood_eval \
-    --batch-size 4 --epochs 1 --repeat 112 \
+    --batch-size 4 \
     --lora-rank 96 --warmup-steps 50 --lr 1e-4 --lr-min 1e-6 \
-    --save-steps 200 --eval-steps 50 --eval-video-steps 200 \
+    --save-steps 200 --eval-steps 100 --eval-video-steps 100 \
     --eval-video-samples-ood -1 --eval-t-samples 5 \
     --wandb-project flip-mitty
 ```
 
 ## 训练代码约定
 
-`src/core/train_utils.py:WandbLogger` 在 rank 0 调用 `wandb.init(project=...)`，其他 rank `project=None` 即禁用。当前维护的 `train.py` / `train_mitty.py` 都经过这条路径。
+`src/core/train_utils.py:WandbLogger` 在 rank 0 调用 `wandb.init(project=...)`，其他 rank `project=None` 即禁用。当前维护的 `train.py` 经过这条路径；`train_mitty.py` 仅作为旧实现模块，不直接启动。
 
 ## 已知副作用
 
