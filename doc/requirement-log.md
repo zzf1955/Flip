@@ -1,5 +1,18 @@
 # 需求日志
 
+## 2026-04-26
+
+**用户原始需求：**
+> 写一个综合评估训练好的模型的脚本. 我需要在比较大的数据集上跑一些 metrics. 使用 Mitty-transfer-124d_r128_2000s_0425_1456 和 Mitty-transfer2LoRA-124d_r128_2000s_0425_1425 两个模型,在 flip/training_data/pair/1s 中的视频上测试现在的 FID,psnr 之类的指标. 先用模型生成视频(32+32),再计算指标. 写新的脚本进行测试
+
+**完成改动：**
+- 新增 `src/pipeline/evaluate_mitty_models.py`：默认评估两个指定 Mitty run 的 `step-2000.safetensors`，在 `eval` 与 `ood_eval` 各取 32 条 1s pair cache，先生成 `gen` 视频，并从 `training_data/pair/1s` 复制原始 `gt/ctrl` 视频，再计算 PSNR、SSIM、LPIPS、FID、FVD。
+- 更新 `src/tools/eval_metrics.py`：视频配对解析支持超过 99 个样本的可变长度编号，便于大数据集评估。
+- 更新 `scripts/flip_run.sh`：新增 `eval_mitty` 统一 GPU 入口。
+- 更新 `doc/step_5_training_infra.md`：记录离线综合评估入口、默认模型、`32+32` 数据口径、输出路径和复算指标方式。
+
+---
+
 ## 2026-04-24
 
 **用户原始需求：**
@@ -375,3 +388,85 @@
 - 验证日志写入 `tmp/t032/smoke/`；使用 `CUDA_VISIBLE_DEVICES=2` 确认 Codex 只看到卡 2，卡 3 未使用。
 
 - 新增 `scripts/smoke_t032_gpu.py`，在 `CUDA_VISIBLE_DEVICES=2` 下复制 1 条 pair 到 `tmp/t032/gpu_smoke/`，完成 `mitty_cache` 真实 VAE cache 生成和 `train.py` 1-step 训练/eval。
+
+## 2026-04-24 — 整体重构：配置、实验、Pipeline 与训练文档
+
+**用户原始需求：**
+> 当前项目有点乱，我要整体重构：统一路径管理与实验设置到 config；明确 Seedance direct、Seedance + Human Mesh/inpaint、Mitty transfer、Mitty 三阶段 LoRA pipeline；统一实验命名和参数管理，自动记录数据用量；实验类型通过参数指定；完全与外部 Diff sync 解耦；整理文档并细分 train Step5。给我一个重构计划，按照 /develop 走流程。
+
+讨论要点：
+- 该需求属于中大型重构，按 `doc/tasks/` 工作流先创建 pending 任务，不在 main 直接实施。
+- 新任务编号为 033，独立于已完成/待审的 T032。
+- 后续确认后应移动到 `active/033.md`，创建 `.worktrees/t033` 与 `feat/t033-config-pipeline-experiment-refactor` 分支实施。
+- 重点交付包括 config 路径中心化、受控 `experiment_type`、自动实验命名、manifest 数据用量记录、三阶段 LoRA 维度自动检测、外部 DiffSynth sync 解耦、Step5 train 文档重划分。
+
+**创建的任务：**
+- [033] 整体重构：配置化路径、实验管理、Pipeline 与训练文档重划分
+
+## 2026-04-25 — Seedance direct 1s 数据充分利用
+
+**用户原始需求：**
+> 当前 Seedance_direct 数据较少，需要重新做数据切片：1s 长度、0.5s 步长重叠滑窗；切片前/后加入左右翻转增强，输出到 Seedance_direct post-process，翻转 segment 编号往后排；不能做仿射变换；重新划分 eval 和 OOD，OOD task 换成 Put cloth into basket；可以重做切片和 cache，但不动 4s 切片数据。
+
+讨论要点：
+- `seedance_clip.py` 改为只从 `seedance_direct/4s/` 生成 `seedance_direct/1s/`，不修改 4s API 输出。
+- 每个 4s 源视频生成 7 个普通 1s 窗口和 7 个 hflip 窗口；普通编号 `clip00`–`clip06`，翻转编号 `clip07`–`clip13`。
+- 写出 `manifest.jsonl` 记录 `clip_start`、`duration`、`window_idx`、`augment`，避免后续按编号错误反推时间。
+- `make_pair.py` 读取 manifest，对 hflip 样本同步翻转 robot target 和 hand patch 权重图。
+- train/eval 改为按原始 4s segment 分组划分，避免重叠切片或翻转样本跨 split 泄漏。
+- OOD 默认任务改为 `Inspire_Pickup_Pillow_MainCamOnly`。
+---
+
+## 2026-04-25 — 人体 Mesh 全身贴合优化
+
+**用户原始需求：**
+> 可以把整个人体 Mesh 的贴合都改一下，不单单是手部的问题；尝试放大手部、调整骨骼，并验证人手渲染和机器人 Mesh 的贴合程度。
+
+**处理要点：**
+- 新增 `src/tools/body_fit_search.py`，以 G1 robot FK mesh mask 为目标，渲染 SMPLH mask 后计算 body/hand IoU、recall、precision 与加权 score。
+- 搜索参数包含 `body_scale`、`hand_scale`、G1 frame 下的 `root_x/root_z` 偏移。
+- `segment_pipeline.py` 主线接入动态手型，并将默认参数更新为：`body_scale=0.75`、`hand_scale=1.8`、`root_offset_g1=[0.02, 0.0, 0.0]`。
+- 验证结果：
+  - Basket/right-hand 样本 score 从 0.4372 提升到 0.5769，hand IoU 从 0.2021 提升到 0.4637。
+  - Collect/left-hand 样本 score 从 0.5791 提升到 0.6336，hand IoU 从 0.4121 提升到 0.5043。
+
+**创建的任务：**
+- [035] 人体 Mesh 全身贴合优化
+
+
+补充决策：
+- Pickup Pillow 改为 OOD task：`Inspire_Pickup_Pillow_MainCamOnly`。
+- OOD 取 32 条；非 OOD 的 4 个 Inspire 任务各取 8 条 eval，共 64 条评估数据。
+- `make_pair.py` 新增 `--max-ood-per-task` 和 `--per-task-eval-clips` 支持该固定数量划分。
+
+### 2026-04-25 Seedance overlay 批量输出目录
+
+- 需求：用 `training_data/overlay/4s/` 下的人体 mesh overlay 视频作为 Seedance 输入，prompt 为“修复视频中人的肢体, 白色上衣,黑色裤子,拖鞋.”，三路并发输出到 `training_data/seedance_overlay/4s/`，保持与 `seedance_direct/4s/` 一致的数据结构。
+- 实现：`src/pipeline/seedance_advance.py` 增加 `--output-root` 参数；默认行为仍输出 `training_data/seedance_advance/4s/`，本次实验使用 `--output-root training_data/seedance_overlay/4s`。
+- 运行：`python -m src.pipeline.seedance_advance --task all --output-root training_data/seedance_overlay/4s --prompt '修复视频中人的肢体, 白色上衣,黑色裤子,拖鞋.' --resume --workers 3`。
+
+## 2026-04-26
+
+**用户原始需求：**
+> 当前的训练代码中加几个功能：eval 视频的生成平分到所有 cuda 运行；eval loss 的计算平分到所有 cuda 运行。随后澄清：正式训练应每 100 step eval 一次；统一使用 `train` 作为入口，不要直接启动旧入口。
+
+**完成改动：**
+- `src/pipeline/train_mitty.py`：旧实现模块补齐 DDP eval loss / eval video 分片能力，便于 `train.py` 复用时保持一致行为。
+- `src/pipeline/train.py`：正式训练入口默认 `--eval-steps 100`；`--eval-video-steps -1` 继续表示跟随 eval loss 频率。
+- `scripts/flip_run.sh`、`AGENTS.md`、`doc/scripts_inventory.md`、`doc/codex_migration.md`：统一训练启动命令为 `scripts/flip_run.sh train ...`。
+- `doc/step_5_training_infra.md`、`doc/step_5_ffn_lora_merge.md`、`doc/step_5_wandb_setup.md`、`doc/step_5_two_stage_training.md`：明确正式实验使用 `train` 入口，eval loss / eval video 每 100 step 触发一次。
+
+## 2026-04-26 — 训练任务集合弃用 Basket
+
+**用户原始需求：**
+> 当前训练 pipeline 需要弃用 put the cloth into basket 任务；该任务手部外观有问题。目前仅使用三个 Task 集合：Inspire_Collect_Clothes_MainCamOnly、Inspire_Pickup_Pillow_MainCamOnly、Inspire_Put_Clothes_into_Washing_Machine。需要同时修改 Mitty 直接训练和 identity + appearance + transfer 三阶段 LoRA 训练。
+
+**完成改动：**
+- `src/core/config.py` 新增 `TRAINING_TASKS`，固定为三个维护中的训练任务，显式排除 `G1_WBT_Inspire_Put_Clothes_Into_Basket`。
+- `src/pipeline/make_pair.py --task all` 默认展开为 `TRAINING_TASKS`，用于 Mitty 直接外观 transfer 的 human→robot pair；仍可用显式任务短名或 `--task inspire` 调试历史任务。
+- `src/pipeline/make_robot_pair.py --task all` 默认展开为 `TRAINING_TASKS`，用于三阶段 LoRA 的 identity robot→robot pair。
+- `doc/step_5_training_infra.md` 与 `doc/step_5_two_stage_training.md` 同步记录三任务集合和 Basket 弃用原因。
+
+**补充说明：**
+- 只保留三个训练数据集的原因：`Inspire_Put_Clothes_into_Washing_Machine_MainCamOnly` 只有一条有效数据且是重复数据；`Inspire_Put_Clothes_Into_Basket` 的手部外观与其他任务不一致。
+- 文档补充了 Mitty 直接训练的 `make_pair --task all` 示例、三阶段 LoRA identity 的 `make_robot_pair --task all` 示例，以及显式调试历史任务的用法。

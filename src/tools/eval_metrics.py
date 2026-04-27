@@ -257,8 +257,9 @@ def find_pairs(step_dir: str) -> list[tuple[str, str, int]]:
     pairs = []
     for f in sorted(os.listdir(step_dir)):
         if f.startswith("gen_") and f.endswith(".mp4"):
-            idx = int(f[4:6])
-            gt = os.path.join(step_dir, f"gt_{idx:02d}.mp4")
+            sample_id = f[len("gen_"):-len(".mp4")]
+            idx = int(sample_id)
+            gt = os.path.join(step_dir, f"gt_{sample_id}.mp4")
             if os.path.exists(gt):
                 pairs.append((os.path.join(step_dir, f), gt, idx))
     return pairs

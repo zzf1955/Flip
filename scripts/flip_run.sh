@@ -16,18 +16,20 @@ Subcommands:
   nvidia-smi       Run NVIDIA-SMI on the host GPU device.
   mitty_cache      Run python -m src.pipeline.mitty_cache.
   sam2_precompute  Run python -m src.pipeline.sam2_precompute.
-  train_mitty      Run torchrun -m src.pipeline.train_mitty.
+  train            Run torchrun -m src.pipeline.train.
+  eval_mitty       Run python -m src.pipeline.evaluate_mitty_models.
 
 Launcher options:
   --cuda IDS       Set CUDA_VISIBLE_DEVICES inside this launcher, e.g. 0 or 2,3.
-  --nproc N        Set torchrun --nproc_per_node for train_mitty.
+  --nproc N        Set torchrun --nproc_per_node for train.
   -h, --help       Show this help.
 
 Examples:
   scripts/flip_run.sh nvidia-smi
   scripts/flip_run.sh mitty_cache --cuda 0 -- --pair-dir training_data/pair/1s/train --output training_data/cache/1s/train --device cuda:0 --no-frames
   scripts/flip_run.sh sam2_precompute --cuda 0 -- --task all --device cuda:0 --resume
-  scripts/flip_run.sh train_mitty --cuda 2,3 --nproc 2 -- --cache-train training_data/cache/1s/train --cache-eval training_data/cache/1s/eval
+  scripts/flip_run.sh train --cuda 2,3 --nproc 2 -- --task-name appearance --loss uniform --cache-train training_data/cache/1s/train --cache-eval training_data/cache/1s/eval
+  scripts/flip_run.sh eval_mitty --cuda 2 -- --device cuda:0 --samples-per-split 32
 USAGE
 }
 
@@ -61,7 +63,7 @@ case "$subcommand" in
   nvidia-smi)
     exec nvidia-smi "$@"
     ;;
-  mitty_cache|sam2_precompute|train_mitty)
+  mitty_cache|sam2_precompute|train|eval_mitty)
     ;;
   *)
     usage >&2
@@ -122,7 +124,7 @@ case "$subcommand" in
   sam2_precompute)
     exec "$PYTHON_BIN" -m src.pipeline.sam2_precompute "${script_args[@]}"
     ;;
-  train_mitty)
+  train)
     if [[ -z "$nproc" ]]; then
       if [[ -n "$cuda_devices" ]]; then
         nproc="$(count_cuda_devices "$cuda_devices")"
@@ -130,6 +132,9 @@ case "$subcommand" in
         nproc="1"
       fi
     fi
-    exec torchrun --nproc_per_node="$nproc" -m src.pipeline.train_mitty "${script_args[@]}"
+    exec torchrun --nproc_per_node="$nproc" -m src.pipeline.train "${script_args[@]}"
+    ;;
+  eval_mitty)
+    exec "$PYTHON_BIN" -m src.pipeline.evaluate_mitty_models "${script_args[@]}"
     ;;
 esac

@@ -10,7 +10,8 @@
 |------|------|------|
 | `python -m src.pipeline.mitty_cache` | 生成 Wan2.2 / Mitty 训练 cache | 维护 |
 | `python -m src.pipeline.train` | Mitty LoRA 正式训练入口 | 维护 |
-| `src.pipeline.train_mitty` | Mitty 训练实现模块与兼容入口 | 维护中，后续逐步收敛到 `train.py` |
+| `python -m src.pipeline.evaluate_mitty_models` | 离线生成评估视频并计算 PSNR/SSIM/LPIPS/FID/FVD | 维护 |
+| `src.pipeline.train_mitty` | 旧 Mitty 实现模块 | 仅供 `train.py` 复用 helper；不要直接启动 |
 
 ### 移除入口
 
@@ -61,6 +62,30 @@ from src.core.config import (
 
 ## Cache 管理
 
+Seedance direct 的 1s 训练数据由 `src.pipeline.seedance_clip` 从
+`training_data/seedance_direct/4s/` 重新后处理得到：每个 4s 源视频按
+1s 窗口、0.5s 步长生成 7 个普通切片，再生成 7 个水平翻转切片，编号
+`clip00`–`clip06` 为普通样本，`clip07`–`clip13` 为翻转样本。脚本会写出
+`training_data/seedance_direct/1s/<task>/manifest.jsonl`，`make_pair.py` 依赖
+该 manifest 对齐真实 `clip_start` 与增强类型；重建 1s 切片、pair 和 cache
+时不要改动 `seedance_direct/4s/` 原始 API 输出。
+
+当前 Seedance direct 1s 划分方案：`Inspire_Pickup_Pillow_MainCamOnly` 作为
+OOD，取 32 条进入 `ood_eval`；其余两个训练任务各取 8 条进入 `eval`。
+训练任务集合固定为：`Inspire_Collect_Clothes_MainCamOnly`、
+`Inspire_Pickup_Pillow_MainCamOnly`、`Inspire_Put_Clothes_into_Washing_Machine`。
+
+弃用数据集：
+
+- `Inspire_Put_Clothes_Into_Basket`：合成手部外观与其他任务不一致，不进入训练分布。
+- `Inspire_Put_Clothes_into_Washing_Machine_MainCamOnly`：只有一条有效数据且是重复数据，没有必要纳入训练。
+
+使用 `--max-ood-per-task 32 --per-task-eval-clips 8` 控制该划分。
+
+`src.pipeline.make_pair --task all` 与 `src.pipeline.make_robot_pair --task all`
+默认展开为上述三任务训练集合；如需调试历史/非训练任务，显式传入任务短名或
+`--task inspire`。
+
 训练前需要预计算 embedding 缓存，分为 **T5 文本缓存** 和 **VAE 视频缓存**。
 
 ```text
@@ -73,7 +98,6 @@ training_data/cache/
     │   ├── train/pair_NNNN.pth
     │   ├── eval/pair_NNNN.pth
     │   └── ood_eval/pair_NNNN.pth
-    ├── pair_1s_identity/
     └── robot_1s/
 ```
 
@@ -88,7 +112,19 @@ T5 embedding 不再重复嵌入每个样本文件。训练脚本通过 `--t5-cac
 
 ## 生成 Cache
 
+### Mitty 直接训练数据
+
 ```bash
+# --task all 等价于当前维护的三个 TRAINING_TASKS，不包含 Basket/MainCamOnly 重复集
+python -m src.pipeline.make_pair \
+  --task all \
+  --second 1s \
+  --human-source seedance_direct \
+  --ood-tasks Inspire_Pickup_Pillow_MainCamOnly \
+  --max-ood-per-task 32 \
+  --per-task-eval-clips 8 \
+  --clean
+
 CUDA_VISIBLE_DEVICES=2 python -m src.pipeline.mitty_cache \
   --pair-dir training_data/pair/1s/train \
   --output training_data/cache/vae/pair_1s/train \
@@ -100,7 +136,59 @@ CUDA_VISIBLE_DEVICES=2 python -m src.pipeline.mitty_cache \
   --save-workers 1
 ```
 
+如果只是调试历史任务或检查被弃用任务，需要显式指定任务，避免误混入正式训练数据：
+
+```bash
+python -m src.pipeline.make_pair \
+  --task Inspire_Put_Clothes_Into_Basket \
+  --second 1s \
+  --human-source seedance_direct \
+  --clean
+```
+
+### 三阶段 LoRA identity 数据
+
+```bash
+# --task all 同样只展开为 TRAINING_TASKS，供 identity 阶段使用
+python -m src.pipeline.make_robot_pair \
+  --task all \
+  --max-segments 500 \
+  --per-task-eval 5 \
+  --clean
+
+CUDA_VISIBLE_DEVICES=2 python -m src.pipeline.mitty_cache \
+  --pair-dir training_data/robot_pair/1s/train \
+  --output training_data/cache/vae/robot_1s/train \
+  --t5-cache-dir training_data/cache/t5 \
+  --device cuda:0 \
+  --batch-size 4
+```
+
 ## 训练命令
+
+## 离线综合评估
+
+`src.pipeline.evaluate_mitty_models` 用于比较训练完成的 Mitty LoRA run：先从
+`training_data/cache/vae/pair_1s/{eval,ood_eval}` 读取 1s pair cache 生成视频，
+再使用 `training_data/pair/1s/{split}/video` 中的原始 robot MP4 作为 GT，
+计算 PSNR、SSIM、LPIPS、FID 和 FVD。默认评估：
+
+- `Mitty-transfer-124d_r128_2000s_0425_1456/ckpt/step-2000.safetensors`
+- `Mitty-transfer2LoRA-124d_r128_2000s_0425_1425/ckpt/step-2000.safetensors`
+- `eval` 32 条 + `ood_eval` 32 条，即用户口径的 `32+32`
+
+推荐通过统一入口运行 GPU 评估：
+
+```bash
+scripts/flip_run.sh eval_mitty --cuda 2 -- \
+  --device cuda:0 \
+  --samples-per-split 32
+```
+
+输出目录默认是 `training_data/eval/mitty_pair_1s/`：每个 run/checkpoint/split
+下保存 `gen_*.mp4`、`gt_*.mp4`、`ctrl_*.mp4`，并在根目录写出
+`summary.csv` 与 `summary.json`。如只想复算已有视频的指标，可加
+`--no-generate`；如评估全集，可设 `--samples-per-split -1`。
 
 ### 轻量 smoke
 
@@ -121,8 +209,10 @@ CUDA_VISIBLE_DEVICES=2 python -m src.pipeline.train \
 
 ### 正式 Mitty 训练
 
+单卡：
+
 ```bash
-scripts/flip_run.sh train_mitty --cuda 2 -- \
+scripts/flip_run.sh train --cuda 2 -- \
   --task-name appearance \
   --loss uniform \
   --cache-train training_data/cache/vae/pair_1s/train \
@@ -132,14 +222,38 @@ scripts/flip_run.sh train_mitty --cuda 2 -- \
   --output-dir training_data/log \
   --max-steps 400 \
   --save-steps 50 \
-  --eval-steps 50 \
-  --eval-video-steps 50
+  --eval-steps 100 \
+  --eval-video-steps 100
 ```
+
+多卡：
+
+```bash
+scripts/flip_run.sh train --cuda 2,3 --nproc 2 -- \
+  --task-name appearance \
+  --loss uniform \
+  --cache-train training_data/cache/vae/pair_1s/train \
+  --cache-eval training_data/cache/vae/pair_1s/eval \
+  --cache-ood training_data/cache/vae/pair_1s/ood_eval \
+  --t5-cache-dir training_data/cache/t5 \
+  --output-dir training_data/log \
+  --max-steps 400 \
+  --save-steps 50 \
+  --eval-steps 100 \
+  --eval-video-steps 100
+```
+
+`train` 的 DDP 评估规则：
+
+- `eval loss` 按 cache 文件索引在所有 rank 间切分，每个 rank 计算自己的子集，再 `all_reduce` 成全局均值；随机种子使用全局样本索引，避免 GPU 数量变化改变评估语义。
+- `eval video` 按待生成视频的全局样本索引在所有 rank 间切分；所有 rank 写入同一个 `step-XXXX/`，文件名仍为 `gen_00.mp4`、`gt_00.mp4`、`ctrl_00.mp4` 这类全局编号。
+- CSV、W&B、eval video 上传和在线指标只在 rank 0 执行；视频生成完成后会用 DDP barrier 等待所有 rank 写完。
+- 正式实验默认 `--eval-steps 100 --eval-video-steps 100`，即 eval loss 和 eval video 都每 100 step 触发一次；smoke/debug 可临时调小。
 
 ### Hand-patch 加权
 
 ```bash
-scripts/flip_run.sh train_mitty --cuda 2 -- \
+scripts/flip_run.sh train --cuda 2 -- \
   --task-name hand_patch \
   --loss hand_patch \
   --patch-dir training_data/pair/1s/train/hand_patch \

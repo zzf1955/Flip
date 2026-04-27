@@ -92,7 +92,7 @@ GPU 命令应优先走统一入口 `scripts/flip_run.sh`，便于保持命令形
 scripts/flip_run.sh nvidia-smi
 scripts/flip_run.sh mitty_cache --cuda 0 -- --pair-dir training_data/pair/1s/train --output training_data/cache/1s/train --device cuda:0 --no-frames
 scripts/flip_run.sh sam2_precompute --cuda 0 -- --task all --device cuda:0 --resume
-scripts/flip_run.sh train_mitty --cuda 2,3 --nproc 2 -- --cache-train training_data/cache/1s/train --cache-eval training_data/cache/1s/eval
+scripts/flip_run.sh train --cuda 2,3 --nproc 2 -- --task-name appearance --loss uniform --cache-train training_data/cache/1s/train --cache-eval training_data/cache/1s/eval
 ```
 
 如需回退到强文件系统边界，可将 `sandbox_mode` 改回 `workspace-write`，并将 `approval_policy` 改回 `on-request`；此时 GPU 命令需要再次通过越权请求在沙箱外执行。

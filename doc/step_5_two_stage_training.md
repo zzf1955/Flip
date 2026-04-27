@@ -29,17 +29,29 @@
 
 ## 数据准备
 
+三阶段 LoRA 当前只使用三个训练任务集合：
+
+- `Inspire_Collect_Clothes_MainCamOnly`
+- `Inspire_Pickup_Pillow_MainCamOnly`
+- `Inspire_Put_Clothes_into_Washing_Machine`
+
+弃用数据集：
+
+- `Inspire_Put_Clothes_Into_Basket`：合成手部外观与其他任务不一致。
+- `Inspire_Put_Clothes_into_Washing_Machine_MainCamOnly`：只有一条有效数据且是重复数据。
+
+identity、appearance 和后续 transfer 阶段都不应使用这两个数据集。
+`make_robot_pair.py --task all` 与 `make_pair.py --task all` 默认均展开为上述三任务集合。
+
 ### Phase 1 数据结构
 
 ```
-training_data/pair/1s_identity/
+training_data/robot_pair/1s/
 ├── train/
 │   ├── video/          → 原始 robot 视频（或 symlink）
 │   ├── metadata.csv    → control_video 列也指向 video/ 下同名文件
 ├── eval/
 │   └── (同上)
-└── ood_eval/
-    └── (同上)
 ```
 
 **metadata.csv 格式**（关键：两列指向同一文件）：
@@ -62,28 +74,33 @@ video/pair_0001.mp4,A first-person view robot arm performing household tasks fli
 ### Phase 1: 生成 identity cache + 训练
 
 ```bash
+# 0. 生成 identity pair；--task all 默认只包含当前维护的三任务集合
+python -m src.pipeline.make_robot_pair \
+  --task all \
+  --max-segments 500 \
+  --per-task-eval 5 \
+  --clean
+
 # 1. 生成 identity pair cache（T5 + VAE 编码）
 python -m src.pipeline.mitty_cache \
-  --pair-dir training_data/pair/1s_identity/train \
-  --output   output/mitty_cache_1s_identity/train \
+  --pair-dir training_data/robot_pair/1s/train \
+  --output   training_data/cache/vae/robot_1s/train \
+  --t5-cache-dir training_data/cache/t5 \
   --device   cuda:2
 
 python -m src.pipeline.mitty_cache \
-  --pair-dir training_data/pair/1s_identity/eval \
-  --output   output/mitty_cache_1s_identity/eval \
-  --device   cuda:2
-
-python -m src.pipeline.mitty_cache \
-  --pair-dir training_data/pair/1s_identity/ood_eval \
-  --output   output/mitty_cache_1s_identity/ood_eval \
+  --pair-dir training_data/robot_pair/1s/eval \
+  --output   training_data/cache/vae/robot_1s/eval \
+  --t5-cache-dir training_data/cache/t5 \
   --device   cuda:2
 
 # 2. Phase 1 训练（恒等重建）
-CUDA_VISIBLE_DEVICES=2 python -m src.pipeline.train_mitty \
-  --cache-train output/mitty_cache_1s_identity/train \
-  --cache-eval  output/mitty_cache_1s_identity/eval \
-  --cache-ood   output/mitty_cache_1s_identity/ood_eval \
-  --max-steps 400 --save-steps 50 --eval-steps 50 \
+scripts/flip_run.sh train --cuda 2 -- \
+  --task-name identity \
+  --loss uniform \
+  --cache-train training_data/cache/vae/robot_1s/train \
+  --cache-eval  training_data/cache/vae/robot_1s/eval \
+  --max-steps 400 --save-steps 50 --eval-steps 100 \
   --eval-video-steps 100
 ```
 
@@ -91,31 +108,36 @@ CUDA_VISIBLE_DEVICES=2 python -m src.pipeline.train_mitty \
 
 ```bash
 # 用 Phase 1 最佳 ckpt 初始化
-CUDA_VISIBLE_DEVICES=2 python -m src.pipeline.train_mitty \
+scripts/flip_run.sh train --cuda 2 -- \
+  --task-name appearance \
+  --loss uniform \
   --init-lora training_data/log/<phase1-run>/ckpt/step-0400.safetensors \
   --cache-train output/mitty_cache_1s/train \
   --cache-eval  output/mitty_cache_1s/eval \
   --cache-ood   output/mitty_cache_1s/ood_eval \
-  --max-steps 400 --save-steps 50 --eval-steps 50
+  --max-steps 400 --save-steps 50 --eval-steps 100
 ```
 
 ### DDP 多卡版本
 
 ```bash
 # Phase 1
-torchrun --nproc_per_node=4 -m src.pipeline.train_mitty \
-  --cache-train output/mitty_cache_1s_identity/train \
-  --cache-eval  output/mitty_cache_1s_identity/eval \
-  --cache-ood   output/mitty_cache_1s_identity/ood_eval \
-  --max-steps 400 --save-steps 50 --eval-steps 50
+scripts/flip_run.sh train --cuda 0,1,2,3 --nproc 4 -- \
+  --task-name identity \
+  --loss uniform \
+  --cache-train training_data/cache/vae/robot_1s/train \
+  --cache-eval  training_data/cache/vae/robot_1s/eval \
+  --max-steps 400 --save-steps 50 --eval-steps 100
 
 # Phase 2
-torchrun --nproc_per_node=4 -m src.pipeline.train_mitty \
+scripts/flip_run.sh train --cuda 0,1,2,3 --nproc 4 -- \
+  --task-name appearance \
+  --loss uniform \
   --init-lora training_data/log/<phase1-run>/ckpt/step-0400.safetensors \
   --cache-train output/mitty_cache_1s/train \
   --cache-eval  output/mitty_cache_1s/eval \
   --cache-ood   output/mitty_cache_1s/ood_eval \
-  --max-steps 400 --save-steps 50 --eval-steps 50
+  --max-steps 400 --save-steps 50 --eval-steps 100
 ```
 
 ## 训练预期
@@ -154,8 +176,8 @@ Identity cache 中 `human_frames` 和 `robot_frames` 完全相同。可以使用
 
 ```bash
 python -m src.pipeline.mitty_cache \
-  --pair-dir training_data/pair/1s_identity/train \
-  --output output/mitty_cache_1s_identity/train \
+  --pair-dir training_data/robot_pair/1s/train \
+  --output training_data/cache/vae/robot_1s/train \
   --device cuda:2 --no-frames
 ```
 

@@ -419,6 +419,10 @@ def retarget_frame(g1_transforms, g1_rest_transforms, smplh, J_shaped,
 
 # ── Hand pose construction ────────────────────────────────────────────
 
+DEFAULT_BODY_SCALE = 0.75
+DEFAULT_HAND_SCALE = 1.8
+DEFAULT_ROOT_OFFSET_G1 = np.array([0.02, 0.0, 0.0], dtype=np.float64)
+
 def scale_hands(smplh, J_shaped, v_shaped, hand_scale):
     """Scale both hands (joints + vertices) relative to their respective wrists.
 
