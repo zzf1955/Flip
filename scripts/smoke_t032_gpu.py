@@ -103,12 +103,7 @@ def main() -> int:
     run(
         [
             str(PYTHON), "-m", "src.pipeline.train",
-            "--task-name", "t032_e2e_smoke",
-            "--loss", "uniform",
-            "--cache-train", str(SMOKE_ROOT / "cache_generated" / "train"),
-            "--cache-eval", str(SMOKE_ROOT / "cache" / "eval"),
-            "--t5-cache-dir", str(SMOKE_ROOT / "t5"),
-            "--output-dir", str(SMOKE_ROOT / "e2e_train_run"),
+            "--task-name", "smoke_t032_e2e",
             "--device", "cuda:0",
             "--max-steps", "1",
             "--save-steps", "1",

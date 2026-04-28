@@ -75,17 +75,16 @@ HTTP_PROXY=http://127.0.0.1:20171 HTTPS_PROXY=http://127.0.0.1:20171 \
   NO_PROXY=localhost,127.0.0.1 \
   WANDB_X_DISABLE_SERVICE=true WANDB_CORE=disabled \
   scripts/flip_run.sh train --cuda 2,3 --nproc 2 -- \
-    --task-name appearance \
-    --loss uniform \
-    --cache-train output/mitty_cache_1s/train \
-    --cache-eval  output/mitty_cache_1s/eval \
-    --cache-ood   output/mitty_cache_1s/ood_eval \
+    --task-name attn_ffn_selected \
     --batch-size 4 \
     --lora-rank 96 --warmup-steps 50 --lr 1e-4 --lr-min 1e-6 \
     --save-steps 200 --eval-steps 100 --eval-video-steps 100 \
     --eval-video-samples-ood -1 --eval-t-samples 5 \
     --wandb-project flip-mitty
 ```
+
+W&B `config` 会记录完整最终参数；tags 会额外追加所有 effective args 的
+`p:key=value` 形式，便于按 task、cache、LoRA、eval 配置检索。
 
 ## 训练代码约定
 
