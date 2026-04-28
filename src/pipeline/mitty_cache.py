@@ -2,12 +2,12 @@
 Mitty cache: encode (human_video, robot_video, prompt) → separate VAE + T5 caches.
 
 VAE cache (per sample):
-    Output: training_data/cache/vae/<dataset>/<split>/pair_NNNN.pth
-    Keys:   human_latent, robot_latent, prompt, source_id
+    Output: training_data/cache/vae/<data_type>/<duration>/<task>/pair_NNNN.pth
+    Keys:   human_latent, robot_latent, prompt, source_id, task metadata
 
-T5 cache (per unique prompt, shared across all datasets):
-    Output: training_data/cache/t5/prompt_NNN.pth  (positive)
-            training_data/cache/t5/negative.pth
+T5 cache (per unique prompt, shared within one dataset):
+    Output: training_data/cache/t5/<dataset>/prompt_NNN.pth  (positive)
+            training_data/cache/t5/<dataset>/negative.pth
     Keys:   embedding (1, 512, 4096), prompt (str)
 
 Usage:
@@ -20,8 +20,9 @@ Usage:
         --prefetch-batches 2 \\
         --save-workers 1
 
-    # T5 cache is written to --t5-cache-dir (default: training_data/cache/t5/)
-    # and only encoded once per unique prompt.
+    # T5 cache is written to --t5-cache-dir. If omitted, it is inferred from
+    # --output, e.g. training_data/cache/vae/pair_1s/train ->
+    # training_data/cache/t5/pair_1s.
 
 Legacy (old format with embedded T5 + frames):
     python -m src.pipeline.mitty_cache \\
@@ -271,6 +272,81 @@ def _save_t5_cache(t5_dir: str, prompts: list[str], neg_prompt: str,
     return saved
 
 
+def infer_t5_cache_dir(output_dir: Path) -> Path:
+    """Infer dataset-matched T5 cache dir from a VAE cache output path."""
+    resolved_output = output_dir.resolve()
+    vae_root = (Path(MAIN_ROOT) / "training_data" / "cache" / "vae").resolve()
+    try:
+        rel = resolved_output.relative_to(vae_root)
+    except ValueError as exc:
+        raise ValueError(
+            "--t5-cache-dir is required when --output is not under "
+            f"{vae_root}/<dataset> or {vae_root}/<data_type>/<duration>/<task>: "
+            f"{resolved_output}"
+        ) from exc
+    parts = rel.parts
+    if len(parts) < 1:
+        raise ValueError(
+            "Cannot infer T5 cache dir from --output; expected "
+            f"{vae_root}/<dataset> or {vae_root}/<data_type>/<duration>/<task>, "
+            f"got {resolved_output}"
+        )
+    if len(parts) >= 3 and parts[1].endswith("s"):
+        return Path(T5_CACHE_DIR) / parts[0] / parts[1]
+    return Path(T5_CACHE_DIR) / parts[0]
+
+
+def _read_pair_manifest(pair_dir: Path) -> dict[str, dict]:
+    manifest_path = pair_dir / "manifest.jsonl"
+    if not manifest_path.is_file():
+        return {}
+    records = {}
+    with manifest_path.open() as fh:
+        for line_no, line in enumerate(fh, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid JSON in {manifest_path}:{line_no}") from exc
+            video = record.get("video")
+            if video:
+                records[Path(video).name] = record
+    return records
+
+
+def _source_record_for(
+    row: dict, source_map: dict, manifest_by_video: dict[str, dict], split_name: str,
+) -> dict:
+    video_name = Path(row["video"]).name
+    if video_name in manifest_by_video:
+        return dict(manifest_by_video[video_name])
+    source_key = f"{split_name}/{video_name}"
+    return dict(source_map.get(source_key, {}))
+
+
+def _cache_manifest_record(
+    row: dict, out_path: Path, source_record: dict, pair_dir: Path,
+) -> dict:
+    record = dict(source_record)
+    record.setdefault("source_id", source_record.get("source_id", ""))
+    record.setdefault("source_segment_id", source_record.get("source_segment_id", ""))
+    record.setdefault("robot_task", source_record.get("task", ""))
+    record.setdefault("data_type", source_record.get("data_type", ""))
+    record.setdefault("duration", source_record.get("duration", ""))
+    record["prompt"] = row["prompt"]
+    record["cache_path"] = out_path.name
+    record["pair_dir"] = str(pair_dir)
+    return record
+
+
+def _write_jsonl(path: Path, rows: list[dict]):
+    with path.open("w") as fh:
+        for row in rows:
+            fh.write(json.dumps(row, sort_keys=True) + "\n")
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Encode pair videos + prompt to .pth cache for Mitty training")
@@ -278,7 +354,7 @@ def main():
                     help="pair split dir with video/ + control_video/ + metadata.csv")
     ap.add_argument("--output", required=True, help="VAE output cache dir")
     ap.add_argument("--t5-cache-dir", default="",
-                    help="T5 cache dir (default: training_data/cache/t5/)")
+                    help="T5 cache dir; default infers training_data/cache/t5/<dataset> from --output")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--resume", action="store_true",
                     help="skip pairs whose .pth already exists")
@@ -321,15 +397,15 @@ def main():
         args.pair_dir = os.path.join(MAIN_ROOT, args.pair_dir)
     if not os.path.isabs(args.output):
         args.output = os.path.join(MAIN_ROOT, args.output)
-    t5_dir = args.t5_cache_dir
-    if not t5_dir:
-        t5_dir = T5_CACHE_DIR
-    elif not os.path.isabs(t5_dir):
-        t5_dir = os.path.join(MAIN_ROOT, t5_dir)
-
     pair_dir = Path(args.pair_dir).resolve()
     output_dir = Path(args.output).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    t5_dir = args.t5_cache_dir
+    if not t5_dir:
+        t5_dir = str(infer_t5_cache_dir(output_dir))
+    elif not os.path.isabs(t5_dir):
+        t5_dir = os.path.join(MAIN_ROOT, t5_dir)
 
     metadata_path = pair_dir / "metadata.csv"
     if not metadata_path.exists():
@@ -350,6 +426,7 @@ def main():
 
     source_map_path = pair_dir.parent / "source_map.json"
     source_map = json.load(open(source_map_path)) if source_map_path.exists() else {}
+    manifest_by_video = _read_pair_manifest(pair_dir)
     split_name = pair_dir.name
 
     rows = list(csv.DictReader(open(metadata_path)))
@@ -397,6 +474,7 @@ def main():
     # VAE encoding
     skipped = 0
     encoded = 0
+    cache_manifest_rows: list[dict] = []
 
     if args.legacy:
         for idx, row in enumerate(rows):
@@ -416,8 +494,8 @@ def main():
             human_lat = encode_video(vae, human_frames, args.device).cpu()
             robot_lat = encode_video(vae, robot_frames, args.device).cpu()
 
-            source_key = f"{split_name}/{Path(row['video']).name}"
-            source_id = source_map.get(source_key, {}).get("source_id", "")
+            source_record = _source_record_for(
+                row, source_map, manifest_by_video, split_name)
 
             data = {
                 "human_latent": human_lat,
@@ -425,12 +503,19 @@ def main():
                 "context_posi": prompt_emb_cache[row["prompt"]],
                 "context_nega": nega_emb,
                 "prompt": row["prompt"],
-                "source_id": source_id,
+                "source_id": source_record.get("source_id", ""),
             }
+            for key in ("data_type", "duration", "robot_task", "task",
+                        "source_segment_id", "episode", "seg", "clip_idx",
+                        "input_role", "target_role"):
+                if key in source_record:
+                    data[key] = source_record[key]
             if not args.no_frames:
                 data["human_frames"] = human_frames
                 data["robot_frames"] = robot_frames
             torch.save(data, str(out_path))
+            cache_manifest_rows.append(
+                _cache_manifest_record(row, out_path, source_record, pair_dir))
             encoded += 1
 
             dt = time.time() - t0
@@ -473,15 +558,22 @@ def main():
             t_robot = time.time()
 
             for batch_idx, (_, row, out_path, _) in enumerate(batch_items):
-                source_key = f"{split_name}/{Path(row['video']).name}"
-                source_id = source_map.get(source_key, {}).get("source_id", "")
+                source_record = _source_record_for(
+                    row, source_map, manifest_by_video, split_name)
                 data = {
                     "human_latent": human_lats[batch_idx:batch_idx + 1],
                     "robot_latent": robot_lats[batch_idx:batch_idx + 1],
                     "prompt": row["prompt"],
-                    "source_id": source_id,
+                    "source_id": source_record.get("source_id", ""),
                 }
+                for key in ("data_type", "duration", "robot_task", "task",
+                            "source_segment_id", "episode", "seg", "clip_idx",
+                            "input_role", "target_role"):
+                    if key in source_record:
+                        data[key] = source_record[key]
                 submit_cache_save(save_pool, out_path, data)
+                cache_manifest_rows.append(
+                    _cache_manifest_record(row, out_path, source_record, pair_dir))
             t_submit = time.time()
 
             encoded += len(batch_items)
@@ -540,6 +632,9 @@ def main():
             while save_futures:
                 save_futures.popleft().result()
 
+    if cache_manifest_rows:
+        _write_jsonl(output_dir / "manifest.jsonl",
+                     sorted(cache_manifest_rows, key=lambda r: r["cache_path"]))
     print(f"\nDone. {encoded} encoded, {skipped} skipped → {output_dir}")
 
 

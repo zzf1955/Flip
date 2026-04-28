@@ -1,23 +1,22 @@
 """
-Generate training pairs and comparison videos, split into train / eval / ood_eval.
+Generate split-free task-organized training pairs and comparison videos.
 
 Matches segment (robot) videos with human videos (seedance_direct, overlay, or
 seedance_advance), resamples both to 16fps, and writes three independent
-subdirectories per duration:
-  pair/<second>/train/          <- majority of clips for training
-  pair/<second>/eval/           <- in-task eval, N clips per non-OOD task
-  pair/<second>/ood_eval/       <- OOD eval, all clips from --ood-tasks
+subdirectories per semantic data type, duration, and robot task:
+  pair/<data_type>/<second>/<task>/video/
+  pair/<data_type>/<second>/<task>/control_video/
 
-Each split gets its own pair_NNNN.mp4 numbering and metadata.csv. A top-level
-pair/<second>/source_map.json records the mapping back to (task, episode, seg).
+Each task directory gets its own pair_NNNN.mp4 numbering, metadata.csv, and
+manifest.jsonl. In-task/OOD splits are decided by training runtime.
 
 Usage:
   # Formal training data: --task all expands to TRAINING_TASKS only.
-  python -m src.pipeline.make_pair --task all --second 1s --clean
+  python -m src.pipeline.make_pair --task all --second 1s --data-type h2r --clean
 
   python -m src.pipeline.make_pair --task all --second 1s \
-    --human-source seedance_advance --hand-patch --hand-weight 3.0 \
-    --ood-tasks "" --per-task-eval 1
+    --data-type h2r --human-source seedance_advance \
+    --hand-patch --hand-weight 3.0
 
   # Historical/debug data outside TRAINING_TASKS must be requested explicitly.
   python -m src.pipeline.make_pair --task inspire --second 1s --clean
@@ -404,28 +403,42 @@ def process_pair(p: dict, do_compare: bool, resume: bool,
                  hand_patch: bool = False,
                  hand_weight: float = 3.0) -> dict:
     """Process a single pair. Returns metadata dict."""
-    os.makedirs(os.path.dirname(p["out_robot"]), exist_ok=True)
-    os.makedirs(os.path.dirname(p["out_human"]), exist_ok=True)
+    os.makedirs(os.path.dirname(p["out_target"]), exist_ok=True)
+    os.makedirs(os.path.dirname(p["out_control"]), exist_ok=True)
 
-    # robot → video/ (target)
-    if not (resume and os.path.isfile(p["out_robot"])):
-        make_robot_clip(p["robot_src"], p["out_robot"],
-                        p["clip_start"], p["clip_dur"],
-                        num_frames=num_frames,
-                        hflip=p.get("augment") == "hflip")
+    if not (resume and os.path.isfile(p["out_target"])):
+        if p["target_role"] == "robot":
+            make_robot_clip(p["robot_src"], p["out_target"],
+                            p["clip_start"], p["clip_dur"],
+                            num_frames=num_frames,
+                            hflip=p.get("augment") == "hflip")
+        elif p["target_role"] == "human":
+            make_human_clip(p["human_src"], p["out_target"],
+                            start=p.get("human_clip_start", p["clip_start"]),
+                            duration=p["clip_dur"],
+                            num_frames=num_frames)
+        else:
+            raise ValueError(f"Unknown target_role: {p['target_role']}")
 
-    # human → control_video/ (condition)
-    if not (resume and os.path.isfile(p["out_human"])):
-        make_human_clip(p["human_src"], p["out_human"],
-                        start=p.get("human_clip_start", p["clip_start"]),
-                        duration=p["clip_dur"],
-                        num_frames=num_frames)
+    if not (resume and os.path.isfile(p["out_control"])):
+        if p["input_role"] == "human":
+            make_human_clip(p["human_src"], p["out_control"],
+                            start=p.get("human_clip_start", p["clip_start"]),
+                            duration=p["clip_dur"],
+                            num_frames=num_frames)
+        elif p["input_role"] == "robot":
+            make_robot_clip(p["robot_src"], p["out_control"],
+                            p["clip_start"], p["clip_dur"],
+                            num_frames=num_frames,
+                            hflip=p.get("augment") == "hflip")
+        else:
+            raise ValueError(f"Unknown input_role: {p['input_role']}")
 
     # compare
     if do_compare:
         os.makedirs(os.path.dirname(p["compare"]), exist_ok=True)
         if not (resume and os.path.isfile(p["compare"])):
-            make_compare(p["out_robot"], p["out_human"], p["compare"])
+            make_compare(p["out_target"], p["out_control"], p["compare"])
 
     # hand patch weight map
     if hand_patch and p.get("hand_df") is not None:
@@ -438,40 +451,45 @@ def process_pair(p: dict, do_compare: bool, resume: bool,
         if weights is not None:
             if p.get("augment") == "hflip":
                 weights = torch.flip(weights, dims=[2])
-            split_dir = os.path.dirname(os.path.dirname(p["out_robot"]))
+            split_dir = os.path.dirname(os.path.dirname(p["out_target"]))
             patch_dir = os.path.join(split_dir, "hand_patch")
             os.makedirs(patch_dir, exist_ok=True)
-            pair_name = os.path.basename(p["out_robot"]).replace(".mp4", ".pth")
+            pair_name = os.path.basename(p["out_target"]).replace(".mp4", ".pth")
             torch.save({
                 "weights": weights,
                 "hand_weight": hand_weight,
             }, os.path.join(patch_dir, pair_name))
 
     return {
-        "video": p["rel_robot"],
+        "video": p["rel_target"],
         "prompt": PROMPT,
-        "control_video": p["rel_human"],
+        "control_video": p["rel_control"],
     }
 
 
 # ── main ───────────────────────────────────────────────────────────────
 
 def _clean_sec_dir(sec_dir: str):
-    """Remove old pair outputs (flat video/, control_video/, and split dirs)."""
-    for sub in ("video", "control_video", "compare",
-                "train", "eval", "ood_eval"):
+    """Remove old pair outputs for one data_type/duration directory."""
+    for sub in os.listdir(sec_dir) if os.path.isdir(sec_dir) else []:
         p = os.path.join(sec_dir, sub)
         if os.path.isdir(p):
             shutil.rmtree(p)
-    for f in ("metadata.csv", "source_map.json"):
+    for f in ("metadata.csv", "source_map.json", "index.jsonl"):
         p = os.path.join(sec_dir, f)
         if os.path.isfile(p):
             os.remove(p)
 
 
+def _write_jsonl(path: str, rows: list[dict]):
+    with open(path, "w") as fh:
+        for row in rows:
+            fh.write(json.dumps(row, sort_keys=True) + "\n")
+
+
 def main():
     ap = argparse.ArgumentParser(
-        description="Generate train/eval/ood_eval training pair splits")
+        description="Generate split-free task-organized training pairs")
     ap.add_argument("--task", required=True,
                     help="task short name or 'all'")
     ap.add_argument("--second", default="all",
@@ -479,6 +497,9 @@ def main():
     ap.add_argument("--human-source", default="seedance_direct",
                     choices=list(HUMAN_SOURCE_MAP.keys()),
                     help="human video source (default: seedance_direct)")
+    ap.add_argument("--data-type", default="h2r",
+                    choices=["h2r", "r2h", "blur_r2r"],
+                    help="semantic pair type for output layout")
     ap.add_argument("--source-second", default=None,
                     choices=["1s", "2s", "4s"],
                     help="source clip duration to cut from (default: same as --second)")
@@ -489,18 +510,6 @@ def main():
                     help="skip files that already exist")
     ap.add_argument("--clean", action="store_true",
                     help="remove existing pair/<sec>/* before writing")
-    ap.add_argument("--ood-tasks",
-                    default="Inspire_Pickup_Pillow_MainCamOnly",
-                    help="comma-separated task short names routed entirely to "
-                         "ood_eval split")
-    ap.add_argument("--per-task-eval", type=int, default=1,
-                    help="source segments per non-OOD task reserved for eval")
-    ap.add_argument("--per-task-eval-clips", type=int, default=0,
-                    help="exact eval clip budget per non-OOD task; keeps whole "
-                         "source segments and skips segments that would exceed budget")
-    ap.add_argument("--max-ood-per-task", type=int, default=0,
-                    help="max clips per OOD task routed to ood_eval (0 = all)")
-    ap.add_argument("--split-seed", type=int, default=42)
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--hand-patch", action="store_true",
                     help="generate hand patch weight maps from precomputed 4s bbox data")
@@ -513,20 +522,14 @@ def main():
 
     tasks = _expand_task_spec(args.task, TRAINING_TASKS)
 
-    ood_tasks = {t.strip() for t in args.ood_tasks.split(",") if t.strip()}
-
-    print(f"Make Pair (split-aware)")
+    print(f"Make Pair (task-organized, split-free)")
     print(f"  tasks:         {tasks}")
     print(f"  seconds:       {seconds}")
+    print(f"  data type:     {args.data_type}")
     print(f"  human:         {args.human_source} ({human_root})")
     print(f"  fps:           {TARGET_FPS}")
     print(f"  compare:       {args.compare}")
     print(f"  workers:       {args.workers}")
-    print(f"  ood tasks:     {sorted(ood_tasks)}")
-    print(f"  per-task eval: {args.per_task_eval}")
-    print(f"  per-task eval clips: {args.per_task_eval_clips or '(disabled)'}")
-    print(f"  max OOD per task: {args.max_ood_per_task or '(all)'}")
-    print(f"  split seed:    {args.split_seed}")
     print(f"  source-second: {args.source_second or '(same as --second)'}")
     print(f"  clean:         {args.clean}")
     print(f"  hand-patch:    {args.hand_patch}")
@@ -538,7 +541,7 @@ def main():
     for sec in seconds:
         source_second = args.source_second or sec
         num_frames = FRAMES_4K1[sec]
-        sec_dir = os.path.join(PAIR_DIR, sec)
+        sec_dir = os.path.join(PAIR_DIR, args.data_type, sec)
         if args.clean:
             _clean_sec_dir(sec_dir)
         os.makedirs(sec_dir, exist_ok=True)
@@ -569,39 +572,37 @@ def main():
             print(f"\n[{sec}] hand patch: {n_loaded} segments loaded "
                   f"from {_MAIN_HAND_PATCH_4S}")
 
-        splits = split_by_task(
-            all_pairs, ood_tasks, args.per_task_eval, args.split_seed,
-            max_ood_per_task=args.max_ood_per_task,
-            per_task_eval_clips=args.per_task_eval_clips,
-        )
+        print(f"\n[{sec}] {len(all_pairs)} pairs ({num_frames} frames, 4k+1)")
 
-        print(f"\n[{sec}] {len(all_pairs)} pairs -> "
-              f"train={len(splits['train'])} "
-              f"eval={len(splits['eval'])} "
-              f"ood_eval={len(splits['ood_eval'])} "
-              f"({num_frames} frames, 4k+1)")
-
-        source_map: dict[str, dict] = {}
         to_process: list[dict] = []
+        by_task: dict[str, list[dict]] = {}
+        for p in all_pairs:
+            by_task.setdefault(p["task"], []).append(p)
 
-        for split_name, split_pairs in splits.items():
-            if not split_pairs:
+        for task, task_pairs in sorted(by_task.items()):
+            if not task_pairs:
                 continue
-            split_dir = os.path.join(sec_dir, split_name)
-            video_dir = os.path.join(split_dir, "video")
-            control_dir = os.path.join(split_dir, "control_video")
+            task_dir = os.path.join(sec_dir, task)
+            video_dir = os.path.join(task_dir, "video")
+            control_dir = os.path.join(task_dir, "control_video")
             os.makedirs(video_dir, exist_ok=True)
             os.makedirs(control_dir, exist_ok=True)
 
-            for idx, p in enumerate(split_pairs):
+            for idx, p in enumerate(sorted(task_pairs, key=lambda x: x["source_id"])):
                 name = f"pair_{idx:04d}.mp4"
-                p["split"] = split_name
-                p["out_robot"] = os.path.join(video_dir, name)
-                p["out_human"] = os.path.join(control_dir, name)
-                p["rel_robot"] = f"video/{name}"
-                p["rel_human"] = f"control_video/{name}"
-                p["compare"] = os.path.join(split_dir, "compare", name)
-                source_map[f"{split_name}/{name}"] = {
+                input_role = "human" if args.data_type == "h2r" else "robot"
+                target_role = "human" if args.data_type == "r2h" else "robot"
+                p["input_role"] = input_role
+                p["target_role"] = target_role
+                p["out_target"] = os.path.join(video_dir, name)
+                p["out_control"] = os.path.join(control_dir, name)
+                p["rel_target"] = f"video/{name}"
+                p["rel_control"] = f"control_video/{name}"
+                p["compare"] = os.path.join(task_dir, "compare", name)
+                p["manifest"] = {
+                    "data_type": args.data_type,
+                    "duration": sec,
+                    "robot_task": p["task"],
                     "task": p["task"],
                     "episode": p["episode"],
                     "seg": p["seg"],
@@ -614,11 +615,16 @@ def main():
                     "source_id": p["source_id"],
                     "human_src": p["human_src"],
                     "robot_src": p["robot_src"],
+                    "video": f"video/{name}",
+                    "control_video": f"control_video/{name}",
+                    "input_role": input_role,
+                    "target_role": target_role,
                 }
                 to_process.append(p)
 
         t0 = time.time()
-        split_meta: dict[str, list[dict]] = {k: [] for k in splits}
+        task_meta: dict[str, list[dict]] = {task: [] for task in by_task}
+        task_manifest: dict[str, list[dict]] = {task: [] for task in by_task}
 
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
             futures = {
@@ -631,31 +637,36 @@ def main():
             for fut in as_completed(futures):
                 p = futures[fut]
                 meta = fut.result()
-                split_meta[p["split"]].append(meta)
+                task_meta[p["task"]].append(meta)
+                task_manifest[p["task"]].append(p["manifest"])
                 done += 1
                 if done % 20 == 0 or done == total:
                     print(f"  {done}/{total}", flush=True)
 
         print(f"  done in {time.time() - t0:.1f}s")
 
-        # Write per-split metadata.csv
-        for split_name, metas in split_meta.items():
+        index_rows: list[dict] = []
+        for task, metas in task_meta.items():
             if not metas:
                 continue
             metas.sort(key=lambda m: m["video"])
-            csv_path = os.path.join(sec_dir, split_name, "metadata.csv")
+            task_dir = os.path.join(sec_dir, task)
+            csv_path = os.path.join(task_dir, "metadata.csv")
             with open(csv_path, "w", newline="") as f:
                 writer = csv.DictWriter(
                     f, fieldnames=["video", "prompt", "control_video"])
                 writer.writeheader()
                 writer.writerows(metas)
             print(f"  metadata: {csv_path} ({len(metas)} rows)")
+            manifest_rows = sorted(task_manifest[task], key=lambda m: m["source_id"])
+            manifest_path = os.path.join(task_dir, "manifest.jsonl")
+            _write_jsonl(manifest_path, manifest_rows)
+            index_rows.extend(manifest_rows)
+            print(f"  manifest: {manifest_path} ({len(manifest_rows)} rows)")
 
-        # Write source_map.json
-        map_path = os.path.join(sec_dir, "source_map.json")
-        with open(map_path, "w") as f:
-            json.dump(source_map, f, indent=2, sort_keys=True)
-        print(f"  source_map: {map_path} ({len(source_map)} entries)")
+        index_path = os.path.join(sec_dir, "index.jsonl")
+        _write_jsonl(index_path, sorted(index_rows, key=lambda m: m["source_id"]))
+        print(f"  index: {index_path} ({len(index_rows)} entries)")
 
     elapsed = time.time() - t_total
     print(f"\nDone in {elapsed:.1f}s")

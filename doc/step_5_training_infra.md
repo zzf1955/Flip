@@ -70,67 +70,79 @@ Seedance direct 的 1s 训练数据由 `src.pipeline.seedance_clip` 从
 该 manifest 对齐真实 `clip_start` 与增强类型；重建 1s 切片、pair 和 cache
 时不要改动 `seedance_direct/4s/` 原始 API 输出。
 
-当前 Seedance direct 1s 划分方案：`Inspire_Pickup_Pillow_MainCamOnly` 作为
-OOD，取 32 条进入 `ood_eval`；其余两个训练任务各取 8 条进入 `eval`。
-训练任务集合固定为：`Inspire_Collect_Clothes_MainCamOnly`、
-`Inspire_Pickup_Pillow_MainCamOnly`、`Inspire_Put_Clothes_into_Washing_Machine`。
+当前维护的数据 Task 固定为三个机器人 Task：
 
-弃用数据集：
+- `Inspire_Pickup_Pillow_MainCamOnly`
+- `Inspire_Put_Clothes_Into_Basket`
+- `Inspire_Put_Clothes_into_Washing_Machine`
 
-- `Inspire_Put_Clothes_Into_Basket`：合成手部外观与其他任务不一致，不进入训练分布。
-- `Inspire_Put_Clothes_into_Washing_Machine_MainCamOnly`：只有一条有效数据且是重复数据，没有必要纳入训练。
+数据本身不再预先切成 `train/eval/ood_eval`。磁盘只按物理属性组织；
+训练时通过 CLI 指定 `--train-tasks` 与 `--ood-tasks`，再按 `--data-seed`
+运行时确定 train / in-task eval / OOD eval。默认 preset 使用 Basket + Washing
+作为 in-task，Pillow 作为 OOD。
 
-使用 `--max-ood-per-task 32 --per-task-eval-clips 8` 控制该划分。
+四类数据类型：
+
+- `identity_r2r`：清晰机器人 → 同一清晰机器人。
+- `blur_r2r`：模糊机器人 → 清晰机器人。
+- `h2r`：人 → 机器人。
+- `r2h`：机器人 → 人。
 
 `src.pipeline.make_pair --task all` 与 `src.pipeline.make_robot_pair --task all`
-默认展开为上述三任务训练集合；如需调试历史/非训练任务，显式传入任务短名或
+默认只展开上述三个 canonical robot Task；如需调试历史/非训练任务，显式传入任务短名或
 `--task inspire`。
 
 训练前需要预计算 embedding 缓存，分为 **T5 文本缓存** 和 **VAE 视频缓存**。
 
 ```text
+training_data/pair/
+└── <data_type>/
+    └── <duration>/
+        ├── <robot_task>/
+        │   ├── video/pair_NNNN.mp4
+        │   ├── control_video/pair_NNNN.mp4
+        │   ├── metadata.csv
+        │   └── manifest.jsonl
+        └── index.jsonl
+
 training_data/cache/
-├── t5/
+├── t5/<data_type>/<duration>/
 │   ├── prompt_<hash>.pth
 │   └── negative.pth
-└── vae/
-    ├── pair_1s/
-    │   ├── train/pair_NNNN.pth
-    │   ├── eval/pair_NNNN.pth
-    │   └── ood_eval/pair_NNNN.pth
-    └── robot_1s/
+└── vae/<data_type>/<duration>/<robot_task>/
+    ├── pair_NNNN.pth
+    └── manifest.jsonl
 ```
 
 VAE cache 样本字段：
 
-- `human_latent`: human/control 视频 latent。
-- `robot_latent`: robot/target 视频 latent。
+- `human_latent`: control/input 视频 latent。
+- `robot_latent`: video/target 视频 latent。
 - `prompt`: prompt 文本，用于匹配共享 T5 cache。
-- `source_id`: 数据溯源 key。
+- `data_type`、`duration`、`robot_task`、`source_id`、`source_segment_id`: 运行时 split 和溯源字段。
 
-T5 embedding 不再重复嵌入每个样本文件。正式训练入口不再从命令行接收
-cache/T5 路径，而是通过 `src/pipeline/train_config.py` 的 `--task-name`
-固定映射选择。
+T5 embedding 不再重复嵌入每个样本文件。T5 cache 目录与数据类型和 duration
+匹配，例如 `h2r/1s` 使用 `training_data/cache/t5/h2r/1s/`。
+正式训练入口通过 `src/pipeline/train_config.py` 的 `--task-name` 选择 preset，
+也可用 CLI 覆盖 `--data-type`、`--duration`、`--train-tasks`、`--ood-tasks`
+以及各类 size。
 
 ## 生成 Cache
 
 ### Mitty 直接训练数据
 
 ```bash
-# --task all 等价于当前维护的三个 TRAINING_TASKS，不包含 Basket/MainCamOnly 重复集
 python -m src.pipeline.make_pair \
   --task all \
   --second 1s \
+  --data-type h2r \
   --human-source seedance_direct \
-  --ood-tasks Inspire_Pickup_Pillow_MainCamOnly \
-  --max-ood-per-task 32 \
-  --per-task-eval-clips 8 \
   --clean
 
 CUDA_VISIBLE_DEVICES=2 python -m src.pipeline.mitty_cache \
-  --pair-dir training_data/pair/1s/train \
-  --output training_data/cache/vae/pair_1s/train \
-  --t5-cache-dir training_data/cache/t5 \
+  --pair-dir training_data/pair/h2r/1s/Inspire_Put_Clothes_Into_Basket \
+  --output training_data/cache/vae/h2r/1s/Inspire_Put_Clothes_Into_Basket \
+  --t5-cache-dir training_data/cache/t5/h2r/1s \
   --device cuda:0 \
   --batch-size 4 \
   --prefetch-workers 8 \
@@ -138,30 +150,27 @@ CUDA_VISIBLE_DEVICES=2 python -m src.pipeline.mitty_cache \
   --save-workers 1
 ```
 
-如果只是调试历史任务或检查被弃用任务，需要显式指定任务，避免误混入正式训练数据：
+需要为每个 robot task 分别运行 `mitty_cache`，输出到对应 task 子目录。
+如果已有旧 split 目录，可先迁移为新布局：
 
 ```bash
-python -m src.pipeline.make_pair \
-  --task Inspire_Put_Clothes_Into_Basket \
-  --second 1s \
-  --human-source seedance_direct \
-  --clean
+python scripts/migrate_task_layout.py --data-type h2r --duration 1s --clean
+python scripts/migrate_task_layout.py --data-type blur_r2r --duration 1s --clean
+python scripts/migrate_task_layout.py --data-type identity_r2r --duration 1s --clean
 ```
 
-### 三阶段 LoRA identity 数据
+### Identity 数据
 
 ```bash
-# --task all 同样只展开为 TRAINING_TASKS，供 identity 阶段使用
 python -m src.pipeline.make_robot_pair \
   --task all \
   --max-segments 500 \
-  --per-task-eval 5 \
   --clean
 
 CUDA_VISIBLE_DEVICES=2 python -m src.pipeline.mitty_cache \
-  --pair-dir training_data/robot_pair/1s/train \
-  --output training_data/cache/vae/robot_1s/train \
-  --t5-cache-dir training_data/cache/t5 \
+  --pair-dir training_data/pair/identity_r2r/1s/Inspire_Put_Clothes_Into_Basket \
+  --output training_data/cache/vae/identity_r2r/1s/Inspire_Put_Clothes_Into_Basket \
+  --t5-cache-dir training_data/cache/t5/identity_r2r/1s \
   --device cuda:0 \
   --batch-size 4
 ```
@@ -192,11 +201,11 @@ scripts/flip_run.sh eval_mitty --cuda 2 -- \
 `summary.csv` 与 `summary.json`。如只想复算已有视频的指标，可加
 `--no-generate`；如评估全集，可设 `--samples-per-split -1`。
 
-### 轻量 smoke
+### 冒烟训练
 
 ```bash
 CUDA_VISIBLE_DEVICES=2 python -m src.pipeline.train \
-  --task-name smoke_t032_e2e \
+  --task-name smoke_test \
   --max-steps 1 \
   --save-steps 1 \
   --eval-steps 1 \
@@ -254,16 +263,17 @@ scripts/flip_run.sh train --cuda 2,3 --nproc 2 -- \
 ## 验证
 
 ```bash
-/home/leadtek/miniconda3/envs/flip/bin/python scripts/smoke_t032_refactor.py
-CUDA_VISIBLE_DEVICES=2 /home/leadtek/miniconda3/envs/flip/bin/python -c "import torch; print(torch.cuda.is_available(), torch.cuda.device_count())"
+/home/leadtek/miniconda3/envs/flip/bin/python scripts/smoke_test.py --cuda 2
 ```
 
-`smoke_t032_refactor.py` 覆盖：`compileall`、保留 pipeline/tool 入口的 `--help`、废弃训练模块不可 import。验证日志统一写入 `tmp/t032/smoke/`。
+`smoke_test.py` 每次都会先跑轻量冒烟，再由 GPU 冒烟脚本执行
+`nvidia-smi` 并把显卡状态写入 `tmp/smoke_test/gpu/nvidia_smi_before.log`，
+随后复制 1 条 pair 到 `tmp/smoke_test/gpu/`，执行 `mitty_cache` 生成 VAE
+cache，再跑 `train.py` 1 step + 1 sample eval。最终报告会标明本次 GPU
+训练是 `single-card`、`dual-card` 还是更多卡测试。
 
-真实 GPU 端到端 smoke：
+如需明确双卡冒烟：
 
 ```bash
-CUDA_VISIBLE_DEVICES=2 /home/leadtek/miniconda3/envs/flip/bin/python scripts/smoke_t032_gpu.py
+/home/leadtek/miniconda3/envs/flip/bin/python scripts/smoke_test.py --cuda 2,3 --nproc 2
 ```
-
-该脚本复制 1 条 pair 到 `tmp/t032/gpu_smoke/`，执行 `mitty_cache` 生成 VAE cache，再跑 `train.py` 1 step + 1 sample eval。卡 3 留给用户实验。

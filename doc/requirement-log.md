@@ -486,3 +486,30 @@
 
 **创建的任务：**
 - [037] 训练入口配置化重构
+
+## 2026-04-28 Smoke test 与 T5 cache 目录统一
+
+用户要求：
+> 1. T5 的 cache 目录,和 pair 目录匹配一下. 现在应该是同一个目录
+> 2. smoke t32 的脚本,全部改名成 smoke test,然后数据也改成 smoke test.
+> 3. 每次冒烟测试的时候,轻量和 GPU 都跑, 跑 GPU 前先看显卡情况, 再跑. 然后报告测试的时候,报告跑的是单卡还是双卡测试
+
+落实：
+- `src.pipeline.train_config` 将正式任务的 T5 cache 映射改为与 VAE/pair 数据集同名目录，例如 `pair_1s` → `training_data/cache/t5/pair_1s/`。
+- 冒烟训练任务名从 `smoke_t032_e2e` 改为 `smoke_test`，临时数据迁移到 `tmp/smoke_test/`。
+- `scripts/smoke_t032_refactor.py` / `scripts/smoke_t032_gpu.py` 改名为 `scripts/smoke_test_light.py` / `scripts/smoke_test_gpu.py`，新增统一入口 `scripts/smoke_test.py`。
+- `scripts/smoke_test.py` 每次串行执行轻量冒烟与 GPU 冒烟；GPU 冒烟先记录 `nvidia-smi` 到 `tmp/smoke_test/gpu/nvidia_smi_before.log`，最终 summary 标明 `single-card` / `dual-card` / `N-card`。
+- GPU smoke 的 eval cache 改为使用与 pair 数据匹配的 `training_data/cache/vae/pair_1s/eval/pair_0001.pth`。
+
+## 2026-04-28 数据按 Task 组织与运行时 OOD 划分
+
+用户要求：
+> 只用三个 Task；数据按类型、duration、机器人 Task 组织；OOD 和 in-task 不在磁盘预切，训练运行时决定；支持按 seed 指定 train/eval/video 子集大小。
+
+落实：
+- `src/core/config.py` 将 canonical 数据 Task 改为 Pillow、Basket、Washing 三个 Inspire Task，并提供默认 runtime train/OOD Task 集合。
+- `make_pair.py` / `make_robot_pair.py` 输出 `training_data/pair/<data_type>/<duration>/<robot_task>/`，每个 Task 目录写 `manifest.jsonl`。
+- `mitty_cache.py` 输出 `training_data/cache/vae/<data_type>/<duration>/<robot_task>/`，复制 manifest 字段到 cache manifest 和 `.pth`。
+- 新增 `src/pipeline/runtime_data.py`，训练时按 `--train-tasks`、`--ood-tasks`、`--data-seed`、size 参数生成 run-local split，并写入 `run_dir/data_split/`。
+- `train.py` 新增 `--data-type`、`--duration`、`--train-size`、`--in-task-eval-size`、`--in-task-video-size`、`--ood-eval-size`、`--ood-video-size`、`--data-seed` 等参数。
+- 新增 `scripts/migrate_task_layout.py`，用于把旧 split 目录迁移为 split-free task 目录。

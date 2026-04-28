@@ -4,13 +4,13 @@ FunControl, RectFlow/Dxxx Flow, and direct-noise replacement experiments are no
 longer exposed from this entry. Historical files may remain in task records, but
 new runs should use this script plus `mitty_cache.py`.
 
-Data/cache paths are fixed by task name in `src.pipeline.train_config`; CLI
-arguments only cover training, eval, LoRA, and W&B knobs.
+Data presets come from `src.pipeline.train_config`; in-task/OOD splits are
+chosen at runtime from split-free task cache manifests.
 
 Usage:
-  # Single GPU smoke on card 2; writes all transient outputs under ./tmp
+  # Single GPU smoke; writes all transient outputs under ./tmp/smoke_test
   CUDA_VISIBLE_DEVICES=2 python -m src.pipeline.train \
-    --task-name smoke_t032_e2e \
+    --task-name smoke_test \
     --max-steps 1 --save-steps 1 --eval-steps 1 --eval-video-steps 0
 
   # Canonical Mitty training
@@ -43,7 +43,6 @@ from src.core.train_utils import (
     build_wandb_tags,
     cleanup_distributed,
     infinite_file_batches,
-    load_cached_files,
     load_sample,
     load_t5_cache,
     log_step_eval_videos,
@@ -56,6 +55,11 @@ from src.core.train_utils import (
     tensor_to_frames,
 )
 from src.pipeline.backbones import MethodSpec, get_mitty_spec
+from src.pipeline.runtime_data import (
+    build_runtime_split,
+    sample_eval_video_files,
+    write_runtime_split,
+)
 from src.pipeline.train_config import apply_train_task_config
 
 # Reuse helpers from the legacy Mitty script (these are generic pipe/IO utils
@@ -209,11 +213,10 @@ def train(args, spec: MethodSpec):
     if args.eval_video_steps == -1:
         args.eval_video_steps = args.eval_steps
 
-    train_files = load_cached_files(args.cache_train)
-    eval_files = load_cached_files(args.cache_eval) if args.cache_eval else []
-    if args.max_eval_files and len(eval_files) > args.max_eval_files:
-        eval_files = eval_files[:args.max_eval_files]
-    ood_files = load_cached_files(args.cache_ood) if args.cache_ood else []
+    runtime_split = build_runtime_split(args)
+    train_files = runtime_split.train_files
+    eval_files = runtime_split.eval_files
+    ood_files = runtime_split.ood_files
 
     # ── Run name + dirs ──
     run_name = build_run_name(spec.name, args, n_train=len(train_files))
@@ -223,6 +226,7 @@ def train(args, spec: MethodSpec):
     if is_main:
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         eval_dir.mkdir(parents=True, exist_ok=True)
+        write_runtime_split(run_dir, args, runtime_split)
     if world_size > 1:
         dist.barrier()
 
@@ -266,8 +270,10 @@ def train(args, spec: MethodSpec):
     info(f"Args: {vars(args)}")
     info(f"DDP: rank={rank}, world_size={world_size}, device={args.device}")
     info(f"Data: train={len(train_files)} eval={len(eval_files)} ood={len(ood_files)}")
-    info(f"Paths: train={args.cache_train} eval={args.cache_eval or '<none>'}"
-         f" ood={args.cache_ood or '<none>'} t5={args.t5_cache_dir or '<none>'}")
+    info(f"Data config: type={args.data_type} duration={args.duration} "
+         f"train_tasks={args.train_tasks} ood_tasks={args.ood_tasks} "
+         f"data_seed={args.data_seed}")
+    info(f"Paths: t5={args.t5_cache_dir or '<none>'}")
 
     # ── T5 cache (shared embeddings for new-format VAE-only caches) ──
     t5_pos, t5_neg = {}, None
@@ -467,18 +473,20 @@ def train(args, spec: MethodSpec):
                 wb.log(eval_payload, step=step)
 
         if hit_eval_video:
-            n_in = (args.eval_video_samples_in_task
-                    if args.eval_video_samples_in_task > 0
-                    else len(eval_files))
-            n_ood = (args.eval_video_samples_ood
-                     if args.eval_video_samples_ood > 0
-                     else len(ood_files))
+            in_task_video_files = sample_eval_video_files(
+                eval_files, args.in_task_video_size, args.data_seed,
+                step, "in_task",
+            )
+            ood_video_files = sample_eval_video_files(
+                ood_files, args.ood_video_size, args.data_seed,
+                step, "ood",
+            )
             if eval_files:
                 generate_eval_videos(
-                    spec, model, eval_files,
+                    spec, model, in_task_video_files,
                     str(eval_dir / "in_task"), step,
                     args.device,
-                    num_samples=n_in,
+                    num_samples=len(in_task_video_files),
                     num_inference_steps=args.num_inference_steps,
                     log=log,
                     t5_pos=t5_pos, t5_neg=t5_neg,
@@ -486,10 +494,10 @@ def train(args, spec: MethodSpec):
                 )
             if ood_files:
                 generate_eval_videos(
-                    spec, model, ood_files,
+                    spec, model, ood_video_files,
                     str(eval_dir / "ood"), step,
                     args.device,
-                    num_samples=n_ood,
+                    num_samples=len(ood_video_files),
                     num_inference_steps=args.num_inference_steps,
                     log=log,
                     t5_pos=t5_pos, t5_neg=t5_neg,
@@ -561,6 +569,31 @@ def main():
                     help="fixed training data config name "
                          "(see src.pipeline.train_config)")
 
+    # Runtime data selection
+    ap.add_argument("--data-type", default="",
+                    choices=["", "identity_r2r", "blur_r2r", "h2r", "r2h"],
+                    help="semantic data type; default comes from --task-name preset")
+    ap.add_argument("--duration", default="",
+                    help="cache duration such as 1s; default comes from preset")
+    ap.add_argument("--train-tasks", default="",
+                    help="comma-separated robot task short names for train/in-task eval")
+    ap.add_argument("--ood-tasks", default="",
+                    help="comma-separated robot task short names for OOD eval")
+    ap.add_argument("--cache-root", default="",
+                    help="root containing <data_type>/<duration>/<task>/manifest.jsonl")
+    ap.add_argument("--train-size", type=int, default=0,
+                    help="runtime train clip count (0=all, -1=all)")
+    ap.add_argument("--in-task-eval-size", type=int, default=0,
+                    help="runtime in-task eval clip count (0=all, -1=all)")
+    ap.add_argument("--in-task-video-size", type=int, default=4,
+                    help="in-task eval videos per trigger (0/-1=all)")
+    ap.add_argument("--ood-eval-size", type=int, default=0,
+                    help="runtime OOD eval clip count (0=all, -1=all)")
+    ap.add_argument("--ood-video-size", type=int, default=2,
+                    help="OOD eval videos per trigger (0/-1=all)")
+    ap.add_argument("--data-seed", type=int, default=42,
+                    help="seed for runtime train/eval/video data sampling")
+
     # Model paths
     ap.add_argument("--dit-dir", default=DEFAULT_DIT_DIR)
     ap.add_argument("--vae-path", default=DEFAULT_VAE)
@@ -599,12 +632,12 @@ def main():
     ap.add_argument("--eval-video-steps", type=int, default=100,
                     help="generate eval videos every N steps "
                          "(-1=follow eval-steps, 0=off, needs VAE)")
-    ap.add_argument("--eval-video-samples-in-task", type=int, default=4,
-                    help="N in-task eval videos per trigger (-1 = all)")
-    ap.add_argument("--eval-video-samples-ood", type=int, default=2,
-                    help="N OOD eval videos per trigger (-1 = all)")
+    ap.add_argument("--eval-video-samples-in-task", type=int, default=None,
+                    help="deprecated alias for --in-task-video-size")
+    ap.add_argument("--eval-video-samples-ood", type=int, default=None,
+                    help="deprecated alias for --ood-video-size")
     ap.add_argument("--max-eval-files", type=int, default=0,
-                    help="cap eval file count (0=no cap)")
+                    help="deprecated; use --in-task-eval-size")
     ap.add_argument("--num-inference-steps", type=int, default=30)
 
     # W&B
@@ -624,6 +657,13 @@ def main():
         apply_train_task_config(args)
     except ValueError as exc:
         ap.error(str(exc))
+
+    if args.eval_video_samples_in_task is not None:
+        args.in_task_video_size = args.eval_video_samples_in_task
+    if args.eval_video_samples_ood is not None:
+        args.ood_video_size = args.eval_video_samples_ood
+    if args.max_eval_files:
+        args.in_task_eval_size = args.max_eval_files
 
     # Resolve shared checkpoint inputs against MAIN_ROOT for worktree runs.
     for attr in ("init_lora",):
