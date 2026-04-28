@@ -36,6 +36,9 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import av
+import cv2
+import numpy as np
 import pandas as pd
 import torch
 
@@ -53,6 +56,7 @@ _MAIN_HAND_PATCH_4S = os.path.join(_MAIN_TRAINING_DATA, "hand_patch", "4s")
 _MAIN_SEEDANCE_DIRECT = os.path.join(_MAIN_TRAINING_DATA, "seedance_direct")
 _MAIN_OVERLAY = os.path.join(_MAIN_TRAINING_DATA, "overlay")
 _MAIN_SEEDANCE_ADVANCE = os.path.join(_MAIN_TRAINING_DATA, "seedance_advance")
+_MAIN_SAM2_MASK = os.path.join(_MAIN_TRAINING_DATA, "sam2_mask")
 
 FFMPEG = os.environ.get(
     "FFMPEG_BIN",
@@ -62,6 +66,8 @@ FFMPEG = os.environ.get(
 TARGET_FPS = 16
 COMPARE_DIR = os.path.join(TRAINING_DATA_ROOT, "compare")
 PROMPT = "A first-person view robot arm performing household tasks flip_v2v"
+DEFAULT_BLUR_KSIZE = 51
+DEFAULT_BLUR_PIXEL_EXPAND = 16
 
 # 4k+1 frame counts at 16fps for each clip duration
 FRAMES_4K1 = {"1s": 17, "2s": 33, "4s": 65}
@@ -126,6 +132,98 @@ def make_compare(robot_path: str, human_path: str, out_path: str):
         "-c:v", "libx264", "-crf", "18", "-preset", "fast",
         out_path,
     ])
+
+
+def read_video_bgr(video_path: str) -> list[np.ndarray]:
+    """Read all frames from a video as BGR uint8 arrays."""
+    container = av.open(video_path)
+    stream = container.streams.video[0]
+    frames = [f.to_ndarray(format="bgr24") for f in container.decode(stream)]
+    container.close()
+    if not frames:
+        raise RuntimeError(f"video has no frames: {video_path}")
+    return frames
+
+
+def write_video_bgr(frames: list[np.ndarray], out_path: str,
+                    fps: int = TARGET_FPS):
+    """Write BGR uint8 frames as an H.264 video."""
+    from src.core.data import close_video, open_video_writer, write_frame
+
+    if not frames:
+        raise ValueError(f"no frames to write: {out_path}")
+    h, w = frames[0].shape[:2]
+    container, stream = open_video_writer(out_path, w, h, fps=fps)
+    for frame in frames:
+        write_frame(container, stream, frame)
+    close_video(container, stream)
+
+
+def soften_mask(mask: np.ndarray, pixel_expand: int) -> np.ndarray:
+    """Match robot_patch blur-mask feathering for full-body degradation."""
+    out = cv2.GaussianBlur(mask, (7, 7), 0)
+    out = (out > 128).astype(np.uint8) * 255
+    d = 15 + 2 * pixel_expand
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (d, d))
+    out = cv2.dilate(out, kernel)
+    blur_k = 21 + 2 * (pixel_expand // 2)
+    if blur_k % 2 == 0:
+        blur_k += 1
+    out = cv2.GaussianBlur(out, (blur_k, blur_k), 0)
+    return out
+
+
+def blur_frame_in_mask(frame: np.ndarray, soft_mask: np.ndarray,
+                       ksize: int) -> np.ndarray:
+    """Blur only the robot mask region and alpha-blend soft boundaries."""
+    blurred = cv2.GaussianBlur(frame, (ksize, ksize), 0)
+    alpha = soft_mask.astype(np.float32) / 255.0
+    out = alpha[..., None] * blurred + (1.0 - alpha[..., None]) * frame
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def clip_mask_indices(clip_start: float, clip_dur: float,
+                      num_frames: int, mask_count: int) -> list[int]:
+    """Map output frames to original 30fps segment mask frame indices."""
+    base = int(round(clip_start * SEGMENT_FPS))
+    clip_frames = max(1, int(round(clip_dur * SEGMENT_FPS)))
+    indices = []
+    for i in range(num_frames):
+        offset = min(round(i * SEGMENT_FPS / TARGET_FPS), clip_frames - 1)
+        indices.append(min(max(base + offset, 0), mask_count - 1))
+    return indices
+
+
+def make_blurred_robot_clip(clean_clip_path: str, out_path: str, p: dict,
+                            mask_root: str, blur_ksize: int,
+                            pixel_expand: int):
+    """Create blur_r2r control video from the clean robot target and SAM2 masks."""
+    mask_path = os.path.join(mask_root, p["task"], p["episode"],
+                             f"{p['seg']}.npz")
+    if not os.path.isfile(mask_path):
+        raise FileNotFoundError(f"SAM2 mask not found for blur_r2r: {mask_path}")
+
+    with np.load(mask_path) as mask_npz:
+        masks = mask_npz["masks"]
+    if masks.ndim != 3:
+        raise ValueError(f"invalid SAM2 mask shape in {mask_path}: {masks.shape}")
+
+    frames = read_video_bgr(clean_clip_path)
+    mask_indices = clip_mask_indices(
+        p["clip_start"], p["clip_dur"], len(frames), len(masks))
+    degraded_frames = []
+    for frame, mask_idx in zip(frames, mask_indices):
+        mask = masks[mask_idx]
+        if p.get("augment") == "hflip":
+            mask = cv2.flip(mask, 1)
+        if mask.shape[:2] != frame.shape[:2]:
+            raise ValueError(
+                f"mask/frame shape mismatch for {mask_path}: "
+                f"mask={mask.shape[:2]}, frame={frame.shape[:2]}")
+        soft = soften_mask(mask, pixel_expand=pixel_expand)
+        degraded_frames.append(blur_frame_in_mask(frame, soft, blur_ksize))
+
+    write_video_bgr(degraded_frames, out_path, fps=TARGET_FPS)
 
 
 # ── hand patch helpers ─────────────────────────────────────────────────
@@ -401,7 +499,10 @@ def split_by_task(all_pairs: list[dict], ood_tasks: set[str],
 def process_pair(p: dict, do_compare: bool, resume: bool,
                  num_frames: int | None = None,
                  hand_patch: bool = False,
-                 hand_weight: float = 3.0) -> dict:
+                 hand_weight: float = 3.0,
+                 blur_mask_root: str = _MAIN_SAM2_MASK,
+                 blur_ksize: int = DEFAULT_BLUR_KSIZE,
+                 blur_pixel_expand: int = DEFAULT_BLUR_PIXEL_EXPAND) -> dict:
     """Process a single pair. Returns metadata dict."""
     os.makedirs(os.path.dirname(p["out_target"]), exist_ok=True)
     os.makedirs(os.path.dirname(p["out_control"]), exist_ok=True)
@@ -427,10 +528,18 @@ def process_pair(p: dict, do_compare: bool, resume: bool,
                             duration=p["clip_dur"],
                             num_frames=num_frames)
         elif p["input_role"] == "robot":
-            make_robot_clip(p["robot_src"], p["out_control"],
-                            p["clip_start"], p["clip_dur"],
-                            num_frames=num_frames,
-                            hflip=p.get("augment") == "hflip")
+            if p.get("control_degrade") == "sam2_blur":
+                if p["target_role"] != "robot":
+                    raise ValueError(
+                        "sam2_blur control requires robot target_role")
+                make_blurred_robot_clip(
+                    p["out_target"], p["out_control"], p,
+                    blur_mask_root, blur_ksize, blur_pixel_expand)
+            else:
+                make_robot_clip(p["robot_src"], p["out_control"],
+                                p["clip_start"], p["clip_dur"],
+                                num_frames=num_frames,
+                                hflip=p.get("augment") == "hflip")
         else:
             raise ValueError(f"Unknown input_role: {p['input_role']}")
 
@@ -515,7 +624,19 @@ def main():
                     help="generate hand patch weight maps from precomputed 4s bbox data")
     ap.add_argument("--hand-weight", type=float, default=3.0,
                     help="weight multiplier for hand regions (default: 3.0)")
+    ap.add_argument("--blur-mask-root", default=_MAIN_SAM2_MASK,
+                    help="SAM2 mask root for blur_r2r control degradation")
+    ap.add_argument("--blur-ksize", type=int, default=DEFAULT_BLUR_KSIZE,
+                    help="Gaussian blur kernel for blur_r2r control videos")
+    ap.add_argument("--blur-pixel-expand", type=int,
+                    default=DEFAULT_BLUR_PIXEL_EXPAND,
+                    help="pixel-space mask dilation for blur_r2r soft mask")
     args = ap.parse_args()
+
+    if args.blur_ksize <= 0 or args.blur_ksize % 2 == 0:
+        raise ValueError("--blur-ksize must be a positive odd integer")
+    if args.blur_pixel_expand < 0:
+        raise ValueError("--blur-pixel-expand must be non-negative")
 
     human_root = HUMAN_SOURCE_MAP[args.human_source]
     seconds = ["1s", "2s", "4s"] if args.second == "all" else [args.second]
@@ -535,6 +656,10 @@ def main():
     print(f"  hand-patch:    {args.hand_patch}")
     if args.hand_patch:
         print(f"  hand-weight:   {args.hand_weight}")
+    if args.data_type == "blur_r2r":
+        print(f"  blur-mask-root: {args.blur_mask_root}")
+        print(f"  blur-ksize:    {args.blur_ksize}")
+        print(f"  blur-pixel-expand: {args.blur_pixel_expand}")
 
     t_total = time.time()
 
@@ -594,6 +719,8 @@ def main():
                 target_role = "human" if args.data_type == "r2h" else "robot"
                 p["input_role"] = input_role
                 p["target_role"] = target_role
+                if args.data_type == "blur_r2r":
+                    p["control_degrade"] = "sam2_blur"
                 p["out_target"] = os.path.join(video_dir, name)
                 p["out_control"] = os.path.join(control_dir, name)
                 p["rel_target"] = f"video/{name}"
@@ -620,6 +747,12 @@ def main():
                     "input_role": input_role,
                     "target_role": target_role,
                 }
+                if args.data_type == "blur_r2r":
+                    p["manifest"].update({
+                        "control_degrade": "sam2_blur",
+                        "blur_ksize": args.blur_ksize,
+                        "blur_pixel_expand": args.blur_pixel_expand,
+                    })
                 to_process.append(p)
 
         t0 = time.time()
@@ -629,7 +762,9 @@ def main():
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
             futures = {
                 pool.submit(process_pair, p, args.compare, args.resume,
-                            num_frames, args.hand_patch, args.hand_weight): p
+                            num_frames, args.hand_patch, args.hand_weight,
+                            args.blur_mask_root, args.blur_ksize,
+                            args.blur_pixel_expand): p
                 for p in to_process
             }
             done = 0

@@ -513,3 +513,14 @@
 - 新增 `src/pipeline/runtime_data.py`，训练时按 `--train-tasks`、`--ood-tasks`、`--data-seed`、size 参数生成 run-local split，并写入 `run_dir/data_split/`。
 - `train.py` 新增 `--data-type`、`--duration`、`--train-size`、`--in-task-eval-size`、`--in-task-video-size`、`--ood-eval-size`、`--ood-video-size`、`--data-seed` 等参数。
 - 新增 `scripts/migrate_task_layout.py`，用于把旧 split 目录迁移为 split-free task 目录。
+
+## 2026-04-28 修复 blur_r2r control 视频未降质
+
+用户要求：
+> 当前这个 blur_r2r 有问题. control Video 应该是模糊过的, Video 是清晰的. 现在这个 clip 输出的都是清晰的. 你看一下 blur 的数据应该怎么做, 之前对的数据在 1s_patch 中
+
+落实：
+- `src/pipeline/make_pair.py` 的 `blur_r2r` 不再把 control 当作普通 robot clip 裁剪；现在先生成清晰 robot target，再用 `training_data/sam2_mask/` 对同一 clip 的 robot 全身区域做 Gaussian blur，写入 `control_video/`。
+- blur 参数默认对齐旧 `1s_patch` blur 语义：`--blur-ksize 51`，`--blur-pixel-expand 16`；hflip 样本会同步翻转 SAM2 mask 后再降质。
+- `manifest.jsonl` 为 `blur_r2r` 记录 `control_degrade=sam2_blur`、`blur_ksize`、`blur_pixel_expand`，便于 cache 与训练追溯。
+- `doc/step_5_training_infra.md` 补充 blur_r2r 生成方式、SAM2 mask 依赖和正式命令。

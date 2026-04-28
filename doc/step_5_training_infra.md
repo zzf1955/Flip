@@ -84,7 +84,10 @@ Seedance direct 的 1s 训练数据由 `src.pipeline.seedance_clip` 从
 四类数据类型：
 
 - `identity_r2r`：清晰机器人 → 同一清晰机器人。
-- `blur_r2r`：模糊机器人 → 清晰机器人。
+- `blur_r2r`：模糊机器人 → 清晰机器人。`video/` 是清晰 robot target；
+  `control_video/` 由同一 robot clip 结合 `training_data/sam2_mask/` 全身 mask
+  做局部 Gaussian blur 生成，语义与旧 `1s_patch` 的 blur 数据一致，但输出为
+  当前 task-organized 布局。
 - `h2r`：人 → 机器人。
 - `r2h`：机器人 → 人。
 
@@ -158,6 +161,26 @@ python scripts/migrate_task_layout.py --data-type h2r --duration 1s --clean
 python scripts/migrate_task_layout.py --data-type blur_r2r --duration 1s --clean
 python scripts/migrate_task_layout.py --data-type identity_r2r --duration 1s --clean
 ```
+
+### Blur R2R 数据
+
+`blur_r2r` 仍通过 `make_pair.py` 生成，以便复用 `seedance_direct/1s`
+manifest 中的 0.5s 滑窗和 hflip 信息；human 视频只用于收集可用 clip 与对齐
+source segment，不写入 pair。生成 control 时要求对应
+`training_data/sam2_mask/<task>/<episode>/<seg>.npz` 已存在，缺失会直接报错。
+
+```bash
+python -m src.pipeline.make_pair \
+  --task all \
+  --second 1s \
+  --data-type blur_r2r \
+  --human-source seedance_direct \
+  --workers 64 \
+  --clean
+```
+
+默认 blur 参数对齐旧 patch 数据：`--blur-ksize 51`，
+`--blur-pixel-expand 16`。如需调试历史任务，必须先确保该任务已有 SAM2 mask。
 
 ### Identity 数据
 
