@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""T032 lightweight smoke tests for the refactored FLIP workflow.
+"""Lightweight smoke tests for the maintained FLIP workflow.
 
 This script intentionally avoids real model/data execution. It verifies that
 maintained pipeline entry points import, expose CLI help, and write smoke logs
-under ./tmp. GPU smoke, when added later, must use CUDA_VISIBLE_DEVICES=2.
+under ./tmp/smoke_test/light.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PYTHON = Path(sys.executable)
-SMOKE_DIR = ROOT / "tmp" / "t032" / "smoke"
+SMOKE_DIR = ROOT / "tmp" / "smoke_test" / "light"
 
 MODULE_HELPS = [
     # Data segmentation and robot removal
@@ -88,12 +88,18 @@ def write_log(name: str, text: str) -> Path:
 
 
 def check_compileall(results: list[dict]) -> None:
-    cmd = [str(PYTHON), "-m", "compileall", "-q", "src", "scripts/smoke_wan22_ti2v5b.py", "scripts/smoke_t032_refactor.py"]
+    cmd = [
+        str(PYTHON), "-m", "compileall", "-q", "src",
+        "scripts/smoke_wan22_ti2v5b.py",
+        "scripts/smoke_test.py",
+        "scripts/smoke_test_light.py",
+        "scripts/smoke_test_gpu.py",
+    ]
     proc = run(cmd)
     write_log("compileall.log", proc.stdout)
     results.append({"name": "compileall", "returncode": proc.returncode})
     if proc.returncode != 0:
-        raise SmokeFailure("compileall failed; see tmp/t032/smoke/compileall.log")
+        raise SmokeFailure("compileall failed; see tmp/smoke_test/light/compileall.log")
 
 
 def check_help(module: str, results: list[dict]) -> None:
@@ -103,7 +109,7 @@ def check_help(module: str, results: list[dict]) -> None:
     ok = proc.returncode == 0 and "usage:" in proc.stdout.lower()
     results.append({"name": module, "kind": "help", "returncode": proc.returncode, "ok": ok})
     if not ok:
-        raise SmokeFailure(f"--help failed for {module}; see tmp/t032/smoke/{safe_name}")
+        raise SmokeFailure(f"--help failed for {module}; see tmp/smoke_test/light/{safe_name}")
 
 
 def check_deleted_module(module: str, results: list[dict]) -> None:
@@ -117,7 +123,7 @@ def check_deleted_module(module: str, results: list[dict]) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run T032 lightweight smoke tests")
+    parser = argparse.ArgumentParser(description="Run lightweight smoke tests")
     parser.add_argument("--skip-help", action="store_true", help="only run compile/deletion checks")
     args = parser.parse_args()
 
@@ -132,7 +138,7 @@ def main() -> int:
     finally:
         write_log("summary.json", json.dumps(results, indent=2, ensure_ascii=False) + "\n")
 
-    print(f"T032 smoke passed; logs: {SMOKE_DIR.relative_to(ROOT)}")
+    print(f"Lightweight smoke test passed; logs: {SMOKE_DIR.relative_to(ROOT)}")
     return 0
 
 

@@ -29,74 +29,66 @@
 
 ## 数据准备
 
-三阶段 LoRA 当前只使用三个训练任务集合：
+当前维护的数据 Task 固定为三个机器人 Task：
 
-- `Inspire_Collect_Clothes_MainCamOnly`
 - `Inspire_Pickup_Pillow_MainCamOnly`
+- `Inspire_Put_Clothes_Into_Basket`
 - `Inspire_Put_Clothes_into_Washing_Machine`
 
-弃用数据集：
-
-- `Inspire_Put_Clothes_Into_Basket`：合成手部外观与其他任务不一致。
-- `Inspire_Put_Clothes_into_Washing_Machine_MainCamOnly`：只有一条有效数据且是重复数据。
-
-identity、appearance 和后续 transfer 阶段都不应使用这两个数据集。
-`make_robot_pair.py --task all` 与 `make_pair.py --task all` 默认均展开为上述三任务集合。
+数据目录不再预切 `train/eval/ood_eval`；磁盘按 `data_type / duration / robot_task`
+组织，训练运行时用 `--train-tasks` 和 `--ood-tasks` 决定 in-task 与 OOD。默认 preset
+使用 Basket + Washing 作为 in-task，Pillow 作为 OOD。
 
 ### Phase 1 数据结构
 
-```
-training_data/robot_pair/1s/
-├── train/
-│   ├── video/          → 原始 robot 视频（或 symlink）
-│   ├── metadata.csv    → control_video 列也指向 video/ 下同名文件
-├── eval/
-│   └── (同上)
-```
+```text
+training_data/pair/identity_r2r/1s/<robot_task>/
+├── video/pair_NNNN.mp4
+├── control_video/pair_NNNN.mp4
+├── metadata.csv
+└── manifest.jsonl
 
-**metadata.csv 格式**（关键：两列指向同一文件）：
-
-```csv
-video,prompt,control_video
-video/pair_0000.mp4,A first-person view robot arm performing household tasks flip_v2v,video/pair_0000.mp4
-video/pair_0001.mp4,A first-person view robot arm performing household tasks flip_v2v,video/pair_0001.mp4
-...
+training_data/cache/vae/identity_r2r/1s/<robot_task>/
+├── pair_NNNN.pth
+└── manifest.jsonl
 ```
 
-不需要单独的 `control_video/` 目录——`mitty_cache.py` 按 metadata.csv 中的相对路径读取文件，两列指向同一路径即可。
+identity 数据中 `control_video` 和 `video` 内容一致，cache 内会记录
+`data_type=identity_r2r`、`robot_task`、`source_id`、`source_segment_id` 等运行时 split 字段。
 
 ### Phase 2 数据结构
 
-沿用现有的 `training_data/pair/1s/` 结构（human≠robot）。
+```text
+training_data/pair/h2r/1s/<robot_task>/
+training_data/cache/vae/h2r/1s/<robot_task>/
+training_data/cache/t5/h2r/1s/
+```
+
+Phase 2 使用 `h2r`：输入 human/control 视频，输出 robot/target 视频。
 
 ## 执行流程
 
 ### Phase 1: 生成 identity cache + 训练
 
 ```bash
-# 0. 生成 identity pair；--task all 默认只包含当前维护的三任务集合
+# 0. 生成 split-free identity pair；--task all 只展开三个 canonical Task
 python -m src.pipeline.make_robot_pair \
   --task all \
   --max-segments 500 \
-  --per-task-eval 5 \
   --clean
 
-# 1. 生成 identity pair cache（T5 + VAE 编码）
+# 1. 为每个 robot task 生成 identity cache
 python -m src.pipeline.mitty_cache \
-  --pair-dir training_data/robot_pair/1s/train \
-  --output   training_data/cache/vae/robot_1s/train \
-  --t5-cache-dir training_data/cache/t5 \
+  --pair-dir training_data/pair/identity_r2r/1s/Inspire_Put_Clothes_Into_Basket \
+  --output   training_data/cache/vae/identity_r2r/1s/Inspire_Put_Clothes_Into_Basket \
+  --t5-cache-dir training_data/cache/t5/identity_r2r/1s \
   --device   cuda:2
 
-python -m src.pipeline.mitty_cache \
-  --pair-dir training_data/robot_pair/1s/eval \
-  --output   training_data/cache/vae/robot_1s/eval \
-  --t5-cache-dir training_data/cache/t5 \
-  --device   cuda:2
-
-# 2. Phase 1 训练（恒等重建）
+# 2. Phase 1 训练（恒等重建）；in-task/OOD 运行时决定
 scripts/flip_run.sh train --cuda 2 -- \
-  --task-name robot_1s \
+  --task-name identity_r2r_1s \
+  --train-tasks Inspire_Put_Clothes_Into_Basket,Inspire_Put_Clothes_into_Washing_Machine \
+  --ood-tasks Inspire_Pickup_Pillow_MainCamOnly \
   --max-steps 400 --save-steps 100 --eval-steps 100 \
   --eval-video-steps 100
 ```
@@ -104,24 +96,28 @@ scripts/flip_run.sh train --cuda 2 -- \
 ### Phase 2: 外观替换训练
 
 ```bash
-# 用 Phase 1 最佳 ckpt 初始化
+# 生成 h2r pair/cache 后，用 Phase 1 最佳 ckpt 初始化
 scripts/flip_run.sh train --cuda 2 -- \
-  --task-name attn_ffn_selected \
+  --task-name h2r_1s \
   --init-lora training_data/log/<phase1-run>/ckpt/step-0400.safetensors \
+  --train-size 0 \
+  --in-task-eval-size 32 \
+  --in-task-video-size 4 \
+  --ood-eval-size 32 \
+  --ood-video-size 2 \
+  --data-seed 42 \
   --max-steps 400 --save-steps 100 --eval-steps 100
 ```
 
 ### DDP 多卡版本
 
 ```bash
-# Phase 1
 scripts/flip_run.sh train --cuda 0,1,2,3 --nproc 4 -- \
-  --task-name robot_1s \
+  --task-name identity_r2r_1s \
   --max-steps 400 --save-steps 100 --eval-steps 100
 
-# Phase 2
 scripts/flip_run.sh train --cuda 0,1,2,3 --nproc 4 -- \
-  --task-name attn_ffn_selected \
+  --task-name h2r_1s \
   --init-lora training_data/log/<phase1-run>/ckpt/step-0400.safetensors \
   --max-steps 400 --save-steps 100 --eval-steps 100
 ```

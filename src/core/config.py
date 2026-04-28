@@ -76,17 +76,25 @@ ALL_TASKS = [
     "G1_WBT_Inspire_Put_Clothes_into_Washing_Machine_MainCamOnly",
 ]
 
-# ── Maintained training task subset ──
-# Pair/cache generation for training uses this subset by default.
-# Exclusions:
-# - Basket: human hand appearance is inconsistent with other tasks.
-# - Washing_Machine_MainCamOnly: only one useful episode, duplicated; no need
-#   to include it in the training distribution.
-TRAINING_TASKS = [
-    "G1_WBT_Inspire_Collect_Clothes_MainCamOnly",
+# ── Maintained data task subset ──
+# Data is stored by robot task. In-task vs OOD is decided at training runtime.
+CANONICAL_DATA_TASKS = [
     "G1_WBT_Inspire_Pickup_Pillow_MainCamOnly",
+    "G1_WBT_Inspire_Put_Clothes_Into_Basket",
     "G1_WBT_Inspire_Put_Clothes_into_Washing_Machine",
 ]
+
+DEFAULT_TRAIN_TASKS = [
+    "G1_WBT_Inspire_Put_Clothes_Into_Basket",
+    "G1_WBT_Inspire_Put_Clothes_into_Washing_Machine",
+]
+
+DEFAULT_OOD_TASKS = [
+    "G1_WBT_Inspire_Pickup_Pillow_MainCamOnly",
+]
+
+# Backward-compatible name for scripts that expand --task all/training.
+TRAINING_TASKS = CANONICAL_DATA_TASKS
 
 # ── Camera model selection (change this line to switch) ──
 CAMERA_MODEL = "pinhole_fixed"   # "pinhole_fixed" | "pinhole_f" | "pinhole" | "fisheye"
