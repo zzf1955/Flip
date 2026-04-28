@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import csv
 import glob
+import hashlib
 import logging
 import os
 import random
@@ -33,6 +34,8 @@ FFMPEG = os.environ.get(
     "FFMPEG_BIN",
     "/home/leadtek/miniconda3/envs/flip/bin/ffmpeg",
 )
+
+WANDB_TAG_MAX_LEN = 64
 
 
 # ── DDP ────────────────────────────────────────────────────────────────
@@ -317,7 +320,7 @@ def build_wandb_tags(method_tag: str, args, *,
     tags.extend(build_wandb_param_tags(args))
     if extra_tags:
         tags.extend(extra_tags)
-    return tags
+    return [_sanitize_wandb_tag(tag) for tag in tags]
 
 
 def _tag_value(value) -> str:
@@ -351,8 +354,18 @@ def build_wandb_param_tags(args) -> list[str]:
     tags = []
     for key in sorted(vars(args)):
         value = getattr(args, key)
-        tags.append(f"p:{key}={_tag_value(value)}")
+        tags.append(_sanitize_wandb_tag(f"p:{key}={_tag_value(value)}"))
     return tags
+
+
+def _sanitize_wandb_tag(tag: str) -> str:
+    """Return a W&B-compatible tag, preserving stable identity for long values."""
+    text = "_".join(str(tag).split()) or "<empty>"
+    if len(text) <= WANDB_TAG_MAX_LEN:
+        return text
+    digest = hashlib.sha1(text.encode()).hexdigest()[:8]
+    keep = WANDB_TAG_MAX_LEN - len(digest) - 1
+    return f"{text[:keep]}-{digest}"
 
 
 class WandbLogger:
