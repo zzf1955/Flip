@@ -1,32 +1,22 @@
 """Canonical Mitty LoRA training entry for Wan 2.2 TI2V-5B.
 
-The maintained training path is Mitty-style in-context appearance transfer with
-either uniform or hand-patch loss weighting:
-
-  --loss {uniform,hand_patch}
-
 FunControl, RectFlow/Dxxx Flow, and direct-noise replacement experiments are no
 longer exposed from this entry. Historical files may remain in task records, but
 new runs should use this script plus `mitty_cache.py`.
 
-Usage:
-  # Single GPU smoke on card 2; write all transient outputs under ./tmp
-  CUDA_VISIBLE_DEVICES=2 python -m src.pipeline.train \
-    --loss uniform \
-    --task-name smoke \
-    --cache-train training_data/cache/vae/pair_1s/train \
-    --cache-eval  training_data/cache/vae/pair_1s/eval \
-    --output-dir tmp/t032/train_smoke \
-    --max-steps 10 --save-steps 10 --eval-steps 10 --eval-video-steps 0
+Data/cache paths are fixed by task name in `src.pipeline.train_config`; CLI
+arguments only cover training, eval, LoRA, and W&B knobs.
 
-  # Mitty + hand_patch weighting
+Usage:
+  # Single GPU smoke on card 2; writes all transient outputs under ./tmp
+  CUDA_VISIBLE_DEVICES=2 python -m src.pipeline.train \
+    --task-name smoke_t032_e2e \
+    --max-steps 1 --save-steps 1 --eval-steps 1 --eval-video-steps 0
+
+  # Canonical Mitty training
   torchrun --nproc_per_node=4 -m src.pipeline.train \
-    --loss hand_patch \
-    --task-name appearance \
-    --patch-dir training_data/pair/1s/train/hand_patch \
-    --cache-train training_data/cache/vae/pair_1s/train \
-    --cache-eval  training_data/cache/vae/pair_1s/eval \
-    --max-steps 400 --eval-steps 100 --eval-video-steps 100
+    --task-name pair_1s \
+    --max-steps 1000 --eval-steps 100 --eval-video-steps 100
 """
 
 import argparse
@@ -44,7 +34,7 @@ import torch.distributed as dist
 
 from diffsynth.diffusion.flow_match import FlowMatchScheduler
 
-from src.core.config import MAIN_ROOT, T5_CACHE_DIR, TRAINING_DATA_ROOT
+from src.core.config import MAIN_ROOT
 from src.core.eval_metrics import OnlineMetrics
 from src.core.train_utils import (
     CsvLogger,
@@ -66,6 +56,7 @@ from src.core.train_utils import (
     tensor_to_frames,
 )
 from src.pipeline.backbones import MethodSpec, get_mitty_spec
+from src.pipeline.train_config import apply_train_task_config
 
 # Reuse helpers from the legacy Mitty script (these are generic pipe/IO utils
 # that happen to live there; keeping them there avoids touching legacy scripts).
@@ -73,7 +64,6 @@ from src.pipeline.train_mitty import (
     DEFAULT_DIT_DIR,
     DEFAULT_TOKENIZER,
     DEFAULT_VAE,
-    _load_patch_weights,
     collate_batch,
     prepare_sample,
 )
@@ -84,7 +74,6 @@ from src.pipeline.train_mitty import (
 @torch.no_grad()
 def eval_loss(model, files: list[str], device: str,
               num_t_samples: int = 5, seed_base: int = 12345,
-              patch_dir: str = "",
               t5_pos: dict = None, t5_neg: torch.Tensor = None,
               rank: int = 0, world_size: int = 1) -> float:
     """Eval MSE loss averaged over every file × ``num_t_samples`` timesteps.
@@ -104,8 +93,6 @@ def eval_loss(model, files: list[str], device: str,
             f = files[gi]
             s = load_sample(f, device=device,
                             t5_pos=t5_pos, t5_neg=t5_neg)
-            if patch_dir:
-                _load_patch_weights(s, f, patch_dir, device=device)
             s = prepare_sample(s, device)
             sub = 0.0
             for k in range(num_t_samples):
@@ -274,11 +261,13 @@ def train(args, spec: MethodSpec):
             csv_logger.write(**fields)
 
     info(f"Backbone: {spec.name} — {spec.description}")
-    info(f"Loss: {args.loss} (patch_dir={args.patch_dir or '<none>'})")
+    info(f"Task: {args.task_name} — {args.task_description}")
     info(f"Run: {run_dir}")
     info(f"Args: {vars(args)}")
     info(f"DDP: rank={rank}, world_size={world_size}, device={args.device}")
     info(f"Data: train={len(train_files)} eval={len(eval_files)} ood={len(ood_files)}")
+    info(f"Paths: train={args.cache_train} eval={args.cache_eval or '<none>'}"
+         f" ood={args.cache_ood or '<none>'} t5={args.t5_cache_dir or '<none>'}")
 
     # ── T5 cache (shared embeddings for new-format VAE-only caches) ──
     t5_pos, t5_neg = {}, None
@@ -287,19 +276,6 @@ def train(args, spec: MethodSpec):
         info(f"T5 cache: {len(t5_pos)} prompts + negative from {args.t5_cache_dir}")
     elif args.t5_cache_dir:
         info(f"T5 cache dir not found: {args.t5_cache_dir} (old-format cache assumed)")
-
-    # ── Patch weights (derived paths for eval/ood mirror the train layout) ──
-    patch_dir_eval = ""
-    patch_dir_ood = ""
-    if args.patch_dir:
-        patch_leaf = os.path.basename(args.patch_dir)
-        patch_parent = os.path.dirname(os.path.dirname(args.patch_dir))
-        patch_dir_eval = os.path.join(patch_parent, "eval", patch_leaf)
-        patch_dir_ood = os.path.join(patch_parent, "ood_eval", patch_leaf)
-        info(f"Patch weights: train={args.patch_dir}"
-             f" eval={patch_dir_eval} ood={patch_dir_ood}")
-    else:
-        info("Patch weights: disabled (uniform loss)")
 
     # ── Model (rank 0 loads from disk; others allocate empty + receive via broadcast) ──
     # All ranks print during loading so we can diagnose stalls.
@@ -314,7 +290,6 @@ def train(args, spec: MethodSpec):
     extra_kwargs = {}
     if args.merge_lora:
         extra_kwargs["merge_lora_paths"] = args.merge_lora
-        extra_kwargs["merge_lora_rank"] = args.merge_lora_rank
     model = spec.training_module_factory(
         device=args.device,
         lora_rank=args.lora_rank,
@@ -330,6 +305,9 @@ def train(args, spec: MethodSpec):
     if getattr(model, "_merge_n", 0):
         info(f"Merged {model._merge_n} LoRA pairs into base weights"
              f" from {len(args.merge_lora)} checkpoint(s)")
+        for item in getattr(model, "_merge_lora_info", []):
+            info(f"  MERGE {item['path']} rank={item['rank']}"
+                 f" pairs={item['pairs']}")
     if getattr(model, "_init_lora_n", 0):
         info(f"Loaded {model._init_lora_n} LoRA tensors from {args.init_lora}")
 
@@ -405,8 +383,6 @@ def train(args, spec: MethodSpec):
         for f in files:
             s = load_sample(f, device=args.device,
                             t5_pos=t5_pos, t5_neg=t5_neg)
-            if args.patch_dir:
-                _load_patch_weights(s, f, args.patch_dir, device=args.device)
             out.append(s)
         return out
 
@@ -470,7 +446,6 @@ def train(args, spec: MethodSpec):
             if eval_files:
                 el = eval_loss(model, eval_files, args.device,
                                num_t_samples=args.eval_t_samples,
-                               patch_dir=patch_dir_eval,
                                t5_pos=t5_pos, t5_neg=t5_neg,
                                rank=rank, world_size=world_size)
                 if is_main:
@@ -481,7 +456,6 @@ def train(args, spec: MethodSpec):
             if ood_files:
                 ol = eval_loss(model, ood_files, args.device,
                                num_t_samples=args.eval_t_samples,
-                               patch_dir=patch_dir_ood,
                                t5_pos=t5_pos, t5_neg=t5_neg,
                                rank=rank, world_size=world_size)
                 if is_main:
@@ -580,28 +554,12 @@ def train(args, spec: MethodSpec):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Mitty LoRA training for Wan 2.2 TI2V-5B "
-                    "(uniform / hand_patch loss)"
+        description="Mitty LoRA training for Wan 2.2 TI2V-5B"
     )
 
-    ap.add_argument("--loss", choices=["uniform", "hand_patch"], default="uniform",
-                    help="loss weighting scheme; hand_patch requires --patch-dir")
-
     ap.add_argument("--task-name", required=True,
-                    help="training task label for run name & W&B "
-                         "(e.g. identity, directly_transfer, appearance)")
-
-    ap.add_argument("--cache-train", required=True)
-    ap.add_argument("--cache-eval", default="")
-    ap.add_argument("--cache-ood", default="")
-    ap.add_argument("--t5-cache-dir", default=T5_CACHE_DIR,
-                    help="shared T5 embedding cache dir "
-                         "(default: training_data/cache/t5/)")
-    ap.add_argument("--patch-dir", default="",
-                    help="hand_patch weight dir for train split "
-                         "(eval/ood auto-derived)")
-    ap.add_argument("--output-dir",
-                    default=os.path.join(TRAINING_DATA_ROOT, "log"))
+                    help="fixed training data config name "
+                         "(see src.pipeline.train_config)")
 
     # Model paths
     ap.add_argument("--dit-dir", default=DEFAULT_DIT_DIR)
@@ -620,8 +578,6 @@ def main():
     ap.add_argument("--merge-lora", action="append", default=None,
                     help="LoRA checkpoint to merge into base weights "
                          "(can be specified multiple times)")
-    ap.add_argument("--merge-lora-rank", type=int, default=96,
-                    help="rank of the LoRA(s) to merge (for alpha/rank scaling)")
 
     # Training
     ap.add_argument("--lr", type=float, default=1e-4)
@@ -630,17 +586,17 @@ def main():
     ap.add_argument("--warmup-steps", type=int, default=50,
                     help="linear warmup steps (0 = no warmup)")
     ap.add_argument("--weight-decay", type=float, default=1e-2)
-    ap.add_argument("--max-steps", type=int, required=True,
+    ap.add_argument("--max-steps", type=int, default=1000,
                     help="total training steps (pure step-based control)")
     ap.add_argument("--batch-size", type=int, default=1,
                     help="per-rank training batch size")
-    ap.add_argument("--save-steps", type=int, default=50)
+    ap.add_argument("--save-steps", type=int, default=100)
     ap.add_argument("--eval-steps", type=int, default=100)
     ap.add_argument("--eval-t-samples", type=int, default=5,
                     help="timesteps to sample per eval sample (reduces variance)")
 
     # Eval video
-    ap.add_argument("--eval-video-steps", type=int, default=-1,
+    ap.add_argument("--eval-video-steps", type=int, default=100,
                     help="generate eval videos every N steps "
                          "(-1=follow eval-steps, 0=off, needs VAE)")
     ap.add_argument("--eval-video-samples-in-task", type=int, default=4,
@@ -657,22 +613,20 @@ def main():
     ap.add_argument("--wandb-run-name", default=None,
                     help="W&B run name (default: timestamp)")
     ap.add_argument("--wandb-tags", nargs="+", default=[],
-                    help="extra W&B tags (method + loss tags added automatically)")
+                    help="extra W&B tags")
     ap.add_argument("--wandb-log-videos", action=argparse.BooleanOptionalAction,
                     default=True,
                     help="upload eval videos to W&B (--no-wandb-log-videos to skip)")
 
     args = ap.parse_args()
 
-    # --- Ablation-flag validation ---
-    if args.loss == "hand_patch" and not args.patch_dir:
-        ap.error("--loss hand_patch requires --patch-dir")
-    if args.loss == "uniform" and args.patch_dir:
-        ap.error("--patch-dir is only valid with --loss hand_patch")
+    try:
+        apply_train_task_config(args)
+    except ValueError as exc:
+        ap.error(str(exc))
 
-    # Resolve relative paths against MAIN_ROOT (worktree-safe; see CLAUDE.md)
-    for attr in ("cache_train", "cache_eval", "cache_ood", "t5_cache_dir",
-                 "patch_dir", "output_dir", "init_lora"):
+    # Resolve shared checkpoint inputs against MAIN_ROOT for worktree runs.
+    for attr in ("init_lora",):
         val = getattr(args, attr)
         if val and not os.path.isabs(val):
             setattr(args, attr, os.path.join(MAIN_ROOT, val))

@@ -281,16 +281,13 @@ def build_wandb_tags(method_tag: str, args, *,
                      extra_tags: list[str] | None = None) -> list[str]:
     """Build comprehensive W&B tags from args.
 
-    Includes: method, loss, rank, lr, bs, steps, data count, warmup,
-    lora targets, init/merge-lora flags, GPU count, and user extra tags.
+    Includes method/data summary tags plus compact tags for every effective
+    argument. User-supplied tags are appended last.
     """
     tags = [method_tag]
     task_name = getattr(args, "task_name", "")
     if task_name:
         tags.append(task_name)
-    loss = getattr(args, "loss", None)
-    if loss:
-        tags.append(loss)
     lora_rank = getattr(args, "lora_rank", None)
     if lora_rank is not None:
         tags.append(f"r{lora_rank}")
@@ -317,8 +314,44 @@ def build_wandb_tags(method_tag: str, args, *,
         tags.append("merge-lora")
     if world_size > 1:
         tags.append(f"gpu:{world_size}")
+    tags.extend(build_wandb_param_tags(args))
     if extra_tags:
         tags.extend(extra_tags)
+    return tags
+
+
+def _tag_value(value) -> str:
+    if value is None:
+        return "<none>"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return "<empty>"
+        return ",".join(_tag_value(v) for v in value)
+
+    text = str(value)
+    if text == "":
+        return "<empty>"
+
+    main_root = os.environ.get("FLIP_MAIN_ROOT", "/disk_n/zzf/flip")
+    if os.path.isabs(text):
+        try:
+            rel = os.path.relpath(text, main_root)
+        except ValueError:
+            rel = text
+        if not rel.startswith(".."):
+            text = rel
+
+    return "_".join(text.split())
+
+
+def build_wandb_param_tags(args) -> list[str]:
+    """Build `p:key=value` tags for every final argparse/config value."""
+    tags = []
+    for key in sorted(vars(args)):
+        value = getattr(args, key)
+        tags.append(f"p:{key}={_tag_value(value)}")
     return tags
 
 

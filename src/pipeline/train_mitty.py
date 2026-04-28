@@ -84,42 +84,95 @@ DEFAULT_TOKENIZER = os.path.join(MANUAL_DIR, "google", "umt5-xxl")
 
 # ── LoRA merge ─────────────────────────────────────────────────────────
 
-def merge_lora_into_weights(model, lora_path: str, lora_rank: int,
-                            lora_alpha: int | None = None) -> int:
+def _strip_module_prefix(sd: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    if any(".module." in k for k in sd):
+        return {k.replace(".module.", ".", 1): v for k, v in sd.items()}
+    return sd
+
+
+def _lora_base_key(lora_a_key: str) -> str:
+    if lora_a_key.endswith(".lora_A.default.weight"):
+        return lora_a_key.removesuffix(".lora_A.default.weight") + ".weight"
+    if lora_a_key.endswith(".lora_A.weight"):
+        return lora_a_key.removesuffix(".lora_A.weight") + ".weight"
+    raise ValueError(f"Unsupported LoRA A key format: {lora_a_key}")
+
+
+def _lora_b_key(lora_a_key: str) -> str:
+    return lora_a_key.replace("lora_A", "lora_B", 1)
+
+
+def detect_lora_rank(lora_path: str) -> int:
+    """Detect a LoRA checkpoint rank from safetensors A/B weight shapes."""
+    if not os.path.isfile(lora_path):
+        raise FileNotFoundError(f"LoRA checkpoint not found: {lora_path}")
+
+    from safetensors.torch import load_file
+    sd = _strip_module_prefix(load_file(lora_path, device="cpu"))
+    lora_a_keys = sorted(
+        k for k, v in sd.items()
+        if "lora_A" in k and k.endswith(".weight") and v.ndim == 2
+    )
+    if not lora_a_keys:
+        raise ValueError(f"No LoRA A weights found in {lora_path}")
+
+    ranks = set()
+    for key in lora_a_keys:
+        b_key = _lora_b_key(key)
+        if b_key not in sd:
+            raise ValueError(f"Missing LoRA B weight for {key} in {lora_path}")
+        lora_a = sd[key]
+        lora_b = sd[b_key]
+        if lora_b.ndim != 2:
+            raise ValueError(f"LoRA B weight is not 2D: {b_key}")
+        rank = lora_a.shape[0]
+        if lora_b.shape[1] != rank:
+            raise ValueError(
+                f"LoRA rank mismatch for {key}: "
+                f"A rank={rank}, B rank={lora_b.shape[1]}"
+            )
+        ranks.add(rank)
+
+    if len(ranks) != 1:
+        raise ValueError(
+            f"LoRA checkpoint has inconsistent ranks {sorted(ranks)}: {lora_path}"
+        )
+    return ranks.pop()
+
+
+def merge_lora_into_weights(model, lora_path: str,
+                            lora_alpha: int | None = None) -> dict:
     """Merge a pre-trained LoRA checkpoint into the model's base weights.
 
     Computes delta = (lora_alpha / lora_rank) * lora_B @ lora_A for each
     LoRA pair and adds it to the corresponding base Linear weight in-place.
-    Returns the number of merged LoRA pairs.
+    Returns merge metadata with checkpoint path, detected rank, and pair count.
     """
+    lora_rank = detect_lora_rank(lora_path)
     if lora_alpha is None:
         lora_alpha = lora_rank
     scaling = lora_alpha / lora_rank
 
     from safetensors.torch import load_file
     device_str = str(next(model.parameters()).device)
-    sd = load_file(lora_path, device=device_str)
-
-    if any(".module." in k for k in sd):
-        sd = {k.replace(".module.", ".", 1): v for k, v in sd.items()}
+    sd = _strip_module_prefix(load_file(lora_path, device=device_str))
 
     base_params = dict(model.named_parameters())
     merged = 0
-    for key in sd:
-        if "lora_A" not in key:
+    for key, lora_A in sd.items():
+        if "lora_A" not in key or not key.endswith(".weight"):
             continue
-        base_key = key.replace(".lora_A.default.weight", ".weight")
-        lora_B_key = key.replace("lora_A", "lora_B")
-        assert base_key in base_params, \
-            f"Cannot find base param {base_key} for LoRA key {key}"
-        assert lora_B_key in sd, \
-            f"Missing lora_B for {key}"
-        lora_A = sd[key]
+        base_key = _lora_base_key(key)
+        lora_B_key = _lora_b_key(key)
+        if base_key not in base_params:
+            raise ValueError(f"Cannot find base param {base_key} for LoRA key {key}")
+        if lora_B_key not in sd:
+            raise ValueError(f"Missing lora_B for {key}")
         lora_B = sd[lora_B_key]
         delta = (lora_B @ lora_A) * scaling
         base_params[base_key].data.add_(delta.to(base_params[base_key].dtype))
         merged += 1
-    return merged
+    return {"path": lora_path, "rank": lora_rank, "pairs": merged}
 
 
 # ── Model ──────────────────────────────────────────────────────────────
@@ -157,7 +210,6 @@ class MittyTrainingModule(DiffusionTrainingModule):
         init_lora_path: str = "",
         skip_dit_load: bool = False,
         merge_lora_paths: list[str] | None = None,
-        merge_lora_rank: int = 96,
     ):
         super().__init__()
         self.pipe = build_pipe(device, dit_dir, vae_path, tokenizer_dir,
@@ -166,9 +218,11 @@ class MittyTrainingModule(DiffusionTrainingModule):
 
         # Merge pre-trained LoRA(s) into base weights before freeze + new LoRA
         self._merge_n = 0
+        self._merge_lora_info = []
         for p in (merge_lora_paths or []):
-            self._merge_n += merge_lora_into_weights(
-                self.pipe.dit, p, merge_lora_rank)
+            info = merge_lora_into_weights(self.pipe.dit, p)
+            self._merge_n += info["pairs"]
+            self._merge_lora_info.append(info)
 
         # Freeze everything
         for name, module in self.pipe.named_children():
@@ -529,12 +583,14 @@ def train(args):
         load_vae=load_vae,
         init_lora_path=args.init_lora,
         merge_lora_paths=args.merge_lora,
-        merge_lora_rank=args.merge_lora_rank,
     )
     info(f"Model loaded in {time.time() - t0:.1f}s (load_vae={load_vae})")
     if model._merge_n:
         info(f"Merged {model._merge_n} LoRA pairs into base weights"
              f" from {len(args.merge_lora)} checkpoint(s)")
+        for item in model._merge_lora_info:
+            info(f"  MERGE {item['path']} rank={item['rank']}"
+                 f" pairs={item['pairs']}")
     if model._init_lora_n:
         info(f"Loaded {model._init_lora_n} LoRA tensors from {args.init_lora}")
 
@@ -817,8 +873,6 @@ def main():
     ap.add_argument("--merge-lora", action="append", default=None,
                     help="LoRA checkpoint to merge into base weights "
                          "(can be specified multiple times)")
-    ap.add_argument("--merge-lora-rank", type=int, default=96,
-                    help="rank of the LoRA(s) to merge (for alpha/rank scaling)")
 
     # Training
     ap.add_argument("--lr", type=float, default=1e-4)

@@ -470,3 +470,19 @@
 **补充说明：**
 - 只保留三个训练数据集的原因：`Inspire_Put_Clothes_into_Washing_Machine_MainCamOnly` 只有一条有效数据且是重复数据；`Inspire_Put_Clothes_Into_Basket` 的手部外观与其他任务不一致。
 - 文档补充了 Mitty 直接训练的 `make_pair --task all` 示例、三阶段 LoRA identity 的 `make_robot_pair --task all` 示例，以及显式调试历史任务的用法。
+
+## 2026-04-28 — T037 训练入口配置化重构
+
+**用户原始需求：**
+> 重新搞一下训练入口。公共的、基本不变的参数写到配置中；不同 task name 的训练数据路径和 T5 cache 固定；去掉 loss 选项；merge LoRA 保留并自动检测；保留可训练 LoRA 参数；max step 默认 1000，eval/save 默认 100；eval 相关默认可覆盖；W&B tag 写入所有参数。
+
+**完成改动：**
+- 新增 `src/pipeline/train_config.py`，用 `--task-name` 固定选择 train/eval/OOD cache、T5 cache 和默认输出目录。
+- `src/pipeline/train.py` 移除 `--loss`、`--cache-*`、`--t5-cache-dir`、`--patch-dir`、`--merge-lora-rank` 公开参数；保留训练、eval、LoRA 和 W&B 覆盖参数。
+- `--max-steps` 默认 1000，`--save-steps` / `--eval-steps` / `--eval-video-steps` 默认 100。
+- `src/pipeline/train_mitty.py` 的 LoRA merge 从 checkpoint 自动检测 rank；多个 `--merge-lora` 按顺序合并，检测失败直接报错。
+- `src/core/train_utils.py` 的 W&B tags 追加所有最终生效参数的 `p:key=value` 形式。
+- 更新训练文档、FFN LoRA merge 文档、W&B 文档、`scripts/flip_run.sh` help 和 GPU smoke 脚本。
+
+**创建的任务：**
+- [037] 训练入口配置化重构

@@ -28,7 +28,7 @@ Examples:
   scripts/flip_run.sh nvidia-smi
   scripts/flip_run.sh mitty_cache --cuda 0 -- --pair-dir training_data/pair/1s/train --output training_data/cache/1s/train --device cuda:0 --no-frames
   scripts/flip_run.sh sam2_precompute --cuda 0 -- --task all --device cuda:0 --resume
-  scripts/flip_run.sh train --cuda 2,3 --nproc 2 -- --task-name appearance --loss uniform --cache-train training_data/cache/1s/train --cache-eval training_data/cache/1s/eval
+  scripts/flip_run.sh train --cuda 2,3 --nproc 2 -- --task-name pair_1s --max-steps 1000
   scripts/flip_run.sh eval_mitty --cuda 2 -- --device cuda:0 --samples-per-split 32
 USAGE
 }
