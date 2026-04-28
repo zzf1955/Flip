@@ -581,6 +581,10 @@ def main():
                     help="comma-separated robot task short names for OOD eval")
     ap.add_argument("--cache-root", default="",
                     help="root containing <data_type>/<duration>/<task>/manifest.jsonl")
+    ap.add_argument("--t5-cache-dir", default="",
+                    help="T5 cache dir; default comes from --task-name preset")
+    ap.add_argument("--output-dir", default="",
+                    help="training output root; default comes from --task-name preset")
     ap.add_argument("--train-size", type=int, default=0,
                     help="runtime train clip count (0=all, -1=all)")
     ap.add_argument("--in-task-eval-size", type=int, default=0,
