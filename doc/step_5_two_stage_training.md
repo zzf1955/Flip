@@ -96,11 +96,8 @@ python -m src.pipeline.mitty_cache \
 
 # 2. Phase 1 训练（恒等重建）
 scripts/flip_run.sh train --cuda 2 -- \
-  --task-name identity \
-  --loss uniform \
-  --cache-train training_data/cache/vae/robot_1s/train \
-  --cache-eval  training_data/cache/vae/robot_1s/eval \
-  --max-steps 400 --save-steps 50 --eval-steps 100 \
+  --task-name robot_1s \
+  --max-steps 400 --save-steps 100 --eval-steps 100 \
   --eval-video-steps 100
 ```
 
@@ -109,13 +106,9 @@ scripts/flip_run.sh train --cuda 2 -- \
 ```bash
 # 用 Phase 1 最佳 ckpt 初始化
 scripts/flip_run.sh train --cuda 2 -- \
-  --task-name appearance \
-  --loss uniform \
+  --task-name attn_ffn_selected \
   --init-lora training_data/log/<phase1-run>/ckpt/step-0400.safetensors \
-  --cache-train output/mitty_cache_1s/train \
-  --cache-eval  output/mitty_cache_1s/eval \
-  --cache-ood   output/mitty_cache_1s/ood_eval \
-  --max-steps 400 --save-steps 50 --eval-steps 100
+  --max-steps 400 --save-steps 100 --eval-steps 100
 ```
 
 ### DDP 多卡版本
@@ -123,21 +116,14 @@ scripts/flip_run.sh train --cuda 2 -- \
 ```bash
 # Phase 1
 scripts/flip_run.sh train --cuda 0,1,2,3 --nproc 4 -- \
-  --task-name identity \
-  --loss uniform \
-  --cache-train training_data/cache/vae/robot_1s/train \
-  --cache-eval  training_data/cache/vae/robot_1s/eval \
-  --max-steps 400 --save-steps 50 --eval-steps 100
+  --task-name robot_1s \
+  --max-steps 400 --save-steps 100 --eval-steps 100
 
 # Phase 2
 scripts/flip_run.sh train --cuda 0,1,2,3 --nproc 4 -- \
-  --task-name appearance \
-  --loss uniform \
+  --task-name attn_ffn_selected \
   --init-lora training_data/log/<phase1-run>/ckpt/step-0400.safetensors \
-  --cache-train output/mitty_cache_1s/train \
-  --cache-eval  output/mitty_cache_1s/eval \
-  --cache-ood   output/mitty_cache_1s/ood_eval \
-  --max-steps 400 --save-steps 50 --eval-steps 100
+  --max-steps 400 --save-steps 100 --eval-steps 100
 ```
 
 ## 训练预期

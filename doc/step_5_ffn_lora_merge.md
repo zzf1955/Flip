@@ -22,7 +22,9 @@ Base DiT (frozen)
 base_weight += (lora_alpha / lora_rank) * lora_B @ lora_A
 ```
 
-默认 `lora_alpha = lora_rank = 96`，scaling = 1.0。合并后模型行为与冻结 LoRA adapter 完全等价，但实现更简洁——无需在同一模型上叠加两套 PEFT adapter。
+训练入口会从 checkpoint 的 LoRA A/B 权重形状自动检测 rank，并默认
+`lora_alpha = detected_rank`，scaling = 1.0。合并后模型行为与冻结 LoRA
+adapter 完全等价，但实现更简洁——无需在同一模型上叠加两套 PEFT adapter。
 
 ### FFN 层结构
 
@@ -78,15 +80,10 @@ LD_PRELOAD=/home/leadtek/miniconda3/envs/flip/lib/libjpeg.so.8 \
 
 ```bash
 scripts/flip_run.sh train --cuda 2,3 --nproc 2 -- \
-  --task-name ffn_patch \
-  --loss hand_patch \
+  --task-name attn_ffn_selected \
   --merge-lora training_data/log/identity-mitty-bs8-2k/ckpt/step-4850.safetensors \
-  --merge-lora-rank 96 \
   --lora-target-modules "ffn.0,ffn.2" \
   --lora-rank 96 \
-  --cache-train training_data/cache/vae/1s_patch/train \
-  --cache-eval  training_data/cache/vae/1s_patch/eval \
-  --patch-dir   training_data/pair/1s_patch/train/patch \
   --max-steps 2000 --save-steps 100 --eval-steps 100 \
   --eval-video-steps 100 --eval-video-samples-in-task 4 \
   --lr 1e-4 --warmup-steps 50 \
@@ -98,15 +95,10 @@ scripts/flip_run.sh train --cuda 2,3 --nproc 2 -- \
 
 ```bash
 scripts/flip_run.sh train --cuda 2,3 --nproc 2 -- \
-  --task-name ffn_patch \
-  --loss hand_patch \
+  --task-name attn_ffn_selected \
   --merge-lora training_data/log/identity-mitty-bs8-2k/ckpt/step-4850.safetensors \
-  --merge-lora-rank 96 \
   --lora-target-modules "ffn.0,ffn.2" \
   --lora-rank 96 \
-  --cache-train training_data/cache/vae/1s_patch/train \
-  --cache-eval  training_data/cache/vae/1s_patch/eval \
-  --patch-dir   training_data/pair/1s_patch/train/patch \
   --max-steps 2000 --save-steps 100 --eval-steps 100 \
   --eval-video-steps 100 \
   --lr 1e-4 --warmup-steps 50 \
@@ -118,10 +110,9 @@ scripts/flip_run.sh train --cuda 2,3 --nproc 2 -- \
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--merge-lora` | `""` | 预训练 LoRA checkpoint 路径，合并到 base weights |
-| `--merge-lora-rank` | 96 | 被合并 LoRA 的 rank（用于 alpha/rank scaling） |
+| `--merge-lora` | `""` | 预训练 LoRA checkpoint 路径，可重复传入，按顺序合并到 base weights |
 
-这两个参数在 `train_mitty.py` 和 `train.py` 中均可用。
+被合并 LoRA 的 rank 会从 checkpoint 自动检测；无法唯一检测时训练直接失败。
 
 ## 训练预期
 
@@ -139,7 +130,7 @@ scripts/flip_run.sh train --cuda 2,3 --nproc 2 -- \
 ```python
 # 伪代码
 model = load_dit(...)
-merge_lora_into_weights(model, identity_ckpt, rank=96)
+merge_lora_into_weights(model, identity_ckpt)
 model = inject_lora(model, target_modules=["ffn.0", "ffn.2"], rank=96)
 model.load_state_dict(load_file(ffn_ckpt), strict=False)
 ```

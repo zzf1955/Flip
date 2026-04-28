@@ -108,7 +108,9 @@ VAE cache 样本字段：
 - `prompt`: prompt 文本，用于匹配共享 T5 cache。
 - `source_id`: 数据溯源 key。
 
-T5 embedding 不再重复嵌入每个样本文件。训练脚本通过 `--t5-cache-dir` 指定，默认 `training_data/cache/t5/`。
+T5 embedding 不再重复嵌入每个样本文件。正式训练入口不再从命令行接收
+cache/T5 路径，而是通过 `src/pipeline/train_config.py` 的 `--task-name`
+固定映射选择。
 
 ## 生成 Cache
 
@@ -194,34 +196,38 @@ scripts/flip_run.sh eval_mitty --cuda 2 -- \
 
 ```bash
 CUDA_VISIBLE_DEVICES=2 python -m src.pipeline.train \
-  --task-name smoke \
-  --loss uniform \
-  --cache-train training_data/cache/vae/pair_1s/train \
-  --cache-eval training_data/cache/vae/pair_1s/eval \
-  --t5-cache-dir training_data/cache/t5 \
-  --output-dir tmp/t032/train_smoke \
-  --max-steps 10 \
-  --save-steps 10 \
-  --eval-steps 10 \
+  --task-name smoke_t032_e2e \
+  --max-steps 1 \
+  --save-steps 1 \
+  --eval-steps 1 \
   --eval-video-steps 0 \
   --wandb-project ""
 ```
 
 ### 正式 Mitty 训练
 
+`--task-name` 从 `src/pipeline/train_config.py` 选择固定数据配置。当前维护
+的 task 包括：
+
+| task name | train/eval/ood cache |
+| --- | --- |
+| `pair_1s` | `training_data/cache/vae/pair_1s/` |
+| `pair_1s_r2h` | `training_data/cache/vae/pair_1s_r2h/` |
+| `pair_1s_train3` | `training_data/cache/vae/pair_1s_train3/` |
+| `pair_1s_16` | `training_data/cache/vae/pair_1s_16/` |
+| `robot_1s` | `training_data/cache/vae/robot_1s/` |
+| `attn_ffn_selected` | `output/mitty_cache_1s/` |
+
+新增训练数据集时只更新 `train_config.py`，不要在正式命令中重新暴露
+`--cache-train` / `--cache-eval` / `--t5-cache-dir`。
+
 单卡：
 
 ```bash
 scripts/flip_run.sh train --cuda 2 -- \
-  --task-name appearance \
-  --loss uniform \
-  --cache-train training_data/cache/vae/pair_1s/train \
-  --cache-eval training_data/cache/vae/pair_1s/eval \
-  --cache-ood training_data/cache/vae/pair_1s/ood_eval \
-  --t5-cache-dir training_data/cache/t5 \
-  --output-dir training_data/log \
-  --max-steps 400 \
-  --save-steps 50 \
+  --task-name pair_1s \
+  --max-steps 1000 \
+  --save-steps 100 \
   --eval-steps 100 \
   --eval-video-steps 100
 ```
@@ -230,15 +236,9 @@ scripts/flip_run.sh train --cuda 2 -- \
 
 ```bash
 scripts/flip_run.sh train --cuda 2,3 --nproc 2 -- \
-  --task-name appearance \
-  --loss uniform \
-  --cache-train training_data/cache/vae/pair_1s/train \
-  --cache-eval training_data/cache/vae/pair_1s/eval \
-  --cache-ood training_data/cache/vae/pair_1s/ood_eval \
-  --t5-cache-dir training_data/cache/t5 \
-  --output-dir training_data/log \
-  --max-steps 400 \
-  --save-steps 50 \
+  --task-name pair_1s \
+  --max-steps 1000 \
+  --save-steps 100 \
   --eval-steps 100 \
   --eval-video-steps 100
 ```
@@ -248,21 +248,8 @@ scripts/flip_run.sh train --cuda 2,3 --nproc 2 -- \
 - `eval loss` 按 cache 文件索引在所有 rank 间切分，每个 rank 计算自己的子集，再 `all_reduce` 成全局均值；随机种子使用全局样本索引，避免 GPU 数量变化改变评估语义。
 - `eval video` 按待生成视频的全局样本索引在所有 rank 间切分；所有 rank 写入同一个 `step-XXXX/`，文件名仍为 `gen_00.mp4`、`gt_00.mp4`、`ctrl_00.mp4` 这类全局编号。
 - CSV、W&B、eval video 上传和在线指标只在 rank 0 执行；视频生成完成后会用 DDP barrier 等待所有 rank 写完。
-- 正式实验默认 `--eval-steps 100 --eval-video-steps 100`，即 eval loss 和 eval video 都每 100 step 触发一次；smoke/debug 可临时调小。
-
-### Hand-patch 加权
-
-```bash
-scripts/flip_run.sh train --cuda 2 -- \
-  --task-name hand_patch \
-  --loss hand_patch \
-  --patch-dir training_data/pair/1s/train/hand_patch \
-  --cache-train training_data/cache/vae/pair_1s/train \
-  --cache-eval training_data/cache/vae/pair_1s/eval \
-  --t5-cache-dir training_data/cache/t5 \
-  --output-dir training_data/log \
-  --max-steps 400
-```
+- 正式实验默认 `--max-steps 1000 --save-steps 100 --eval-steps 100 --eval-video-steps 100`；smoke/debug 可临时调小。
+- `--loss`、`--patch-dir` 已从正式训练入口移除，当前统一使用标准 Mitty loss。
 
 ## 验证
 
