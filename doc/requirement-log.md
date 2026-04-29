@@ -1,5 +1,42 @@
 # 需求日志
 
+## 2026-04-29
+
+**用户原始需求：**
+> 改一下当前的 LoRA 注入,我需要更细化地控制 LoRA 的情况：在 Attention 中支持选择 self Attention 和 Cross Attention 注入 LoRA；支持在 QKVO 中的几个层注入 LoRA；训练好的 LoRA 读取时自动识别大小。
+
+**完成改动：**
+- `src/pipeline/train_mitty.py`：新增 LoRA 目标解析，默认通过 `--lora-attn-types self,cross` 与 `--lora-attn-projections q,k,v,o` 展开为 `self_attn.q`、`cross_attn.v` 等精确注入点；`--lora-target-modules` 仍可显式覆盖到任意 PEFT target suffix，例如 `ffn.0,ffn.2`。
+- `src/pipeline/train.py`、`src/pipeline/train_mitty.py`：`--lora-rank` 改为可省略；指定 `--init-lora` 时从 checkpoint 的 LoRA A/B 形状自动检测 rank，并从 checkpoint key 自动检测 target modules。
+- `src/pipeline/train_mitty.py`：加载 `--init-lora` 后校验所有已注入 LoRA tensor 都来自 checkpoint，避免 target/rank 不匹配时静默随机初始化部分 LoRA。
+- `src/pipeline/evaluate_mitty_models.py`：综合评估加载训练好的 LoRA 时默认自动检测 rank 和 target modules，不再需要手动传 `--lora-rank` / `--lora-target-modules`。
+- `tests/test_lora_config.py`：新增 LoRA attention 控制、checkpoint rank/target 检测和 CLI args 自动填充单测。
+
+---
+
+**用户原始需求：**
+> 修复 FID 和 FVD 的计算，并说明标准 FVD 的实现复杂度和显存占用。
+
+**完成改动：**
+- `src/core/eval_metrics.py`：在线 FID 保持 InceptionV3 pool3 帧级 Frechet 距离；FVD 改为 torchvision S3D Kinetics-400 时空视频特征，不再使用 Inception 帧特征时间均值伪 FVD。
+- `src/tools/eval_metrics.py`：离线 FVD 同步改为 S3D 视频特征，FID/FVD 分别使用图像/视频特征抽取器，并在 gen/gt 帧数不一致时直接报错。
+- `src/pipeline/evaluate_mitty_models.py`：综合评估入口同步加载 S3D 视频特征模型，保持与离线工具签名一致。
+- `doc/step_5_training_infra.md`：记录 FID/FVD 当前口径、显存/耗时影响和小样本不稳定注意事项。
+
+---
+
+## 2026-04-28
+
+**用户原始需求：**
+> 修几个 bug：W&B 的 log 目录和训练名字后面加具体秒，保证目录名字不会冲突；目录中加上 LoRA 的位置，比如 ffn0ffn2 / qkvo，当前没有 LoRA 看不出来且路径名字会冲突。
+
+**完成改动：**
+- `src/core/train_utils.py`：默认 run name 时间戳从 `MMDD_HHMM` 改为 `MMDD_HHMMSS`，同一分钟内启动多个训练时不再共用目录名。
+- `src/core/train_utils.py`：默认 run name 加入 LoRA target 短签名，例如 `q,k,v,o` → `qkvo`、`ffn.0,ffn.2` → `ffn0ffn2`。
+- `doc/step_5_training_infra.md`、`doc/step_5_wandb_setup.md`：同步记录新的 run name 格式。
+
+---
+
 ## 2026-04-26
 
 **用户原始需求：**
@@ -220,7 +257,7 @@
 
 讨论要点：
 - FID 需要大量样本才稳定，配对视频编辑任务更适合逐帧指标（LPIPS/SSIM/PSNR）
-- 环境无 lpips/torchmetrics 包，用 VGG16/InceptionV3 自实现 LPIPS/FID/FVD
+- 环境无 lpips/torchmetrics 包，用 VGG16/InceptionV3 自实现 LPIPS/FID；FVD 后续已升级为 torchvision S3D Kinetics 视频特征
 - 独立 CLI 工具，不集成到训练循环
 
 **创建的任务：**

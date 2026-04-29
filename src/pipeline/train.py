@@ -70,6 +70,7 @@ from src.pipeline.train_mitty import (
     DEFAULT_VAE,
     collate_batch,
     prepare_sample,
+    resolve_lora_args,
 )
 
 
@@ -238,8 +239,10 @@ def train(args, spec: MethodSpec):
         "eval_loss_in_task", "eval_loss_ood",
         "eval_psnr_in_task", "eval_ssim_in_task",
         "eval_lpips_in_task", "eval_clip_in_task",
+        "eval_fid_in_task", "eval_fvd_in_task",
         "eval_psnr_ood", "eval_ssim_ood",
         "eval_lpips_ood", "eval_clip_ood",
+        "eval_fid_ood", "eval_fvd_ood",
         "save_ckpt", "eval_video",
     ]
     csv_logger = CsvLogger(str(run_dir / "train.csv"),
@@ -316,6 +319,7 @@ def train(args, spec: MethodSpec):
                  f" pairs={item['pairs']}")
     if getattr(model, "_init_lora_n", 0):
         info(f"Loaded {model._init_lora_n} LoRA tensors from {args.init_lora}")
+    info(f"LoRA: rank={model._lora_rank} targets={model._lora_target_modules}")
 
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     n_total = sum(p.numel() for p in model.parameters())
@@ -366,7 +370,9 @@ def train(args, spec: MethodSpec):
     else:
         lr_scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0)
 
-    online_metrics = OnlineMetrics(args.device) if is_main else None
+    online_metrics = OnlineMetrics(
+        args.device, include_frechet=args.eval_video_frechet_metrics,
+    ) if is_main else None
 
     info(f"Plan: {len(train_files)} train files, {total_steps} steps,"
          f" effective_bs={effective_bs}")
@@ -530,12 +536,14 @@ def train(args, spec: MethodSpec):
                     if not m:
                         continue
                     for k, v in m.items():
-                        csv_key = f"eval_{k}_{split_name}"
-                        row_fields[csv_key] = f"{v:.4f}"
-                        metrics_payload[f"eval/{k}_{split_name}"] = v
+                        metric_name = "clip" if k == "clip_score" else k
+                        row_fields[f"eval_{metric_name}_{split_name}"] = f"{v:.4f}"
+                        metrics_payload[f"eval/{metric_name}_{split_name}"] = v
                     info(f"  METRICS [{split_name}] "
                          f"PSNR={m['psnr']:.2f} SSIM={m['ssim']:.4f} "
-                         f"LPIPS={m['lpips']:.4f} CLIP={m['clip_score']:.4f}")
+                         f"LPIPS={m['lpips']:.4f} CLIP={m['clip_score']:.4f}" +
+                         (f" FID={m['fid']:.1f}" if "fid" in m else "") +
+                         (f" FVD={m['fvd']:.1f}" if "fvd" in m else ""))
                 if metrics_payload:
                     wb.log(metrics_payload, step=step)
 
@@ -608,8 +616,18 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
 
     # LoRA
-    ap.add_argument("--lora-rank", type=int, default=96)
-    ap.add_argument("--lora-target-modules", default="q,k,v,o")
+    ap.add_argument("--lora-rank", type=int, default=None,
+                    help="LoRA rank; defaults to 96, or auto-detects from --init-lora")
+    ap.add_argument("--lora-target-modules", default=None,
+                    help="explicit comma-separated PEFT target suffixes, e.g. "
+                         "self_attn.q,cross_attn.v,ffn.0; overrides "
+                         "--lora-attn-types/--lora-attn-projections")
+    ap.add_argument("--lora-attn-types", default="self,cross",
+                    help="attention blocks to LoRA when --lora-target-modules "
+                         "is omitted: self,cross")
+    ap.add_argument("--lora-attn-projections", default="q,k,v,o",
+                    help="attention projections to LoRA when --lora-target-modules "
+                         "is omitted: q,k,v,o")
     ap.add_argument("--init-lora", default="",
                     help="path to .safetensors LoRA checkpoint to initialize from")
     ap.add_argument("--merge-lora", action="append", default=None,
@@ -643,12 +661,17 @@ def main():
     ap.add_argument("--max-eval-files", type=int, default=0,
                     help="deprecated; use --in-task-eval-size")
     ap.add_argument("--num-inference-steps", type=int, default=30)
+    ap.add_argument("--eval-video-frechet-metrics",
+                    action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help="also compute FID/FVD during eval video metrics "
+                         "(slower and uses extra VRAM; default: on)")
 
     # W&B
     ap.add_argument("--wandb-project", default="Flip",
                     help="W&B project name (default: 'Flip'; set to '' to disable)")
     ap.add_argument("--wandb-run-name", default=None,
-                    help="W&B run name (default: timestamp)")
+                    help="W&B run name (default: auto run name)")
     ap.add_argument("--wandb-tags", nargs="+", default=[],
                     help="extra W&B tags")
     ap.add_argument("--wandb-log-videos", action=argparse.BooleanOptionalAction,
@@ -679,6 +702,10 @@ def main():
             os.path.join(MAIN_ROOT, p) if not os.path.isabs(p) else p
             for p in args.merge_lora
         ]
+    try:
+        resolve_lora_args(args)
+    except (FileNotFoundError, ValueError) as exc:
+        ap.error(str(exc))
 
     train(args, get_mitty_spec())
 

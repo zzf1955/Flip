@@ -119,10 +119,11 @@ scripts/flip_run.sh train --cuda 0,2 --nproc 2 -- \
   --ood-video-size 4 \
   --data-seed 42
 
+# 恒等映射 leadtek 10.20.1.2
 
 scripts/flip_run_2.sh train --cuda 0 -- \
   --task-name identity_r2r_1s \
-  --lora-rank 32 \
+  --lora-rank 64 \
   --train-size 10000 \
   --in-task-eval-size 16 \
   --ood-eval-size 16 \
@@ -130,10 +131,9 @@ scripts/flip_run_2.sh train --cuda 0 -- \
   --ood-video-size 8 \
   --batch-size 4
 
-
 scripts/flip_run_2.sh train --cuda 2 -- \
   --task-name identity_r2r_1s \
-  --lora-rank 32 \
+  --lora-rank 64 \
   --lora-target-modules q,k,v,o,ffn.0,ffn.2 \
   --batch-size 4 \
   --train-size 10000 \
@@ -142,9 +142,9 @@ scripts/flip_run_2.sh train --cuda 2 -- \
   --in-task-video-size 8 \
   --ood-video-size 8
 
-  scripts/flip_run.sh train --cuda 3 -- \
+scripts/flip_run_2.sh train --cuda 1 -- \
   --task-name identity_r2r_1s \
-  --lora-rank 32 \
+  --lora-rank 64 \
   --lora-target-modules ffn.0,ffn.2 \
   --batch-size 4 \
   --train-size 10000 \

@@ -254,8 +254,8 @@ _BACKBONE_DISPLAY = {
 def build_run_name(prefix: str, args, *, n_train: int = 0) -> str:
     """Build a descriptive run name used for both local dir and W&B.
 
-    Format: {Backbone}-{task_name}-{n_train}d_{params}_{MMDD_HHMM}
-    Example: Mitty-identity-1200d_r96_500s_0422_1430
+    Format: {Backbone}-{task_name}-{n_train}d_{params}_{MMDD_HHMMSS}
+    Example: Mitty-identity-1200d_r96_qkvo_500s_0422_143015
     """
     backbone = _BACKBONE_DISPLAY.get(prefix, prefix.capitalize())
     task_name = getattr(args, "task_name", "")
@@ -270,12 +270,27 @@ def build_run_name(prefix: str, args, *, n_train: int = 0) -> str:
     lora_rank = getattr(args, "lora_rank", None)
     if lora_rank is not None:
         detail.append(f"r{lora_rank}")
+    lora_targets = _compact_lora_targets(getattr(args, "lora_target_modules", ""))
+    if lora_targets:
+        detail.append(lora_targets)
     max_steps = getattr(args, "max_steps", None)
     if max_steps is not None:
         detail.append(f"{max_steps}s")
-    detail.append(datetime.now().strftime("%m%d_%H%M"))
+    detail.append(datetime.now().strftime("%m%d_%H%M%S"))
 
     return "-".join(head) + "_" + "_".join(detail)
+
+
+def _compact_lora_targets(target_modules: str) -> str:
+    """Return a filename-safe LoRA target signature for run names."""
+    if not target_modules:
+        return ""
+    parts = []
+    for raw_part in str(target_modules).split(","):
+        cleaned = "".join(ch for ch in raw_part.strip() if ch.isalnum())
+        if cleaned:
+            parts.append(cleaned)
+    return "".join(parts)
 
 
 def build_wandb_tags(method_tag: str, args, *,

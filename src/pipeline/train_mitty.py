@@ -24,6 +24,7 @@ Usage:
 import argparse
 import os
 import random
+import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -102,8 +103,130 @@ def _lora_b_key(lora_a_key: str) -> str:
     return lora_a_key.replace("lora_A", "lora_B", 1)
 
 
-def detect_lora_rank(lora_path: str) -> int:
-    """Detect a LoRA checkpoint rank from safetensors A/B weight shapes."""
+def _split_csv(value: str | list[str] | tuple[str, ...] | None) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        raw_parts = value
+    else:
+        raw_parts = str(value).split(",")
+    return [str(part).strip() for part in raw_parts if str(part).strip()]
+
+
+_ATTN_TYPE_ALIASES = {
+    "self": "self_attn",
+    "self_attn": "self_attn",
+    "self_attention": "self_attn",
+    "cross": "cross_attn",
+    "cross_attn": "cross_attn",
+    "cross_attention": "cross_attn",
+}
+
+_ATTN_PROJECTION_ALIASES = {
+    "q": "q",
+    "query": "q",
+    "k": "k",
+    "key": "k",
+    "v": "v",
+    "value": "v",
+    "o": "o",
+    "out": "o",
+    "output": "o",
+}
+
+_TARGET_ORDER = {
+    "self_attn.q": 0,
+    "self_attn.k": 1,
+    "self_attn.v": 2,
+    "self_attn.o": 3,
+    "cross_attn.q": 4,
+    "cross_attn.k": 5,
+    "cross_attn.v": 6,
+    "cross_attn.o": 7,
+    "ffn.0": 8,
+    "ffn.2": 9,
+}
+
+
+def _ordered_unique(parts: list[str]) -> list[str]:
+    seen = set()
+    out = []
+    for part in parts:
+        if part not in seen:
+            seen.add(part)
+            out.append(part)
+    return out
+
+
+def resolve_lora_target_modules(
+    lora_target_modules: str | list[str] | tuple[str, ...] | None = None,
+    *,
+    lora_attn_types: str | list[str] | tuple[str, ...] = "self,cross",
+    lora_attn_projections: str | list[str] | tuple[str, ...] = "q,k,v,o",
+) -> list[str]:
+    """Resolve CLI LoRA controls into PEFT target-module suffixes.
+
+    ``lora_target_modules`` is an explicit override and may include arbitrary
+    module suffixes such as ``ffn.0``.  When it is empty, attention controls are
+    expanded to precise Wan DiT names such as ``self_attn.q``.
+    """
+    explicit = _split_csv(lora_target_modules)
+    if explicit:
+        return _ordered_unique(explicit)
+
+    attn_types = []
+    for raw in _split_csv(lora_attn_types):
+        key = raw.lower()
+        if key not in _ATTN_TYPE_ALIASES:
+            raise ValueError(
+                f"Unsupported LoRA attention type '{raw}'. "
+                f"Expected one of: {sorted(_ATTN_TYPE_ALIASES)}"
+            )
+        attn_types.append(_ATTN_TYPE_ALIASES[key])
+
+    projections = []
+    for raw in _split_csv(lora_attn_projections):
+        key = raw.lower()
+        if key not in _ATTN_PROJECTION_ALIASES:
+            raise ValueError(
+                f"Unsupported LoRA attention projection '{raw}'. "
+                f"Expected one of: {sorted(_ATTN_PROJECTION_ALIASES)}"
+            )
+        projections.append(_ATTN_PROJECTION_ALIASES[key])
+
+    if not attn_types:
+        raise ValueError("LoRA attention type list is empty")
+    if not projections:
+        raise ValueError("LoRA attention projection list is empty")
+
+    return _ordered_unique(
+        f"{attn_type}.{projection}"
+        for attn_type in attn_types
+        for projection in projections
+    )
+
+
+def _lora_module_key(lora_a_key: str) -> str:
+    if lora_a_key.endswith(".lora_A.default.weight"):
+        return lora_a_key.removesuffix(".lora_A.default.weight")
+    if lora_a_key.endswith(".lora_A.weight"):
+        return lora_a_key.removesuffix(".lora_A.weight")
+    raise ValueError(f"Unsupported LoRA A key format: {lora_a_key}")
+
+
+def _lora_target_from_module_key(module_key: str) -> str:
+    match = re.match(r"^blocks\.\d+\.(.+)$", module_key)
+    if match:
+        return match.group(1)
+    return module_key
+
+
+def _sort_lora_targets(targets: list[str]) -> list[str]:
+    return sorted(targets, key=lambda item: (_TARGET_ORDER.get(item, 1000), item))
+
+
+def detect_lora_config(lora_path: str) -> dict:
+    """Detect rank and target modules from a safetensors LoRA checkpoint."""
     if not os.path.isfile(lora_path):
         raise FileNotFoundError(f"LoRA checkpoint not found: {lora_path}")
 
@@ -130,14 +253,80 @@ def detect_lora_rank(lora_path: str) -> int:
             raise ValueError(
                 f"LoRA rank mismatch for {key}: "
                 f"A rank={rank}, B rank={lora_b.shape[1]}"
-            )
+        )
         ranks.add(rank)
 
     if len(ranks) != 1:
         raise ValueError(
             f"LoRA checkpoint has inconsistent ranks {sorted(ranks)}: {lora_path}"
         )
-    return ranks.pop()
+
+    target_modules = _sort_lora_targets(_ordered_unique([
+        _lora_target_from_module_key(_lora_module_key(key))
+        for key in lora_a_keys
+    ]))
+    return {
+        "path": lora_path,
+        "rank": ranks.pop(),
+        "target_modules": target_modules,
+        "pairs": len(lora_a_keys),
+    }
+
+
+def detect_lora_rank(lora_path: str) -> int:
+    """Detect a LoRA checkpoint rank from safetensors A/B weight shapes."""
+    return detect_lora_config(lora_path)["rank"]
+
+
+def resolve_lora_args(args) -> dict | None:
+    """Resolve train/eval CLI args to a concrete LoRA rank and target list."""
+    init_lora_path = getattr(args, "init_lora", "")
+    ckpt_info = detect_lora_config(init_lora_path) if init_lora_path else None
+
+    requested_rank = getattr(args, "lora_rank", None)
+    if ckpt_info:
+        if requested_rank is None:
+            args.lora_rank = ckpt_info["rank"]
+        elif int(requested_rank) != ckpt_info["rank"]:
+            raise ValueError(
+                f"--lora-rank={requested_rank} does not match init LoRA "
+                f"rank={ckpt_info['rank']} from {init_lora_path}"
+            )
+    elif requested_rank is None:
+        args.lora_rank = 96
+
+    if not _split_csv(getattr(args, "lora_target_modules", None)) and ckpt_info:
+        args.lora_target_modules = ",".join(ckpt_info["target_modules"])
+    else:
+        args.lora_target_modules = ",".join(resolve_lora_target_modules(
+            getattr(args, "lora_target_modules", None),
+            lora_attn_types=getattr(args, "lora_attn_types", "self,cross"),
+            lora_attn_projections=getattr(args, "lora_attn_projections", "q,k,v,o"),
+        ))
+
+    return ckpt_info
+
+
+def _normalize_lora_state_dict_for_model(sd: dict, model) -> dict:
+    sd = _strip_module_prefix(sd)
+    model_keys = set(model.state_dict().keys())
+    out = {}
+    for key, value in sd.items():
+        candidates = [key]
+        if ".lora_A.weight" in key or ".lora_B.weight" in key:
+            candidates.append(
+                key.replace(".lora_A.weight", ".lora_A.default.weight")
+                   .replace(".lora_B.weight", ".lora_B.default.weight")
+            )
+        if ".lora_A.default.weight" in key or ".lora_B.default.weight" in key:
+            candidates.append(
+                key.replace(".lora_A.default.weight", ".lora_A.weight")
+                   .replace(".lora_B.default.weight", ".lora_B.weight")
+            )
+        chosen = next((candidate for candidate in candidates
+                       if candidate in model_keys), key)
+        out[chosen] = value
+    return out
 
 
 def merge_lora_into_weights(model, lora_path: str,
@@ -203,8 +392,10 @@ class MittyTrainingModule(DiffusionTrainingModule):
         dit_dir: str = DEFAULT_DIT_DIR,
         vae_path: str = DEFAULT_VAE,
         tokenizer_dir: str = DEFAULT_TOKENIZER,
-        lora_rank: int = 96,
-        lora_target_modules: str = "q,k,v,o",
+        lora_rank: int | None = 96,
+        lora_target_modules: str | list[str] | tuple[str, ...] | None = None,
+        lora_attn_types: str | list[str] | tuple[str, ...] = "self,cross",
+        lora_attn_projections: str | list[str] | tuple[str, ...] = "q,k,v,o",
         use_gradient_checkpointing: bool = True,
         load_vae: bool = True,
         init_lora_path: str = "",
@@ -224,13 +415,31 @@ class MittyTrainingModule(DiffusionTrainingModule):
             self._merge_n += info["pairs"]
             self._merge_lora_info.append(info)
 
+        init_lora_info = detect_lora_config(init_lora_path) if init_lora_path else None
+        if init_lora_info:
+            if lora_rank is None:
+                lora_rank = init_lora_info["rank"]
+            elif int(lora_rank) != init_lora_info["rank"]:
+                raise ValueError(
+                    f"lora_rank={lora_rank} does not match init LoRA "
+                    f"rank={init_lora_info['rank']} from {init_lora_path}"
+                )
+            if not _split_csv(lora_target_modules):
+                lora_target_modules = init_lora_info["target_modules"]
+        elif lora_rank is None:
+            lora_rank = 96
+
         # Freeze everything
         for name, module in self.pipe.named_children():
             for p in module.parameters():
                 p.requires_grad_(False)
 
         # Inject LoRA into DiT
-        target_modules = [m.strip() for m in lora_target_modules.split(",")]
+        target_modules = resolve_lora_target_modules(
+            lora_target_modules,
+            lora_attn_types=lora_attn_types,
+            lora_attn_projections=lora_attn_projections,
+        )
         if len(target_modules) == 1:
             target_modules = target_modules[0]
         self.pipe.dit = self.add_lora_to_model(
@@ -242,21 +451,37 @@ class MittyTrainingModule(DiffusionTrainingModule):
 
         if init_lora_path:
             from safetensors.torch import load_file
-            sd = load_file(init_lora_path, device=str(device))
+            sd = _normalize_lora_state_dict_for_model(
+                load_file(init_lora_path, device=str(device)),
+                self.pipe.dit,
+            )
             # Legacy ckpts from DiffSynth's AutoWrappedLinear path carry a
             # `.module.` prefix on every LoRA key (e.g. `blocks.0.self_attn.q` →
             # `blocks.0.module.self_attn.q`). The new loader uses bare Linears,
-            # so strip that prefix when present to keep resume-from-old working.
-            if any(".module." in k for k in sd):
-                sd = {k.replace(".module.", ".", 1): v for k, v in sd.items()}
+            # so the state dict has already been normalized before loading.
             result = self.pipe.dit.load_state_dict(sd, strict=False)
             if result.unexpected_keys:
                 raise ValueError(
                     f"LoRA checkpoint has unexpected keys: "
                     f"{result.unexpected_keys[:5]}")
+            expected_lora_keys = {
+                key for key in self.pipe.dit.state_dict()
+                if ".lora_A." in key or ".lora_B." in key
+            }
+            missing_lora_keys = sorted(expected_lora_keys - set(sd))
+            if missing_lora_keys:
+                raise ValueError(
+                    f"LoRA checkpoint is missing {len(missing_lora_keys)} "
+                    f"expected LoRA tensors after injection; first keys: "
+                    f"{missing_lora_keys[:5]}"
+                )
             self._init_lora_n = len(sd)
         else:
             self._init_lora_n = 0
+        target_list = [target_modules] if isinstance(target_modules, str) else target_modules
+        self._lora_rank = lora_rank
+        self._lora_target_modules = list(target_list)
+        self._init_lora_info = init_lora_info
 
         # Install Mitty forward
         self.pipe.model_fn = mitty_model_fn_wan_video
@@ -518,8 +743,10 @@ def train(args):
         "eval_loss_in_task", "eval_loss_ood",
         "eval_psnr_in_task", "eval_ssim_in_task",
         "eval_lpips_in_task", "eval_clip_in_task",
+        "eval_fid_in_task", "eval_fvd_in_task",
         "eval_psnr_ood", "eval_ssim_ood",
         "eval_lpips_ood", "eval_clip_ood",
+        "eval_fid_ood", "eval_fvd_ood",
         "save_ckpt", "eval_video",
     ]
     csv_logger = CsvLogger(str(run_dir / "train.csv"),
@@ -593,6 +820,7 @@ def train(args):
                  f" pairs={item['pairs']}")
     if model._init_lora_n:
         info(f"Loaded {model._init_lora_n} LoRA tensors from {args.init_lora}")
+    info(f"LoRA: rank={model._lora_rank} targets={model._lora_target_modules}")
 
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     n_total = sum(p.numel() for p in model.parameters())
@@ -633,7 +861,8 @@ def train(args):
     else:
         lr_scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0)
 
-    online_metrics = (OnlineMetrics(args.device)
+    online_metrics = (OnlineMetrics(
+        args.device, include_frechet=args.eval_video_frechet_metrics)
                       if is_main and args.eval_video_metrics else None)
 
     info(f"Plan: {total_steps} steps, {len(train_files)} train files, cycling infinitely")
@@ -808,7 +1037,9 @@ def train(args):
                             metrics_payload[f"eval/{metric_name}_{split_name}"] = v
                         info(f"  METRICS [{split_name}] "
                              f"PSNR={m['psnr']:.2f} SSIM={m['ssim']:.4f} "
-                             f"LPIPS={m['lpips']:.4f} CLIP={m['clip_score']:.4f}")
+                             f"LPIPS={m['lpips']:.4f} CLIP={m['clip_score']:.4f}" +
+                             (f" FID={m['fid']:.1f}" if "fid" in m else "") +
+                             (f" FVD={m['fvd']:.1f}" if "fvd" in m else ""))
                     if metrics_payload:
                         wb.log(metrics_payload, step=step)
 
@@ -866,8 +1097,18 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
 
     # LoRA
-    ap.add_argument("--lora-rank", type=int, default=96)
-    ap.add_argument("--lora-target-modules", default="q,k,v,o")
+    ap.add_argument("--lora-rank", type=int, default=None,
+                    help="LoRA rank; defaults to 96, or auto-detects from --init-lora")
+    ap.add_argument("--lora-target-modules", default=None,
+                    help="explicit comma-separated PEFT target suffixes, e.g. "
+                         "self_attn.q,cross_attn.v,ffn.0; overrides "
+                         "--lora-attn-types/--lora-attn-projections")
+    ap.add_argument("--lora-attn-types", default="self,cross",
+                    help="attention blocks to LoRA when --lora-target-modules "
+                         "is omitted: self,cross")
+    ap.add_argument("--lora-attn-projections", default="q,k,v,o",
+                    help="attention projections to LoRA when --lora-target-modules "
+                         "is omitted: q,k,v,o")
     ap.add_argument("--init-lora", default="",
                     help="path to .safetensors LoRA checkpoint to initialize from")
     ap.add_argument("--merge-lora", action="append", default=None,
@@ -902,6 +1143,11 @@ def main():
     ap.add_argument("--eval-video-metrics", action=argparse.BooleanOptionalAction,
                     default=True,
                     help="compute PSNR/SSIM/LPIPS/CLIP after eval video generation")
+    ap.add_argument("--eval-video-frechet-metrics",
+                    action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help="also compute FID/FVD during eval video metrics "
+                         "(slower and uses extra VRAM; default: on)")
     ap.add_argument("--max-eval-files", type=int, default=0,
                     help="cap eval file count (0=no cap)")
     ap.add_argument("--num-inference-steps", type=int, default=30)
@@ -910,7 +1156,7 @@ def main():
     ap.add_argument("--wandb-project", default="Flip",
                     help="W&B project name (default: 'Flip'; set to '' to disable)")
     ap.add_argument("--wandb-run-name", default=None,
-                    help="W&B run name (default: timestamp)")
+                    help="W&B run name (default: auto run name)")
     ap.add_argument("--wandb-tags", nargs="+", default=[],
                     help="extra W&B tags (in addition to 'mitty')")
     ap.add_argument("--wandb-log-videos", action=argparse.BooleanOptionalAction,
@@ -930,6 +1176,10 @@ def main():
             os.path.join(MAIN_ROOT, p) if not os.path.isabs(p) else p
             for p in args.merge_lora
         ]
+    try:
+        resolve_lora_args(args)
+    except (FileNotFoundError, ValueError) as exc:
+        ap.error(str(exc))
 
     train(args)
 

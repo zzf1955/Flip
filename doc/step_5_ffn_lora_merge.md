@@ -113,6 +113,10 @@ scripts/flip_run.sh train --cuda 2,3 --nproc 2 -- \
 | `--merge-lora` | `""` | 预训练 LoRA checkpoint 路径，可重复传入，按顺序合并到 base weights |
 
 被合并 LoRA 的 rank 会从 checkpoint 自动检测；无法唯一检测时训练直接失败。
+作为 adapter 读取的 `--init-lora` 也会从 checkpoint 自动检测 rank 和 target
+modules；未显式覆盖时无需再手动传入原训练的 `--lora-rank` 或
+`--lora-target-modules`。如果显式 rank 与 checkpoint 不一致，或注入后的
+LoRA tensor 没有完整从 checkpoint 加载，训练/评估会直接失败。
 
 ## 训练预期
 
@@ -131,7 +135,8 @@ scripts/flip_run.sh train --cuda 2,3 --nproc 2 -- \
 # 伪代码
 model = load_dit(...)
 merge_lora_into_weights(model, identity_ckpt)
-model = inject_lora(model, target_modules=["ffn.0", "ffn.2"], rank=96)
+info = detect_lora_config(ffn_ckpt)
+model = inject_lora(model, target_modules=info["target_modules"], rank=info["rank"])
 model.load_state_dict(load_file(ffn_ckpt), strict=False)
 ```
 

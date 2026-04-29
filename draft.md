@@ -1,58 +1,19 @@
-给出指令
-1. Task 恒等映射
-2. lora Attention rank = 32
-3. Step = 1000
-4. train data 1000
-5. eval data 16+16
-6. eval Video 4+4
+# 实验计划
 
-scripts/flip_run.sh train --cuda 0,2 --nproc 2 -- \
-    --task-name identity_r2r_1s \
-    --lora-rank 32 \
-    --lora-target-modules q,k,v,o \
-    --max-steps 1000 \
-    --save-steps 100 \
-    --eval-steps 100 \
-    --eval-video-steps 100 \
-    --train-size 1000 \
-    --in-task-eval-size 16 \
-    --ood-eval-size 16 \
-    --in-task-video-size 4 \
-    --ood-video-size 4 \
-    --data-seed 42
+- 恒等映射
+  - 对比设置：
+    - 维度 32/64
+    - 位置 FFN/QKV/FFN+QKV
+    - 维度 x 位置，6 组
+  - 指标 FID/FVD/像素差异
+  - 可扩展：引入其他视频数据、T5 prompt 可能需要更换
 
-  scripts/flip_run.sh train --cuda 3 -- \
-    --task-name identity_r2r_1s \
-    --lora-rank 32 \
-    --lora-target-modules q,k,v,o \
-    --max-steps 1000 \
-    --save-steps 100 \
-    --eval-steps 100 \
-    --eval-video-steps 100 \
-    --train-size 1000 \
-    --in-task-eval-size 16 \
-    --ood-eval-size 16 \
-    --in-task-video-size 4 \
-    --ood-video-size 4 \
-    --data-seed 42
+- 外观学习
+  - 对比设置
+    - 位置 FFN/QKV/FFN+QKV
+  - 指标：FID/FDV/不同层的梯度方向？这个外观到底是储存在哪里？
 
-python -m src.pipeline.make_robot_pair \
---task all \
---workers 64 \
---clean
-
-python -m src.pipeline.make_pair \
---task all \
---second 1s \
---data-type h2r \
---human-source seedance_direct \
---workers 64 \
---clean
-
-python -m src.pipeline.make_pair \
---task all \
---second 1s \
---data-type blur_r2r \
---human-source seedance_direct \
---workers 64 \
---clean
+- 合并实验
+  - 将外观和恒等映射合并成一组实验
+  - 直接重建机器人数据
+  - LoRA 位置

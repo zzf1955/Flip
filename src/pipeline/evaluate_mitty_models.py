@@ -35,7 +35,12 @@ from src.core.train_utils import (
 )
 from src.pipeline.backbones import get_mitty_spec
 from src.pipeline.train_mitty import DEFAULT_DIT_DIR, DEFAULT_TOKENIZER, DEFAULT_VAE
-from src.tools.eval_metrics import InceptionFeatureExtractor, LPIPS, process_step
+from src.tools.eval_metrics import (
+    InceptionFeatureExtractor,
+    LPIPS,
+    VideoFeatureExtractor,
+    process_step,
+)
 
 
 DEFAULT_RUNS = [
@@ -119,8 +124,10 @@ def parse_run_specs(
 def load_model(
     run: RunSpec,
     device: str,
-    lora_rank: int,
-    lora_target_modules: str,
+    lora_rank: int | None,
+    lora_target_modules: str | None,
+    lora_attn_types: str,
+    lora_attn_projections: str,
     dit_dir: str,
     vae_path: str,
     tokenizer_dir: str,
@@ -129,7 +136,6 @@ def load_model(
     extra_kwargs = {}
     if run.merge_lora_paths:
         extra_kwargs["merge_lora_paths"] = [str(p) for p in run.merge_lora_paths]
-        extra_kwargs["merge_lora_rank"] = run.merge_lora_rank
     model = spec.training_module_factory(
         device=device,
         dit_dir=dit_dir,
@@ -137,6 +143,8 @@ def load_model(
         tokenizer_dir=tokenizer_dir,
         lora_rank=lora_rank,
         lora_target_modules=lora_target_modules,
+        lora_attn_types=lora_attn_types,
+        lora_attn_projections=lora_attn_projections,
         use_gradient_checkpointing=False,
         load_vae=True,
         init_lora_path=str(run.checkpoint),
@@ -200,7 +208,8 @@ def generate_split(
 def metric_models(device: torch.device, no_lpips: bool, no_fid: bool):
     lpips_model = None if no_lpips else LPIPS().to(device).eval()
     inception = None if no_fid else InceptionFeatureExtractor().to(device).eval()
-    return lpips_model, inception
+    video_extractor = None if no_fid else VideoFeatureExtractor().to(device).eval()
+    return lpips_model, inception, video_extractor
 
 
 def compute_rows(
@@ -211,12 +220,13 @@ def compute_rows(
     no_lpips: bool,
     no_fid: bool,
 ) -> list[dict]:
-    lpips_model, inception = metric_models(device, no_lpips, no_fid)
+    lpips_model, inception, video_extractor = metric_models(device, no_lpips, no_fid)
     rows = []
     for run in run_specs:
         for split in splits:
             split_out = out_root / run.name / run.checkpoint.stem / split
-            metrics = process_step(str(split_out), lpips_model, inception, device)
+            metrics = process_step(
+                str(split_out), lpips_model, inception, video_extractor, device)
             if not metrics:
                 raise RuntimeError(f"No gen/gt pairs found in {split_out}")
             row = {
@@ -265,8 +275,17 @@ def main():
     ap.add_argument("--samples-per-split", type=int, default=32,
                     help="samples per split; -1 means all cached samples")
     ap.add_argument("--device", default="cuda:0")
-    ap.add_argument("--lora-rank", type=int, default=128)
-    ap.add_argument("--lora-target-modules", default="q,k,v,o")
+    ap.add_argument("--lora-rank", type=int, default=None,
+                    help="LoRA rank; auto-detected from each checkpoint by default")
+    ap.add_argument("--lora-target-modules", default=None,
+                    help="explicit comma-separated PEFT target suffixes; "
+                         "auto-detected from each checkpoint by default")
+    ap.add_argument("--lora-attn-types", default="self,cross",
+                    help="attention blocks used only when target modules are not "
+                         "auto-detected from a checkpoint")
+    ap.add_argument("--lora-attn-projections", default="q,k,v,o",
+                    help="attention projections used only when target modules are "
+                         "not auto-detected from a checkpoint")
     ap.add_argument("--num-inference-steps", type=int, default=30)
     ap.add_argument("--cfg-scale", type=float, default=5.0)
     ap.add_argument("--dit-dir", default=DEFAULT_DIT_DIR)
@@ -314,6 +333,8 @@ def main():
                 device=args.device,
                 lora_rank=args.lora_rank,
                 lora_target_modules=args.lora_target_modules,
+                lora_attn_types=args.lora_attn_types,
+                lora_attn_projections=args.lora_attn_projections,
                 dit_dir=args.dit_dir,
                 vae_path=args.vae_path,
                 tokenizer_dir=args.tokenizer_dir,

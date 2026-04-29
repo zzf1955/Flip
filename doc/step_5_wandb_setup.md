@@ -85,6 +85,9 @@ HTTP_PROXY=http://127.0.0.1:20171 HTTPS_PROXY=http://127.0.0.1:20171 \
 
 W&B `config` 会记录完整最终参数；tags 会额外追加所有 effective args 的
 `p:key=value` 形式，便于按 task、cache、LoRA、eval 配置检索。
+默认 run name 与本地 log 目录一致，并包含 LoRA 位置短签名和秒级时间戳，
+例如 `Mitty-pair_1s-124d_r96_qkvo_1000s_0428_153012` 或
+`Mitty-attn_ffn_selected-124d_r96_ffn0ffn2_1000s_0428_153045`。
 
 ## 训练代码约定
 
