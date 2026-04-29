@@ -8,7 +8,7 @@ Metrics:
   - SSIM   (structural similarity, higher is better)
   - LPIPS  (perceptual distance via VGG, lower is better)
   - FID    (Frechet Inception Distance across all frames, lower is better)
-  - FVD    (Frechet Video Distance via Inception features, lower is better)
+  - FVD    (Frechet Video Distance via S3D video features, lower is better)
 
 Usage:
   python -m src.tools.eval_metrics --run 2026-04-18_163933
@@ -109,7 +109,7 @@ class LPIPS(nn.Module):
         return torch.stack(dists).mean(dim=0)
 
 
-# ── InceptionV3 feature extractor (for FID / FVD) ────────────────────
+# ── InceptionV3 feature extractor (for FID) ──────────────────────────
 
 
 class InceptionFeatureExtractor(nn.Module):
@@ -149,6 +149,10 @@ def frechet_distance(mu1, sigma1, mu2, sigma2):
     from scipy.linalg import sqrtm
     diff = mu1 - mu2
     covmean, _ = sqrtm(sigma1 @ sigma2, disp=False)
+    if not np.isfinite(covmean).all():
+        eps = 1e-6
+        offset = np.eye(sigma1.shape[0]) * eps
+        covmean = sqrtm((sigma1 + offset) @ (sigma2 + offset))
     if np.iscomplexobj(covmean):
         covmean = covmean.real
     return float(diff @ diff + np.trace(sigma1 + sigma2 - 2 * covmean))
@@ -164,7 +168,11 @@ def compute_pairwise_metrics(
     device: torch.device,
 ) -> dict:
     """Compute PSNR, SSIM, LPIPS between paired frame arrays (T,H,W,3)."""
-    T = min(len(gen_frames), len(gt_frames))
+    if len(gen_frames) != len(gt_frames):
+        raise ValueError(
+            f"Frame count mismatch: gen has {len(gen_frames)} frames, "
+            f"gt has {len(gt_frames)} frames")
+    T = len(gen_frames)
     psnrs, ssims, lpipss = [], [], []
 
     for t in range(T):
@@ -214,34 +222,69 @@ def compute_fid(feats_gen: np.ndarray, feats_gt: np.ndarray) -> float:
     return frechet_distance(mu_gen, sigma_gen, mu_gt, sigma_gt)
 
 
-# ── FVD ──────────────────────────────────────��────────────────────────
+# ── FVD ───────────────────────────────────────────────────────────────
 
 
-def video_inception_features(
+class VideoFeatureExtractor(nn.Module):
+    """Extract S3D Kinetics video features for FVD-style evaluation."""
+
+    NUM_FRAMES = 16
+    SIZE = 224
+
+    def __init__(self):
+        super().__init__()
+        from torchvision.models.video import S3D_Weights, s3d
+        net = s3d(weights=S3D_Weights.KINETICS400_V1).eval()
+        self.features = net.features
+        self.avgpool = net.avgpool
+        for p in self.parameters():
+            p.requires_grad = False
+        self.register_buffer(
+            "mean", torch.tensor([0.43216, 0.394666, 0.37645]).view(1, 3, 1, 1, 1))
+        self.register_buffer(
+            "std", torch.tensor([0.22803, 0.22145, 0.216989]).view(1, 3, 1, 1, 1))
+
+    @torch.no_grad()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (B, 3, T, H, W) in [0, 1] -> (B, 1024)."""
+        x = F.interpolate(
+            x,
+            size=(self.NUM_FRAMES, self.SIZE, self.SIZE),
+            mode="trilinear",
+            align_corners=False,
+        )
+        x = (x - self.mean) / self.std
+        x = self.features(x)
+        return self.avgpool(x).flatten(1)
+
+
+def collect_video_features(
     video_arrays: list[np.ndarray],
-    extractor: InceptionFeatureExtractor,
+    extractor: VideoFeatureExtractor,
     device: torch.device,
 ) -> np.ndarray:
-    """Per-video feature: mean-pool Inception features across frames -> (V, 2048)."""
+    """Extract one S3D spatiotemporal feature vector per video -> (V, 1024)."""
     feats = []
     for vid in video_arrays:
-        t = torch.from_numpy(vid).permute(0, 3, 1, 2).float() / 255.0
-        f = extractor(t.to(device))
-        feats.append(f.mean(0).cpu().numpy())
+        t = torch.from_numpy(vid).permute(3, 0, 1, 2).unsqueeze(0).float() / 255.0
+        feats.append(extractor(t.to(device)).cpu().numpy()[0])
     return np.stack(feats)
 
 
 def compute_fvd(
     gen_videos: list[np.ndarray],
     gt_videos: list[np.ndarray],
-    extractor: InceptionFeatureExtractor,
+    extractor: VideoFeatureExtractor,
     device: torch.device,
 ) -> float | None:
-    """Compute FVD. Returns None if too few videos for stable covariance."""
-    if len(gen_videos) < 3:
+    """Compute FVD with S3D video features.
+
+    Returns None if too few videos are available for covariance estimation.
+    """
+    if len(gen_videos) < 2:
         return None
-    feats_gen = video_inception_features(gen_videos, extractor, device)
-    feats_gt = video_inception_features(gt_videos, extractor, device)
+    feats_gen = collect_video_features(gen_videos, extractor, device)
+    feats_gt = collect_video_features(gt_videos, extractor, device)
     mu_gen, sigma_gen = feats_gen.mean(0), np.cov(feats_gen, rowvar=False)
     mu_gt, sigma_gt = feats_gt.mean(0), np.cov(feats_gt, rowvar=False)
     if sigma_gen.ndim < 2:
@@ -269,6 +312,7 @@ def process_step(
     step_dir: str,
     lpips_model: LPIPS | None,
     inception: InceptionFeatureExtractor | None,
+    video_extractor: VideoFeatureExtractor | None,
     device: torch.device,
 ) -> dict:
     """Compute all metrics for one eval step directory."""
@@ -283,6 +327,10 @@ def process_step(
     for gen_path, gt_path, idx in pairs:
         gen_frames = read_video_frames(gen_path)
         gt_frames = read_video_frames(gt_path)
+        if len(gen_frames) != len(gt_frames):
+            raise ValueError(
+                f"Frame count mismatch: {gen_path} has {len(gen_frames)} frames, "
+                f"{gt_path} has {len(gt_frames)} frames")
         gen_videos.append(gen_frames)
         gt_videos.append(gt_frames)
 
@@ -310,7 +358,8 @@ def process_step(
             feats_gt = collect_inception_features(gt_videos, inception, device)
             result["fid"] = compute_fid(feats_gen, feats_gt)
 
-        fvd = compute_fvd(gen_videos, gt_videos, inception, device)
+    if video_extractor is not None:
+        fvd = compute_fvd(gen_videos, gt_videos, video_extractor, device)
         if fvd is not None:
             result["fvd"] = fvd
 
@@ -346,9 +395,12 @@ def main():
         print("  LPIPS (VGG16) loaded")
 
     inception = None
+    video_extractor = None
     if not args.no_fid:
         inception = InceptionFeatureExtractor().to(device)
         print("  InceptionV3 loaded")
+        video_extractor = VideoFeatureExtractor().to(device)
+        print("  S3D video feature extractor loaded")
 
     # Detect layout: split-based (in_task/ood) or flat (step-NNNN directly)
     splits = []
@@ -380,7 +432,7 @@ def main():
             label = f"{split}/{step_name}" if split else step_name
             print(f"\n[{label}]")
 
-            result = process_step(str(step_path), lpips_model, inception, device)
+            result = process_step(str(step_path), lpips_model, inception, video_extractor, device)
             if not result:
                 print("  No gen/gt pairs found")
                 continue

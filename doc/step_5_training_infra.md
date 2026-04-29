@@ -253,6 +253,47 @@ CUDA_VISIBLE_DEVICES=2 python -m src.pipeline.train \
 新增训练数据集时只更新 `train_config.py`，不要在正式命令中重新暴露
 `--cache-train` / `--cache-eval` / `--t5-cache-dir`。
 
+默认 run name 同时用于本地训练目录和 W&B run name，格式为：
+`{Backbone}-{task_name}-{n_train}d_r{rank}_{lora_targets}_{max_steps}s_{MMDD_HHMMSS}`。
+其中 `lora_targets` 会把 `--lora-target-modules` 压成文件名安全的短签名，
+例如 `q,k,v,o` → `qkvo`，`ffn.0,ffn.2` → `ffn0ffn2`。时间戳精确到秒，
+避免同一分钟内启动多个实验时目录重名。
+
+LoRA 注入默认走细粒度 Attention 控制：
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `--lora-attn-types` | `self,cross` | Attention 类型，可选 `self` / `cross`，会展开到 `self_attn.*` / `cross_attn.*` |
+| `--lora-attn-projections` | `q,k,v,o` | Attention 投影层，可选 `q`、`k`、`v`、`o` |
+| `--lora-target-modules` | 自动展开 | 显式 PEFT target suffix 覆盖入口，例如 `self_attn.q,cross_attn.v` 或 `ffn.0,ffn.2` |
+
+示例：
+
+```bash
+# 只在 self attention 的 q/o 上加 LoRA
+scripts/flip_run.sh train --cuda 2 -- \
+  --task-name pair_1s \
+  --lora-attn-types self \
+  --lora-attn-projections q,o
+
+# 只在 cross attention 的 k/v 上加 LoRA
+scripts/flip_run.sh train --cuda 2 -- \
+  --task-name pair_1s \
+  --lora-attn-types cross \
+  --lora-attn-projections k,v
+
+# Attention + FFN 等混合目标使用显式 target 覆盖
+scripts/flip_run.sh train --cuda 2 -- \
+  --task-name pair_1s \
+  --lora-target-modules self_attn.q,cross_attn.q,ffn.0,ffn.2
+```
+
+加载训练好的 LoRA 时，`--init-lora` 会从 checkpoint 的 LoRA A/B tensor
+自动检测 rank 和 target modules；未显式传 `--lora-rank` /
+`--lora-target-modules` 时不需要手动维护这些参数。若显式传入的 rank 与
+checkpoint 不一致，训练会直接报错；若注入后的 LoRA tensor 没有从 checkpoint
+完整加载，也会直接报错，避免部分随机初始化。
+
 单卡：
 
 ```bash
@@ -279,7 +320,7 @@ scripts/flip_run.sh train --cuda 2,3 --nproc 2 -- \
 
 - `eval loss` 按 cache 文件索引在所有 rank 间切分，每个 rank 计算自己的子集，再 `all_reduce` 成全局均值；随机种子使用全局样本索引，避免 GPU 数量变化改变评估语义。
 - `eval video` 按待生成视频的全局样本索引在所有 rank 间切分；所有 rank 写入同一个 `step-XXXX/`，文件名仍为 `gen_00.mp4`、`gt_00.mp4`、`ctrl_00.mp4` 这类全局编号。
-- CSV、W&B、eval video 上传和在线指标只在 rank 0 执行；视频生成完成后会用 DDP barrier 等待所有 rank 写完。
+- CSV、W&B、eval video 上传和在线指标只在 rank 0 执行；视频生成完成后会用 DDP barrier 等待所有 rank 写完。默认在线指标为 PSNR/SSIM/LPIPS/CLIP/FID/FVD；FID 使用 InceptionV3 pool3 逐帧特征计算帧级 Frechet 距离，FVD 使用 torchvision S3D Kinetics-400 1024-d 时空视频特征计算视频级 Frechet 距离。在线指标当前按单帧 batch 执行帧级模型，并逐视频执行 S3D，以降低显存峰值，但会明显增加 eval 阶段耗时，并在 rank 0 训练卡上多占显存。如需关闭 FID/FVD，加 `--no-eval-video-frechet-metrics`；正式对比也可训练后用 `src.pipeline.evaluate_mitty_models` 或 `src.tools.eval_metrics` 离线计算。FID/FVD 是分布指标，样本太少时方差很大，正式汇报建议使用几十条以上视频。
 - 正式实验默认 `--max-steps 1000 --save-steps 100 --eval-steps 100 --eval-video-steps 100`；smoke/debug 可临时调小。
 - `--loss`、`--patch-dir` 已从正式训练入口移除，当前统一使用标准 Mitty loss。
 
