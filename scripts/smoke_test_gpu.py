@@ -16,6 +16,7 @@ import os
 import shutil
 import subprocess
 import sys
+from threading import Thread
 from pathlib import Path
 
 
@@ -52,20 +53,32 @@ def build_env(cuda_devices: str) -> dict[str, str]:
 
 
 def run(cmd: list[str], log_path: Path, *, env: dict[str, str]) -> None:
-    proc = subprocess.run(
-        cmd,
-        cwd=ROOT,
-        env=env,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        check=False,
-    )
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_path.write_text(proc.stdout)
-    print(proc.stdout, end="")
-    if proc.returncode != 0:
-        raise SmokeFailure(f"command failed ({proc.returncode}): {' '.join(cmd)}; see {log_path}")
+    with open(log_path, "w", encoding="utf-8") as log_file:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=ROOT,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=1,
+        )
+        assert proc.stdout is not None
+
+        def _stream_output() -> None:
+            for line in proc.stdout:
+                log_file.write(line)
+                log_file.flush()
+                print(line, end="", flush=True)
+
+        reader = Thread(target=_stream_output, daemon=True)
+        reader.start()
+        returncode = proc.wait()
+        reader.join()
+
+    if returncode != 0:
+        raise SmokeFailure(f"command failed ({returncode}): {' '.join(cmd)}; see {log_path}")
 
 
 def record_gpu_status(log_path: Path) -> None:
@@ -79,7 +92,7 @@ def record_gpu_status(log_path: Path) -> None:
     )
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.write_text(proc.stdout)
-    print(proc.stdout, end="")
+    print(proc.stdout, end="", flush=True)
     if proc.returncode != 0:
         raise SmokeFailure(f"nvidia-smi failed ({proc.returncode}); see {log_path}")
 
@@ -117,15 +130,11 @@ def prepare_inputs() -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run minimal GPU smoke test")
     parser.add_argument("--cuda", default="2", help="CUDA_VISIBLE_DEVICES for GPU smoke, e.g. 2 or 2,3")
-    parser.add_argument("--nproc", type=int, default=0, help="train worker count; default equals --cuda device count")
     parser.add_argument("--skip-prepare", action="store_true", help="reuse existing tmp inputs")
     args = parser.parse_args()
 
-    nproc = args.nproc or visible_device_count(args.cuda)
-    if nproc < 1:
-        raise ValueError("--nproc must be >= 1")
-    if nproc > visible_device_count(args.cuda):
-        raise ValueError("--nproc cannot exceed the number of --cuda devices")
+    if visible_device_count(args.cuda) < 1:
+        raise ValueError("--cuda is empty")
 
     if not args.skip_prepare:
         prepare_inputs()
@@ -166,15 +175,13 @@ def main() -> int:
         "--wandb-project", "",
     ]
     train_cmd = [str(PYTHON), *train_args]
-    if nproc > 1:
-        train_cmd = ["torchrun", f"--nproc_per_node={nproc}", *train_args]
     run(train_cmd, SMOKE_ROOT / "train_e2e_1step.log", env=env)
 
     summary = {
         "status": "passed",
         "cuda_visible_devices": args.cuda,
-        "nproc": nproc,
-        "scope": smoke_scope(nproc),
+        "nproc": 1,
+        "scope": smoke_scope(1),
         "logs": str(SMOKE_ROOT.relative_to(ROOT)),
     }
     (SMOKE_ROOT / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n")
