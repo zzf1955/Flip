@@ -285,12 +285,35 @@ def _compact_lora_targets(target_modules: str) -> str:
     """Return a filename-safe LoRA target signature for run names."""
     if not target_modules:
         return ""
-    parts = []
-    for raw_part in str(target_modules).split(","):
-        cleaned = "".join(ch for ch in raw_part.strip() if ch.isalnum())
-        if cleaned:
-            parts.append(cleaned)
-    return "".join(parts)
+    raw_parts = [part.strip() for part in str(target_modules).split(",")]
+    parts = [part for part in raw_parts if part]
+
+    groups = [
+        ("self", "self_attn."),
+        ("cross", "cross_attn."),
+    ]
+    compact = []
+    remaining = set(parts)
+    for group_name, prefix in groups:
+        projections = []
+        for projection in ("q", "k", "v", "o"):
+            target = f"{prefix}{projection}"
+            if target in remaining:
+                projections.append(projection)
+                remaining.remove(target)
+        if projections:
+            compact.append(f"{group_name}_{''.join(projections)}")
+
+    ffn_targets = {"ffn.0", "ffn.2"}
+    if ffn_targets.issubset(remaining):
+        compact.append("ffn")
+        remaining.difference_update(ffn_targets)
+
+    for raw_part in parts:
+        if raw_part in remaining:
+            compact.append("".join(ch for ch in raw_part if ch.isalnum()))
+            remaining.remove(raw_part)
+    return "_".join(part for part in compact if part)
 
 
 def build_wandb_tags(method_tag: str, args, *,

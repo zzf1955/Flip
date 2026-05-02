@@ -256,8 +256,8 @@ CUDA_VISIBLE_DEVICES=2 python -m src.pipeline.train \
 默认 run name 同时用于本地训练目录和 W&B run name，格式为：
 `{Backbone}-{task_name}-{n_train}d_r{rank}_{lora_targets}_{max_steps}s_{MMDD_HHMMSS}`。
 其中 `lora_targets` 会把 `--lora-target-modules` 压成文件名安全的短签名，
-例如 `q,k,v,o` → `qkvo`，`ffn.0,ffn.2` → `ffn0ffn2`。时间戳精确到秒，
-避免同一分钟内启动多个实验时目录重名。
+例如 `self_attn.q,self_attn.k,self_attn.v,cross_attn.q,cross_attn.k,cross_attn.v,ffn.0,ffn.2`
+→ `self_qkv_cross_qkv_ffn`，`ffn.0,ffn.2` → `ffn`。时间戳精确到秒，避免同一分钟内启动多个实验时目录重名。
 
 LoRA 注入默认走细粒度 Attention 控制：
 
@@ -287,6 +287,41 @@ scripts/flip_run.sh train --cuda 2 -- \
   --task-name pair_1s \
   --lora-target-modules self_attn.q,cross_attn.q,ffn.0,ffn.2
 ```
+
+### LoRA layout/rank 网格搜索
+
+`scripts/train_lora_grid.py` 是维护中的 LoRA 搜索入口，用于把
+`LoRA layout × LoRA rank` 展开成一组单卡训练命令，并在指定 CUDA 列表上轮转顺序执行。
+实际训练仍通过 `scripts/flip_run.sh train --nproc 1` 启动，因此会复用统一环境变量、cache 和 GPU 入口。
+
+常用示例：
+
+```bash
+scripts/train_lora_grid.py \
+  --cuda 0,1 \
+  --task-name h2r_1s \
+  --train-size 490 \
+  --merge-lora training_data/log/Mitty-identity_r2r_1s-10000d_r64_ffn_1000s_0429_185108/ckpt/step-0900.safetensors \
+  --layouts self_qkv,self_qkvo,self_qkv_cross_qkv,self_qkvo_cross_qkvo,self_qkv_cross_qkv_ffn \
+  --ranks 64,128,256
+```
+
+关键参数：
+
+| 参数 | 说明 |
+| --- | --- |
+| `--merge-lora` | 空格或逗号分隔的 checkpoint 列表；训练入口会在加载时自动检测每个 merge LoRA 的 rank 与 target modules |
+| `--task-name` / `--data-type` / `--duration` | 数据 preset 与可选覆盖；默认 task 分配来自 `train_config.py` |
+| `--train-size` | 固定搜索用训练数据量；in-task/OOD eval/video size 可分别用对应参数设置 |
+| `--layouts` | layout 短名列表，支持 `self_qkv`、`self_qkvo`、`cross_qkv`、`cross_qkvo`、`self_qkv_cross_qkv`、`self_qkvo_cross_qkvo`、`ffn`、`self_qkv_ffn`、`self_qkvo_ffn`、`self_qkv_cross_qkv_ffn`、`self_qkvo_cross_qkvo_ffn` |
+| `--ranks` | 逗号分隔的 LoRA rank 列表 |
+| `--cuda` | 逗号分隔 CUDA id；展开后的实验按顺序轮转分配，并逐个等待完成 |
+| `--dry-run` | 只打印命令，不启动训练 |
+
+layout 名称直接写入本地 log 目录和 W&B run name，例如
+`h2r_1s_self_qkv_cross_qkv_ffn_r128_20260502_153000`。需要临时 layout 时可写
+`name=target1,target2`，例如 `self_q=self_attn.q`。
+对比 qkv-only 时使用 `self_qkv` / `cross_qkv` / `self_qkv_cross_qkv`，这些 layout 不会在 `o` projection 上加 LoRA。
 
 加载训练好的 LoRA 时，`--init-lora` 会从 checkpoint 的 LoRA A/B tensor
 自动检测 rank 和 target modules；未显式传 `--lora-rank` /
