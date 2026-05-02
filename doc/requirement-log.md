@@ -561,3 +561,15 @@
 - blur 参数默认对齐旧 `1s_patch` blur 语义：`--blur-ksize 51`，`--blur-pixel-expand 16`；hflip 样本会同步翻转 SAM2 mask 后再降质。
 - `manifest.jsonl` 为 `blur_r2r` 记录 `control_degrade=sam2_blur`、`blur_ksize`、`blur_pixel_expand`，便于 cache 与训练追溯。
 - `doc/step_5_training_infra.md` 补充 blur_r2r 生成方式、SAM2 mask 依赖和正式命令。
+
+## 2026-05-02 — LoRA layout/rank 搜索脚本整理
+
+用户要求：
+> 确定三个阶段里 LoRA 最佳位置；找出数据量相同且各 LoRA layout 都有的实验，比较性能。整理训练搜索脚本：支持指定 merge LoRA、数据量、layout/rank、CUDA；layout × rank 展开后在指定 GPU 上顺序分配；log 和 W&B 名称加日期时间；log 目录写 rank 与 layout 短名；支持 qkv-only 不含 o。
+
+落实：
+- 新增 `scripts/train_lora_grid.py`，统一展开 `LoRA layout × rank`，并通过 `scripts/flip_run.sh train --nproc 1` 顺序启动训练。
+- 支持 `--merge-lora` 多 checkpoint、`--task-name`/数据覆盖、`--train-size`、eval/video size、`--layouts`、`--ranks`、`--cuda`、`--dry-run` 和额外 train 参数透传。
+- 内置 `self_qkv`、`cross_qkv`、`self_qkv_cross_qkv` 等 qkv-only layout，以及 qkvo/ffn 组合 layout；本地 run dir 与 W&B run name 使用 `{task}_{layout}_r{rank}_{YYYYMMDD_HHMMSS}`。
+- `src/core/train_utils.py` 将显式 LoRA target modules 压缩为 `self_qkv_cross_qkv_ffn` 这类短名，避免目录名展开过长。
+- 更新 `doc/step_5_training_infra.md` 与 `doc/scripts_inventory.md` 的使用说明。

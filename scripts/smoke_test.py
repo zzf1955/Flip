@@ -51,21 +51,19 @@ def visible_device_count(cuda_devices: str) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run lightweight + GPU smoke tests")
     parser.add_argument("--cuda", default="2", help="CUDA_VISIBLE_DEVICES for GPU smoke, e.g. 2 or 2,3")
-    parser.add_argument("--nproc", type=int, default=0, help="GPU train worker count; default equals --cuda device count")
+    parser.add_argument("--nproc", type=int, default=1, help="deprecated; GPU smoke is always single-card")
     parser.add_argument("--skip-help", action="store_true", help="pass through to lightweight smoke")
     parser.add_argument("--skip-prepare", action="store_true", help="pass through to GPU smoke")
     args = parser.parse_args()
 
-    nproc = args.nproc or visible_device_count(args.cuda)
-    if nproc < 1:
-        raise ValueError("--nproc must be >= 1")
+    nproc = 1
 
     light_cmd = [str(PYTHON), "scripts/smoke_test_light.py"]
     if args.skip_help:
         light_cmd.append("--skip-help")
     run(light_cmd, SMOKE_ROOT / "smoke_test_light.log")
 
-    gpu_cmd = [str(PYTHON), "scripts/smoke_test_gpu.py", "--cuda", args.cuda, "--nproc", str(nproc)]
+    gpu_cmd = [str(PYTHON), "scripts/smoke_test_gpu.py", "--cuda", args.cuda]
     if args.skip_prepare:
         gpu_cmd.append("--skip-prepare")
     run(gpu_cmd, SMOKE_ROOT / "smoke_test_gpu.log")

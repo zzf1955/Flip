@@ -90,6 +90,7 @@ eval_metrics.py    ← torch, skimage, transformers (CLIP)
 | 脚本 | 功能 | 输入 | 输出 |
 |------|------|------|------|
 | `train.py` | Mitty / Wan2.2 LoRA 正式训练入口 | `training_data/cache/vae/...` + `training_data/cache/t5` | `training_data/log/` 或 `tmp/` smoke |
+| `train_lora_grid.py` | LoRA layout × rank 网格搜索启动器；支持 merge LoRA、数据量、layout/rank、CUDA 轮转与 dry-run | LoRA checkpoint + `train.py` 数据 preset | 多个 `training_data/log/*_{layout}_r{rank}_{timestamp}/` run |
 
 ### 人体重绘（Step 4 本地方案）
 
