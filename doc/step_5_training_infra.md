@@ -267,7 +267,7 @@ LPIPS 默认按 `--lpips-batch-size 16` 合批跑 VGG，FID/Local FID 默认按
 `--no-progress`。
 
 当评估数据类型为 `blur_r2r` 时，`evaluate_mitty_models` 默认会启用
-mask-region Frechet 指标：从
+mask-region 指标：从
 `training_data/sam2_mask/<task>/<episode>/<seg>.npz` 读取与该 clip 对齐的
 机器人 mask，按 `clip_start` / `clip_dur` / `augment` 对齐。summary 会额外写出
 全局 `mse`，以及局部 `foreground_mse`、`foreground_psnr`、
@@ -275,23 +275,28 @@ mask-region Frechet 指标：从
 这些局部配对指标只统计 mask 内或 mask 外像素，不比较黑底区域。区域 FID 使用
 Local FID 口径：按每帧 robot mask 的 bounding box 向外扩展 24 px 后裁剪
 gen/GT 局部图像，再把局部 crop resize 到 InceptionV3 输入尺寸计算 Frechet
-距离，字段为 `foreground_local_fid`。区域 FVD 暂时仍使用黑底视频口径，并写为
-`foreground_black_fvd`、`background_black_fvd`。缺少 mask 或 manifest 缺少对齐字段
-会直接报错。可用 `--mask-region-metrics off` 关闭，或用 `--sam2-mask-root`
-指向其他 SAM2 mask 根目录。`--no-fid` 会关闭全局 FID/FVD、Local FID 和黑底 FVD，
-局部 MSE/PSNR/SSIM 仍会计算。
+距离，字段为 `foreground_local_fid`。区域 FVD 使用同一个 bbox crop 局部口径：
+先把每帧 gen/GT 裁到 robot mask bbox，再用 S3D video feature 计算视频级
+Frechet 距离，字段为 `foreground_local_fvd`。旧的黑底区域 FVD 字段
+`foreground_black_fvd`、`background_black_fvd` 不再输出。缺少 mask 或 manifest
+缺少对齐字段会直接报错。可用 `--mask-region-metrics off` 关闭，或用
+`--sam2-mask-root` 指向其他 SAM2 mask 根目录。`--no-fid` 会关闭全局 FID/FVD、
+Local FID 和 Local FVD，局部 MSE/PSNR/SSIM 仍会计算。
 
 如需查看 Local FID 实际关注的局部区域，可加 `--write-local-videos`。脚本会在
 每个 split 下写出 `local_fid/`：
 
 - `gen_*.mp4`、`gt_*.mp4`、`ctrl_*.mp4`：按 robot mask bbox 裁剪并 resize 后的
-  局部视频。
+  局部视频，和 Local FID / Local FVD 使用同一组 bbox。
 - `compare_*.mp4`：`GT | gen | ctrl` 三列局部对比。
+- `gen_overlay_*.mp4`、`gt_overlay_*.mp4`、`ctrl_overlay_*.mp4`：原始画面大小，
+  用黄色半透明 robot mask 和黄色 bbox 标出参与 Local 指标计算的区域。
+- `compare_overlay_*.mp4`：`GT | gen | ctrl` 三列原始画面 overlay 对比。
 - `patch_index.jsonl`：每个 sample 的 `sample_id`、`pair_id`、`order_index`、
-  `pair_order_path`、`source_id`、`mask_path`、`frame_bboxes_xyxy` 和
-  `union_bbox_xyxy`。
+  `pair_order_path`、`source_id`、`mask_path`、Local/overlay 视频路径、
+  `frame_bboxes_xyxy`、`union_bbox_xyxy` 和 overlay 颜色。
 
-Local 视频默认使用与 Local FID 相同的 per-frame bbox 口径，默认
+Local 视频默认使用与 Local FID / Local FVD 相同的 per-frame bbox 口径，默认
 `--local-video-margin 24 --local-video-size 300 --local-video-bbox-mode frame`。
 Local FID 指标内部仍使用 InceptionV3 的 299 输入尺寸；视频默认写成 300 是因为
 H.264 `yuv420p` 输出要求宽高为偶数。
