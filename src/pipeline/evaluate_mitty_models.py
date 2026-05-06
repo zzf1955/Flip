@@ -385,9 +385,12 @@ def main():
     ap.add_argument("--no-fid", action="store_true",
                     help="skip both FID and FVD")
     args = ap.parse_args()
+    output_dir_provided = bool(args.output_dir)
 
     try:
         apply_train_task_config(args)
+        if not output_dir_provided:
+            args.output_dir = ""
         args.splits = normalize_splits(args.splits)
     except ValueError as exc:
         ap.error(str(exc))
@@ -402,6 +405,9 @@ def main():
     args.pair_root = str(resolve_path(args.pair_root))
 
     runtime_split = build_tail_eval_split(args)
+    for split in args.splits:
+        if not records_for_split(split, runtime_split):
+            ap.error(f"Split '{split}' selected no eval samples")
 
     print(
         "Selected eval samples from pair_order tails: "
