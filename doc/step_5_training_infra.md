@@ -224,10 +224,14 @@ CUDA_VISIBLE_DEVICES=2 python -m src.pipeline.mitty_cache \
 ## 离线综合评估
 
 `src.pipeline.evaluate_mitty_models` 用于比较训练完成的 Mitty LoRA run：按
-训练入口相同的 task 级 `pair_order.jsonl` 顺序表选择样本，从每个 in-task
-task 和 OOD task 的顺序表尾部读取 `--eval-tail-percent`，再用对应 VAE cache
-生成视频，并复制 pair 目录中的原始 `video` / `control_video` 作为 GT 和
-Control，计算 PSNR、SSIM、LPIPS、FID 和 FVD。默认评估：
+训练入口相同的 task 级 `pair_order.jsonl` 顺序表选择样本。正式评估推荐显式传
+`--in-task-eval-size K --ood-eval-size M`：in-task 会按各 in-task task 的数据量
+比例分配总数 K，并从每个 task 顺序表尾部读取对应数量；OOD 会从 OOD task
+顺序表尾部读取总数 M（多 OOD task 时同样按数据量比例分配）。未传固定数量时，
+兼容旧逻辑，从每个 in-task task 和 OOD task 的顺序表尾部读取
+`--eval-tail-percent`。选中样本再用对应 VAE cache 生成视频，并复制 pair 目录中
+的原始 `video` / `control_video` 作为 GT 和 Control，计算 PSNR、SSIM、LPIPS、
+FID 和 FVD。默认评估：
 
 - `Mitty-transfer-124d_r128_2000s_0425_1456/ckpt/step-2000.safetensors`
 - `Mitty-transfer2LoRA-124d_r128_2000s_0425_1425/ckpt/step-2000.safetensors`
@@ -238,7 +242,8 @@ Control，计算 PSNR、SSIM、LPIPS、FID 和 FVD。默认评估：
 ```bash
 scripts/flip_run.sh eval_mitty --cuda 2 -- \
   --device cuda:0 \
-  --eval-tail-percent 10
+  --in-task-eval-size 32 \
+  --ood-eval-size 8
 ```
 
 输出目录默认写在对应 ckpt 旁边：`training_data/log/<run>/ckpt/<step>_eval/`。
@@ -246,7 +251,20 @@ scripts/flip_run.sh eval_mitty --cuda 2 -- \
 `summary.csv`、`summary.json` 和 `data_split/` 选择记录。可用 `--splits
 in_task_eval ood_eval` 指定 split；`eval` 是 `in_task_eval` 的兼容别名，
 `ood` 是 `ood_eval` 的兼容别名。如只想复算已有视频的指标，可加
-`--no-generate`；如需继续写到集中目录，可显式传 `--output-dir`。
+`--no-generate`；如生成过程被中断，可加 `--resume-existing` 复用已经完整写出的
+`gen/gt/ctrl` 三元组，只补齐缺失或不可解码的样本。如需继续写到集中目录，可显式传
+`--output-dir`。
+`data_split/*.jsonl` 会保留每个样本的 `pair_id`、`order_index`、
+`pair_order_path`、`source_id`、`episode`、`seg`、`clip_start`、`clip_dur`
+等字段，用于把评估视频对应回 pair 顺序表。
+
+离线指标计算会打印 generation、Local crop 和 metrics 各阶段进度。metrics 阶段
+默认用 `--metric-workers 8` 并行读取视频、计算 PSNR/SSIM 和 mask 局部指标；
+LPIPS 默认按 `--lpips-batch-size 16` 合批跑 VGG，FID/Local FID 默认按
+`--feature-batch-size 32` 合批跑 InceptionV3，FVD 默认按
+`--fvd-batch-size 4` 合批跑 S3D。显存不足时可调小这些 batch size；CPU
+解码/SSIM 不足时可调大 `--metric-workers`。如需安静日志，可加
+`--no-progress`。
 
 当评估数据类型为 `blur_r2r` 时，`evaluate_mitty_models` 默认会启用
 mask-region Frechet 指标：从
@@ -254,12 +272,30 @@ mask-region Frechet 指标：从
 机器人 mask，按 `clip_start` / `clip_dur` / `augment` 对齐。summary 会额外写出
 全局 `mse`，以及局部 `foreground_mse`、`foreground_psnr`、
 `foreground_ssim`、`background_mse`、`background_psnr`、`background_ssim`；
-这些局部配对指标只统计 mask 内或 mask 外像素，不比较黑底区域。FID/FVD 仍需
-完整 RGB 视频输入，因此区域 Frechet 指标使用黑底视频口径，并写为
-`foreground_black_fid`、`foreground_black_fvd`、`background_black_fid`、
-`background_black_fvd`。缺少 mask 或 manifest 缺少对齐字段会直接报错。可用
-`--mask-region-metrics off` 关闭，或用 `--sam2-mask-root` 指向其他 SAM2 mask
-根目录。`--no-fid` 只会关闭全局和黑底区域 FID/FVD，局部 MSE/PSNR/SSIM 仍会计算。
+这些局部配对指标只统计 mask 内或 mask 外像素，不比较黑底区域。区域 FID 使用
+Local FID 口径：按每帧 robot mask 的 bounding box 向外扩展 24 px 后裁剪
+gen/GT 局部图像，再把局部 crop resize 到 InceptionV3 输入尺寸计算 Frechet
+距离，字段为 `foreground_local_fid`。区域 FVD 暂时仍使用黑底视频口径，并写为
+`foreground_black_fvd`、`background_black_fvd`。缺少 mask 或 manifest 缺少对齐字段
+会直接报错。可用 `--mask-region-metrics off` 关闭，或用 `--sam2-mask-root`
+指向其他 SAM2 mask 根目录。`--no-fid` 会关闭全局 FID/FVD、Local FID 和黑底 FVD，
+局部 MSE/PSNR/SSIM 仍会计算。
+
+如需查看 Local FID 实际关注的局部区域，可加 `--write-local-videos`。脚本会在
+每个 split 下写出 `local_fid/`：
+
+- `gen_*.mp4`、`gt_*.mp4`、`ctrl_*.mp4`：按 robot mask bbox 裁剪并 resize 后的
+  局部视频。
+- `compare_*.mp4`：`GT | gen | ctrl` 三列局部对比。
+- `patch_index.jsonl`：每个 sample 的 `sample_id`、`pair_id`、`order_index`、
+  `pair_order_path`、`source_id`、`mask_path`、`frame_bboxes_xyxy` 和
+  `union_bbox_xyxy`。
+
+Local 视频默认使用与 Local FID 相同的 per-frame bbox 口径，默认
+`--local-video-margin 24 --local-video-size 300 --local-video-bbox-mode frame`。
+Local FID 指标内部仍使用 InceptionV3 的 299 输入尺寸；视频默认写成 300 是因为
+H.264 `yuv420p` 输出要求宽高为偶数。
+如果只为人工观看、希望减少 bbox 抖动，可改用 `--local-video-bbox-mode union`。
 
 ### 冒烟训练
 
@@ -461,7 +497,7 @@ scripts/flip_run.sh train --cuda 2,3 --nproc 2 -- \
 
 - `eval loss` 按 cache 文件索引在所有 rank 间切分，每个 rank 计算自己的子集，再 `all_reduce` 成全局均值；随机种子使用全局样本索引，避免 GPU 数量变化改变评估语义。
 - `eval video` 的样本集合由 `--data-seed` 和 eval split 固定，不随 step 改变；生成时按待生成视频的全局样本索引在所有 rank 间切分，所有 rank 写入同一个 `step-XXXX/`，文件名仍为 `gen_00.mp4`、`gt_00.mp4`、`ctrl_00.mp4` 这类全局编号。
-- CSV、W&B、eval video 上传和在线指标只在 rank 0 执行；视频生成完成后会用 DDP barrier 等待所有 rank 写完。默认在线指标为 PSNR/SSIM/LPIPS/CLIP/FID/FVD；FID 使用 InceptionV3 pool3 逐帧特征计算帧级 Frechet 距离，FVD 使用 torchvision S3D Kinetics-400 1024-d 时空视频特征计算视频级 Frechet 距离。在线指标当前按单帧 batch 执行帧级模型，并逐视频执行 S3D，以降低显存峰值，但会明显增加 eval 阶段耗时，并在 rank 0 训练卡上多占显存。如需关闭 FID/FVD，加 `--no-eval-video-frechet-metrics`；正式对比也可训练后用 `src.pipeline.evaluate_mitty_models` 或 `src.tools.eval_metrics` 离线计算。FID/FVD 是分布指标，样本太少时方差很大，正式汇报建议使用几十条以上视频。
+- CSV、W&B、eval video 上传和在线指标只在 rank 0 执行；视频生成完成后会用 DDP barrier 等待所有 rank 写完。默认在线指标为 PSNR/SSIM/LPIPS/CLIP/FID/FVD；FID 使用 InceptionV3 pool3 逐帧特征计算帧级 Frechet 距离，FVD 使用 torchvision S3D Kinetics-400 1024-d 时空视频特征计算视频级 Frechet 距离。在线指标会按 frame batch 跑 LPIPS/CLIP/Inception、按 video batch 跑 S3D，并在训练日志中打印 `pairwise`、`lpips`、`clip`、`fid/*`、`fvd/*` 进度；这些指标仍只在 rank 0 训练卡上占用额外显存。如需关闭 FID/FVD，加 `--no-eval-video-frechet-metrics`；正式对比也可训练后用 `src.pipeline.evaluate_mitty_models` 或 `src.tools.eval_metrics` 离线计算。FID/FVD 是分布指标，样本太少时方差很大，正式汇报建议使用几十条以上视频。
 - 正式实验默认 `--max-steps 1000 --save-steps 100 --eval-steps 100 --eval-video-steps 100`；smoke/debug 可临时调小。
 - `--loss`、`--patch-dir` 已从正式训练入口移除，当前统一使用标准 Mitty loss。
 

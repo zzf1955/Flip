@@ -10,8 +10,8 @@ Metrics:
   - LPIPS  (perceptual distance via VGG, lower is better)
   - FID    (Frechet Inception Distance across all frames, lower is better)
   - FVD    (Frechet Video Distance via S3D video features, lower is better)
-  - foreground/background MSE/PSNR/SSIM and black-background FID/FVD when
-    SAM2 masks are available and selected
+  - foreground/background MSE/PSNR/SSIM, foreground Local FID, and
+    black-background FVD when SAM2 masks are available and selected
 
 Usage:
   python -m src.tools.eval_metrics --run 2026-04-18_163933
@@ -26,12 +26,16 @@ import csv
 import os
 import subprocess
 import sys
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from PIL import Image
 from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 
 MAIN_ROOT = Path(os.environ.get("FLIP_MAIN_ROOT", "/disk_n/zzf/flip"))
@@ -44,6 +48,22 @@ FFPROBE = FFMPEG.replace("ffmpeg", "ffprobe")
 SEGMENT_FPS = 30.0
 TARGET_FPS = 16.0
 REGION_NAMES = ("foreground", "background")
+LOCAL_FID_MARGIN = 24
+LOCAL_FID_SIZE = 299
+DEFAULT_METRIC_WORKERS = min(8, os.cpu_count() or 1)
+DEFAULT_LPIPS_BATCH_SIZE = 16
+DEFAULT_FEATURE_BATCH_SIZE = 32
+DEFAULT_FVD_BATCH_SIZE = 4
+ProgressCallback = Callable[[str, int, int], None]
+
+
+@dataclass(frozen=True)
+class PairMetricData:
+    idx: int
+    gen_frames: np.ndarray
+    gt_frames: np.ndarray
+    masks: np.ndarray | None
+    metrics: dict
 
 
 # ── Video IO ──────��──────────────────────────────���────────────────────
@@ -149,6 +169,56 @@ def split_video_by_mask(frames: np.ndarray, masks: np.ndarray) -> dict[str, np.n
         "foreground": np.where(keep_foreground, frames, 0).astype(np.uint8),
         "background": np.where(~keep_foreground, frames, 0).astype(np.uint8),
     }
+
+
+def mask_bbox(mask: np.ndarray, margin: int = LOCAL_FID_MARGIN) -> tuple[int, int, int, int]:
+    """Return expanded xyxy bbox for a non-empty 2D mask."""
+    if mask.ndim != 2:
+        raise ValueError(f"Expected 2D mask, got {mask.shape}")
+    if margin < 0:
+        raise ValueError(f"margin must be non-negative, got {margin}")
+    ys, xs = np.nonzero(mask)
+    if len(xs) == 0:
+        raise ValueError("Local FID mask has no foreground pixels")
+    h, w = mask.shape
+    x1 = max(int(xs.min()) - margin, 0)
+    y1 = max(int(ys.min()) - margin, 0)
+    x2 = min(int(xs.max()) + margin + 1, w)
+    y2 = min(int(ys.max()) + margin + 1, h)
+    if x1 >= x2 or y1 >= y2:
+        raise ValueError(f"Invalid Local FID bbox {(x1, y1, x2, y2)} for mask {mask.shape}")
+    return x1, y1, x2, y2
+
+
+def crop_video_by_mask_bbox(
+    frames: np.ndarray,
+    masks: np.ndarray,
+    margin: int = LOCAL_FID_MARGIN,
+    output_size: int = LOCAL_FID_SIZE,
+) -> np.ndarray:
+    """Crop each frame to the mask bbox and resize crops for Local FID.
+
+    This follows the Local FID protocol used by object inpainting work: the
+    same mask-derived bbox is applied to generated and GT frames, making FID
+    focus on the edited foreground instead of unchanged background.
+    """
+    if frames.ndim != 4 or frames.shape[-1] != 3:
+        raise ValueError(f"Expected video frames shape (T,H,W,3), got {frames.shape}")
+    if masks.shape != frames.shape[:3]:
+        raise ValueError(f"Mask shape {masks.shape} does not match frames {frames.shape[:3]}")
+    if output_size <= 0:
+        raise ValueError(f"output_size must be positive, got {output_size}")
+
+    crops = []
+    for frame, mask in zip(frames, masks):
+        x1, y1, x2, y2 = mask_bbox(mask, margin)
+        crop = frame[y1:y2, x1:x2]
+        resized = Image.fromarray(crop).resize(
+            (output_size, output_size),
+            Image.Resampling.BILINEAR,
+        )
+        crops.append(np.asarray(resized, dtype=np.uint8))
+    return np.stack(crops, axis=0)
 
 
 def region_masks(masks: np.ndarray) -> dict[str, np.ndarray]:
@@ -307,6 +377,7 @@ def compute_pairwise_metrics(
     lpips_model: LPIPS | None,
     device: torch.device,
     masks: np.ndarray | None = None,
+    lpips_batch_size: int = 8,
 ) -> dict:
     """Compute PSNR, SSIM, LPIPS between paired frame arrays (T,H,W,3)."""
     if len(gen_frames) != len(gt_frames):
@@ -324,11 +395,13 @@ def compute_pairwise_metrics(
         ssims.append(structural_similarity(gt_frames[t], gen_frames[t], channel_axis=2, data_range=255))
 
     if lpips_model is not None:
+        if lpips_batch_size <= 0:
+            raise ValueError(f"lpips_batch_size must be positive, got {lpips_batch_size}")
         gen_t = torch.from_numpy(gen_frames[:T]).permute(0, 3, 1, 2).float() / 255.0
         gt_t = torch.from_numpy(gt_frames[:T]).permute(0, 3, 1, 2).float() / 255.0
-        for i in range(0, T, 8):
-            batch_gen = gen_t[i:i + 8].to(device)
-            batch_gt = gt_t[i:i + 8].to(device)
+        for i in range(0, T, lpips_batch_size):
+            batch_gen = gen_t[i:i + lpips_batch_size].to(device)
+            batch_gt = gt_t[i:i + lpips_batch_size].to(device)
             d = lpips_model(batch_gen, batch_gt)
             lpipss.extend(d.cpu().tolist())
 
@@ -348,6 +421,70 @@ def compute_pairwise_metrics(
     return result
 
 
+def compute_lpips_per_video(
+    video_pairs: list[tuple[np.ndarray, np.ndarray]],
+    lpips_model: LPIPS,
+    device: torch.device,
+    batch_size: int = DEFAULT_LPIPS_BATCH_SIZE,
+    progress_callback: ProgressCallback | None = None,
+) -> list[float]:
+    """Compute LPIPS with frame batches shared across all videos."""
+    if batch_size <= 0:
+        raise ValueError(f"LPIPS batch size must be positive, got {batch_size}")
+    totals = [len(gen) for gen, _ in video_pairs]
+    total_frames = sum(totals)
+    if total_frames == 0:
+        raise ValueError("No frames available for LPIPS")
+
+    per_video_scores = [[] for _ in video_pairs]
+    batch_gen: list[np.ndarray] = []
+    batch_gt: list[np.ndarray] = []
+    batch_owners: list[int] = []
+    done = 0
+
+    def flush_batch() -> None:
+        nonlocal done
+        if not batch_gen:
+            return
+        gen_t = (
+            torch.from_numpy(np.stack(batch_gen, axis=0))
+            .permute(0, 3, 1, 2)
+            .float()
+            / 255.0
+        )
+        gt_t = (
+            torch.from_numpy(np.stack(batch_gt, axis=0))
+            .permute(0, 3, 1, 2)
+            .float()
+            / 255.0
+        )
+        scores = lpips_model(gen_t.to(device), gt_t.to(device)).cpu().tolist()
+        for owner, score in zip(batch_owners, scores):
+            per_video_scores[owner].append(float(score))
+        done += len(scores)
+        if progress_callback is not None:
+            progress_callback("lpips", done, total_frames)
+        batch_gen.clear()
+        batch_gt.clear()
+        batch_owners.clear()
+
+    for video_idx, (gen_frames, gt_frames) in enumerate(video_pairs):
+        if len(gen_frames) != len(gt_frames):
+            raise ValueError(
+                f"Frame count mismatch in LPIPS video {video_idx}: "
+                f"gen={len(gen_frames)} gt={len(gt_frames)}"
+            )
+        for gen_frame, gt_frame in zip(gen_frames, gt_frames):
+            batch_gen.append(gen_frame)
+            batch_gt.append(gt_frame)
+            batch_owners.append(video_idx)
+            if len(batch_gen) == batch_size:
+                flush_batch()
+    flush_batch()
+
+    return [float(np.mean(scores)) for scores in per_video_scores]
+
+
 # ── Inception features ���───────────────────────────────────────────────
 
 
@@ -355,16 +492,51 @@ def collect_inception_features(
     video_arrays: list[np.ndarray],
     extractor: InceptionFeatureExtractor,
     device: torch.device,
-    batch_size: int = 16,
+    batch_size: int = DEFAULT_FEATURE_BATCH_SIZE,
+    progress_callback: ProgressCallback | None = None,
+    progress_phase: str = "fid",
 ) -> np.ndarray:
     """Extract Inception features from all frames -> (N_total_frames, 2048)."""
+    if batch_size <= 0:
+        raise ValueError(f"Inception feature batch size must be positive, got {batch_size}")
     all_frames = np.concatenate(video_arrays, axis=0)
     feats = []
     for i in range(0, len(all_frames), batch_size):
         chunk = all_frames[i:i + batch_size]
         batch = torch.from_numpy(chunk).permute(0, 3, 1, 2).float() / 255.0
         feats.append(extractor(batch.to(device)).cpu().numpy())
+        if progress_callback is not None:
+            progress_callback(progress_phase, min(i + len(chunk), len(all_frames)), len(all_frames))
     return np.concatenate(feats, axis=0)
+
+
+def collect_local_inception_features(
+    video_arrays: list[np.ndarray],
+    mask_arrays: list[np.ndarray],
+    extractor: InceptionFeatureExtractor,
+    device: torch.device,
+    margin: int = LOCAL_FID_MARGIN,
+    batch_size: int = DEFAULT_FEATURE_BATCH_SIZE,
+    progress_callback: ProgressCallback | None = None,
+    progress_phase: str = "local_fid",
+) -> np.ndarray:
+    """Extract Inception features from mask-bbox frame crops for Local FID."""
+    if len(video_arrays) != len(mask_arrays):
+        raise ValueError(
+            f"Video/mask count mismatch: {len(video_arrays)} vs {len(mask_arrays)}"
+        )
+    cropped_videos = [
+        crop_video_by_mask_bbox(video, masks, margin=margin)
+        for video, masks in zip(video_arrays, mask_arrays)
+    ]
+    return collect_inception_features(
+        cropped_videos,
+        extractor,
+        device,
+        batch_size,
+        progress_callback=progress_callback,
+        progress_phase=progress_phase,
+    )
 
 
 def compute_fid(feats_gen: np.ndarray, feats_gt: np.ndarray) -> float:
@@ -413,13 +585,25 @@ def collect_video_features(
     video_arrays: list[np.ndarray],
     extractor: VideoFeatureExtractor,
     device: torch.device,
+    batch_size: int = DEFAULT_FVD_BATCH_SIZE,
+    progress_callback: ProgressCallback | None = None,
+    progress_phase: str = "fvd",
 ) -> np.ndarray:
     """Extract one S3D spatiotemporal feature vector per video -> (V, 1024)."""
+    if batch_size <= 0:
+        raise ValueError(f"FVD batch size must be positive, got {batch_size}")
     feats = []
-    for vid in video_arrays:
-        t = torch.from_numpy(vid).permute(3, 0, 1, 2).unsqueeze(0).float() / 255.0
-        feats.append(extractor(t.to(device)).cpu().numpy()[0])
-    return np.stack(feats)
+    for i in range(0, len(video_arrays), batch_size):
+        chunk = video_arrays[i:i + batch_size]
+        tensors = [
+            torch.from_numpy(vid).permute(3, 0, 1, 2).float() / 255.0
+            for vid in chunk
+        ]
+        batch = torch.stack(tensors, dim=0)
+        feats.append(extractor(batch.to(device)).cpu().numpy())
+        if progress_callback is not None:
+            progress_callback(progress_phase, min(i + len(chunk), len(video_arrays)), len(video_arrays))
+    return np.concatenate(feats, axis=0)
 
 
 def compute_fvd(
@@ -427,6 +611,9 @@ def compute_fvd(
     gt_videos: list[np.ndarray],
     extractor: VideoFeatureExtractor,
     device: torch.device,
+    batch_size: int = DEFAULT_FVD_BATCH_SIZE,
+    progress_callback: ProgressCallback | None = None,
+    progress_prefix: str = "fvd",
 ) -> float | None:
     """Compute FVD with S3D video features.
 
@@ -434,8 +621,22 @@ def compute_fvd(
     """
     if len(gen_videos) < 2:
         return None
-    feats_gen = collect_video_features(gen_videos, extractor, device)
-    feats_gt = collect_video_features(gt_videos, extractor, device)
+    feats_gen = collect_video_features(
+        gen_videos,
+        extractor,
+        device,
+        batch_size=batch_size,
+        progress_callback=progress_callback,
+        progress_phase=f"{progress_prefix}/gen",
+    )
+    feats_gt = collect_video_features(
+        gt_videos,
+        extractor,
+        device,
+        batch_size=batch_size,
+        progress_callback=progress_callback,
+        progress_phase=f"{progress_prefix}/gt",
+    )
     mu_gen, sigma_gen = feats_gen.mean(0), np.cov(feats_gen, rowvar=False)
     mu_gt, sigma_gt = feats_gt.mean(0), np.cov(feats_gt, rowvar=False)
     if sigma_gen.ndim < 2:
@@ -459,6 +660,46 @@ def find_pairs(step_dir: str) -> list[tuple[str, str, int]]:
     return pairs
 
 
+def _load_pair_metric_data(
+    pair: tuple[str, str, int],
+    records_by_index: dict[int, dict],
+    sam2_mask_root: str | Path | None,
+) -> PairMetricData:
+    gen_path, gt_path, idx = pair
+    gen_frames = read_video_frames(gen_path)
+    gt_frames = read_video_frames(gt_path)
+    if len(gen_frames) != len(gt_frames):
+        raise ValueError(
+            f"Frame count mismatch: {gen_path} has {len(gen_frames)} frames, "
+            f"{gt_path} has {len(gt_frames)} frames"
+        )
+    masks = None
+    if sam2_mask_root is not None:
+        if idx not in records_by_index:
+            raise ValueError(f"No selected record for sample index {idx}")
+        masks = load_clip_mask_stack(
+            records_by_index[idx],
+            sam2_mask_root,
+            len(gen_frames),
+            gen_frames.shape[1:3],
+        )
+    metrics = compute_pairwise_metrics(
+        gen_frames,
+        gt_frames,
+        lpips_model=None,
+        device=torch.device("cpu"),
+        masks=masks,
+    )
+    metrics["sample"] = idx
+    return PairMetricData(
+        idx=idx,
+        gen_frames=gen_frames,
+        gt_frames=gt_frames,
+        masks=masks,
+        metrics=metrics,
+    )
+
+
 def process_step(
     step_dir: str,
     lpips_model: LPIPS | None,
@@ -467,11 +708,18 @@ def process_step(
     device: torch.device,
     selected_records: list[dict] | None = None,
     sam2_mask_root: str | Path | None = None,
+    metric_workers: int = DEFAULT_METRIC_WORKERS,
+    lpips_batch_size: int = DEFAULT_LPIPS_BATCH_SIZE,
+    feature_batch_size: int = DEFAULT_FEATURE_BATCH_SIZE,
+    fvd_batch_size: int = DEFAULT_FVD_BATCH_SIZE,
+    progress_callback: ProgressCallback | None = None,
 ) -> dict:
     """Compute all metrics for one eval step directory."""
     pairs = find_pairs(step_dir)
     if not pairs:
         return {}
+    if metric_workers <= 0:
+        raise ValueError(f"metric_workers must be positive, got {metric_workers}")
     if selected_records is not None and len(selected_records) != len(pairs):
         raise ValueError(
             f"Selected record count {len(selected_records)} does not match "
@@ -499,43 +747,49 @@ def process_step(
     gen_videos, gt_videos = [], []
     region_gen_videos = {name: [] for name in REGION_NAMES}
     region_gt_videos = {name: [] for name in REGION_NAMES}
-    per_sample = []
+    local_fid_masks = []
+    pair_data: list[PairMetricData] = []
 
-    for gen_path, gt_path, idx in pairs:
-        gen_frames = read_video_frames(gen_path)
-        gt_frames = read_video_frames(gt_path)
-        if len(gen_frames) != len(gt_frames):
-            raise ValueError(
-            f"Frame count mismatch: {gen_path} has {len(gen_frames)} frames, "
-            f"{gt_path} has {len(gt_frames)} frames")
+    with ThreadPoolExecutor(max_workers=metric_workers) as executor:
+        futures = [
+            executor.submit(_load_pair_metric_data, pair, records_by_index, sam2_mask_root)
+            for pair in pairs
+        ]
+        for done, future in enumerate(as_completed(futures), 1):
+            pair_data.append(future.result())
+            if progress_callback is not None:
+                progress_callback("pairwise", done, len(pairs))
+
+    pair_data.sort(key=lambda item: item.idx)
+    per_sample = [item.metrics for item in pair_data]
+
+    if lpips_model is not None:
+        lpips_scores = compute_lpips_per_video(
+            [(item.gen_frames, item.gt_frames) for item in pair_data],
+            lpips_model,
+            device,
+            batch_size=lpips_batch_size,
+            progress_callback=progress_callback,
+        )
+        for item, score in zip(pair_data, lpips_scores):
+            item.metrics["lpips"] = score
+
+    for item in pair_data:
+        gen_frames = item.gen_frames
+        gt_frames = item.gt_frames
+        masks = item.masks
         gen_videos.append(gen_frames)
         gt_videos.append(gt_frames)
-        masks = None
 
-        if selected_records is not None and sam2_mask_root is not None:
-            if idx not in records_by_index:
-                raise ValueError(f"No selected record for sample index {idx} in {step_dir}")
-            masks = load_clip_mask_stack(
-                records_by_index[idx],
-                sam2_mask_root,
-                len(gen_frames),
-                gen_frames.shape[1:3],
-            )
+        if masks is not None:
             split_gen = split_video_by_mask(gen_frames, masks)
             split_gt = split_video_by_mask(gt_frames, masks)
             for name in REGION_NAMES:
                 region_gen_videos[name].append(split_gen[name])
                 region_gt_videos[name].append(split_gt[name])
+            local_fid_masks.append(masks)
 
-        m = compute_pairwise_metrics(
-            gen_frames,
-            gt_frames,
-            lpips_model,
-            device,
-            masks=masks,
-        )
-        m["sample"] = idx
-        per_sample.append(m)
+        m = item.metrics
         for key in metric_values:
             if key in m:
                 metric_values[key].append(m[key])
@@ -551,21 +805,56 @@ def process_step(
     if inception is not None:
         total_gen_frames = sum(len(v) for v in gen_videos)
         if total_gen_frames >= 2:
-            feats_gen = collect_inception_features(gen_videos, inception, device)
-            feats_gt = collect_inception_features(gt_videos, inception, device)
+            feats_gen = collect_inception_features(
+                gen_videos,
+                inception,
+                device,
+                batch_size=feature_batch_size,
+                progress_callback=progress_callback,
+                progress_phase="fid/gen",
+            )
+            feats_gt = collect_inception_features(
+                gt_videos,
+                inception,
+                device,
+                batch_size=feature_batch_size,
+                progress_callback=progress_callback,
+                progress_phase="fid/gt",
+            )
             result["fid"] = compute_fid(feats_gen, feats_gt)
         if selected_records is not None:
-            for name in REGION_NAMES:
-                total_region_frames = sum(len(v) for v in region_gen_videos[name])
-                if total_region_frames >= 2:
-                    feats_gen = collect_inception_features(
-                        region_gen_videos[name], inception, device)
-                    feats_gt = collect_inception_features(
-                        region_gt_videos[name], inception, device)
-                    result[f"{name}_black_fid"] = compute_fid(feats_gen, feats_gt)
+            total_local_frames = sum(len(v) for v in gen_videos)
+            if total_local_frames >= 2:
+                feats_gen = collect_local_inception_features(
+                    gen_videos,
+                    local_fid_masks,
+                    inception,
+                    device,
+                    batch_size=feature_batch_size,
+                    progress_callback=progress_callback,
+                    progress_phase="local_fid/gen",
+                )
+                feats_gt = collect_local_inception_features(
+                    gt_videos,
+                    local_fid_masks,
+                    inception,
+                    device,
+                    batch_size=feature_batch_size,
+                    progress_callback=progress_callback,
+                    progress_phase="local_fid/gt",
+                )
+                result["foreground_local_fid"] = compute_fid(feats_gen, feats_gt)
 
     if video_extractor is not None:
-        fvd = compute_fvd(gen_videos, gt_videos, video_extractor, device)
+        fvd = compute_fvd(
+            gen_videos,
+            gt_videos,
+            video_extractor,
+            device,
+            batch_size=fvd_batch_size,
+            progress_callback=progress_callback,
+            progress_prefix="fvd",
+        )
         if fvd is not None:
             result["fvd"] = fvd
         if selected_records is not None:
@@ -575,11 +864,27 @@ def process_step(
                     region_gt_videos[name],
                     video_extractor,
                     device,
+                    batch_size=fvd_batch_size,
+                    progress_callback=progress_callback,
+                    progress_prefix=f"{name}_black_fvd",
                 )
                 if fvd is not None:
                     result[f"{name}_black_fvd"] = fvd
 
     return result
+
+
+def make_print_progress(prefix: str) -> ProgressCallback:
+    last: dict[str, tuple[int, int]] = {}
+
+    def _progress(phase: str, done: int, total: int) -> None:
+        state = (done, total)
+        if last.get(phase) == state:
+            return
+        last[phase] = state
+        print(f"  {prefix} {phase}: {done}/{total}", flush=True)
+
+    return _progress
 
 
 def main():
@@ -592,6 +897,16 @@ def main():
     parser.add_argument("--no-lpips", action="store_true", help="Skip LPIPS (saves VRAM)")
     parser.add_argument("--no-fid", action="store_true", help="Skip FID/FVD (saves VRAM)")
     parser.add_argument("--csv", default=None, help="Output CSV path (default: <run>/eval_metrics.csv)")
+    parser.add_argument("--metric-workers", type=int, default=DEFAULT_METRIC_WORKERS,
+                        help="parallel workers for video decode and CPU pairwise metrics")
+    parser.add_argument("--lpips-batch-size", type=int, default=DEFAULT_LPIPS_BATCH_SIZE,
+                        help="GPU batch size for LPIPS frame batches")
+    parser.add_argument("--feature-batch-size", type=int, default=DEFAULT_FEATURE_BATCH_SIZE,
+                        help="GPU batch size for Inception/FID frame features")
+    parser.add_argument("--fvd-batch-size", type=int, default=DEFAULT_FVD_BATCH_SIZE,
+                        help="GPU batch size for S3D/FVD video features")
+    parser.add_argument("--no-progress", action="store_true",
+                        help="disable metric progress printing")
     args = parser.parse_args()
 
     run_dir = TRAINING_LOG_ROOT / args.run
@@ -648,7 +963,18 @@ def main():
             label = f"{split}/{step_name}" if split else step_name
             print(f"\n[{label}]")
 
-            result = process_step(str(step_path), lpips_model, inception, video_extractor, device)
+            result = process_step(
+                str(step_path),
+                lpips_model,
+                inception,
+                video_extractor,
+                device,
+                metric_workers=args.metric_workers,
+                lpips_batch_size=args.lpips_batch_size,
+                feature_batch_size=args.feature_batch_size,
+                fvd_batch_size=args.fvd_batch_size,
+                progress_callback=None if args.no_progress else make_print_progress("metrics"),
+            )
             if not result:
                 print("  No gen/gt pairs found")
                 continue
@@ -686,8 +1012,8 @@ def main():
         "mse", "psnr", "ssim", "lpips", "fid", "fvd",
         "foreground_mse", "foreground_psnr", "foreground_ssim",
         "background_mse", "background_psnr", "background_ssim",
-        "foreground_black_fid", "foreground_black_fvd",
-        "background_black_fid", "background_black_fvd",
+        "foreground_local_fid",
+        "foreground_black_fvd", "background_black_fvd",
     ]
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=headers, extrasaction="ignore")
@@ -698,8 +1024,8 @@ def main():
                 "mse", "psnr", "ssim", "lpips", "fid", "fvd",
                 "foreground_mse", "foreground_psnr", "foreground_ssim",
                 "background_mse", "background_psnr", "background_ssim",
-                "foreground_black_fid", "foreground_black_fvd",
-                "background_black_fid", "background_black_fvd",
+                "foreground_local_fid",
+                "foreground_black_fvd", "background_black_fvd",
             ]:
                 if k in r:
                     row[k] = (

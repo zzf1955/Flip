@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -21,6 +22,9 @@ FFMPEG = os.environ.get(
     "/home/leadtek/miniconda3/envs/flip/bin/ffmpeg",
 )
 FFPROBE = FFMPEG.replace("ffmpeg", "ffprobe")
+DEFAULT_FRAME_BATCH_SIZE = 16
+DEFAULT_VIDEO_BATCH_SIZE = 4
+ProgressCallback = Callable[[str, int, int], None]
 
 
 # ── Video IO ──────────────────────────────────────────────────────────
@@ -192,6 +196,16 @@ def _compute_frechet_metric(gen_feats: np.ndarray,
     return _frechet_distance(mu_gen, sigma_gen, mu_gt, sigma_gt)
 
 
+def _emit_progress(
+    callback: ProgressCallback | None,
+    phase: str,
+    done: int,
+    total: int,
+) -> None:
+    if callback is not None:
+        callback(phase, done, total)
+
+
 class _VideoFeatureExtractor(nn.Module):
     """Extract S3D Kinetics video features for FVD-style evaluation."""
 
@@ -238,9 +252,24 @@ class OnlineMetrics:
         # {"psnr": 18.5, "ssim": 0.72, "lpips": 0.004, "clip_score": 0.92}
     """
 
-    def __init__(self, device: str | torch.device, *, include_frechet: bool = False):
+    def __init__(
+        self,
+        device: str | torch.device,
+        *,
+        include_frechet: bool = False,
+        frame_batch_size: int = DEFAULT_FRAME_BATCH_SIZE,
+        video_batch_size: int = DEFAULT_VIDEO_BATCH_SIZE,
+        progress_callback: ProgressCallback | None = None,
+    ):
         self.device = torch.device(device)
         self.include_frechet = include_frechet
+        if frame_batch_size <= 0:
+            raise ValueError(f"frame_batch_size must be positive, got {frame_batch_size}")
+        if video_batch_size <= 0:
+            raise ValueError(f"video_batch_size must be positive, got {video_batch_size}")
+        self.frame_batch_size = frame_batch_size
+        self.video_batch_size = video_batch_size
+        self.progress_callback = progress_callback
         self._lpips: _LPIPS | None = None
         self._clip: _CLIPScorer | None = None
         self._inception: _InceptionFeatureExtractor | None = None
@@ -269,11 +298,10 @@ class OnlineMetrics:
 
         self._ensure_models()
 
-        all_psnr, all_ssim, all_lpips, all_clip = [], [], [], []
-        frame_feats_gen, frame_feats_gt = [], []
-        video_feats_gen, video_feats_gt = [], []
+        all_psnr, all_ssim = [], []
+        video_pairs: list[tuple[np.ndarray, np.ndarray]] = []
 
-        for gen_path, gt_path in pairs:
+        for pair_idx, (gen_path, gt_path) in enumerate(pairs, 1):
             gen_frames = read_video_frames(gen_path)
             gt_frames = read_video_frames(gt_path)
             if len(gen_frames) != len(gt_frames):
@@ -288,30 +316,13 @@ class OnlineMetrics:
                 all_ssim.append(structural_similarity(
                     gt_frames[t], gen_frames[t],
                     channel_axis=2, data_range=255))
+            video_pairs.append((gen_frames, gt_frames))
+            _emit_progress(self.progress_callback, "pairwise", pair_idx, len(pairs))
 
-            gen_t = (torch.from_numpy(gen_frames[:T])
-                     .permute(0, 3, 1, 2).float() / 255.0)
-            gt_t = (torch.from_numpy(gt_frames[:T])
-                    .permute(0, 3, 1, 2).float() / 255.0)
-
-            for i in range(T):
-                b_gen = gen_t[i:i + 1].to(self.device)
-                b_gt = gt_t[i:i + 1].to(self.device)
-                all_lpips.extend(
-                    self._lpips(b_gen, b_gt).cpu().tolist())
-                all_clip.extend(
-                    self._clip(b_gen, b_gt).cpu().tolist())
-
-                if self._inception is not None:
-                    gen_feats = self._inception(b_gen).cpu().numpy()
-                    gt_feats = self._inception(b_gt).cpu().numpy()
-                    frame_feats_gen.append(gen_feats)
-                    frame_feats_gt.append(gt_feats)
-            if self._video is not None:
-                video_gen = gen_t.permute(1, 0, 2, 3).unsqueeze(0).to(self.device)
-                video_gt = gt_t.permute(1, 0, 2, 3).unsqueeze(0).to(self.device)
-                video_feats_gen.append(self._video(video_gen).cpu().numpy())
-                video_feats_gt.append(self._video(video_gt).cpu().numpy())
+        all_lpips = self._compute_frame_scores(
+            self._lpips, video_pairs, "lpips")
+        all_clip = self._compute_frame_scores(
+            self._clip, video_pairs, "clip")
 
         result = {
             "psnr": float(np.mean(all_psnr)),
@@ -319,20 +330,115 @@ class OnlineMetrics:
             "lpips": float(np.mean(all_lpips)),
             "clip_score": float(np.mean(all_clip)),
         }
-        if self._inception is not None and frame_feats_gen:
+        if self._inception is not None:
+            frame_feats_gen, frame_feats_gt = self._compute_inception_features(video_pairs)
+            video_feats_gen, video_feats_gt = self._compute_video_features(video_pairs)
             fid = _compute_frechet_metric(
-                np.concatenate(frame_feats_gen, axis=0),
-                np.concatenate(frame_feats_gt, axis=0),
+                frame_feats_gen,
+                frame_feats_gt,
             )
-            fvd = _compute_frechet_metric(
-                np.concatenate(video_feats_gen, axis=0),
-                np.concatenate(video_feats_gt, axis=0),
-            )
+            fvd = _compute_frechet_metric(video_feats_gen, video_feats_gt)
             if fid is not None:
                 result["fid"] = fid
             if fvd is not None:
                 result["fvd"] = fvd
         return result
+
+    def _compute_frame_scores(
+        self,
+        model: nn.Module,
+        video_pairs: list[tuple[np.ndarray, np.ndarray]],
+        phase: str,
+    ) -> list[float]:
+        scores = []
+        batch_gen: list[np.ndarray] = []
+        batch_gt: list[np.ndarray] = []
+        total = sum(len(gen) for gen, _ in video_pairs)
+        done = 0
+
+        def flush_batch() -> None:
+            nonlocal done
+            if not batch_gen:
+                return
+            gen_t = (
+                torch.from_numpy(np.stack(batch_gen, axis=0))
+                .permute(0, 3, 1, 2)
+                .float()
+                / 255.0
+            )
+            gt_t = (
+                torch.from_numpy(np.stack(batch_gt, axis=0))
+                .permute(0, 3, 1, 2)
+                .float()
+                / 255.0
+            )
+            scores.extend(model(gen_t.to(self.device), gt_t.to(self.device)).cpu().tolist())
+            done += len(batch_gen)
+            _emit_progress(self.progress_callback, phase, done, total)
+            batch_gen.clear()
+            batch_gt.clear()
+
+        for gen_frames, gt_frames in video_pairs:
+            for gen_frame, gt_frame in zip(gen_frames, gt_frames):
+                batch_gen.append(gen_frame)
+                batch_gt.append(gt_frame)
+                if len(batch_gen) == self.frame_batch_size:
+                    flush_batch()
+        flush_batch()
+        return [float(score) for score in scores]
+
+    def _compute_inception_features(
+        self,
+        video_pairs: list[tuple[np.ndarray, np.ndarray]],
+    ) -> tuple[np.ndarray, np.ndarray]:
+        gen_frames = np.concatenate([gen for gen, _ in video_pairs], axis=0)
+        gt_frames = np.concatenate([gt for _, gt in video_pairs], axis=0)
+        return (
+            self._compute_frame_features(gen_frames, self._inception, "fid/gen"),
+            self._compute_frame_features(gt_frames, self._inception, "fid/gt"),
+        )
+
+    def _compute_frame_features(
+        self,
+        frames: np.ndarray,
+        model: nn.Module,
+        phase: str,
+    ) -> np.ndarray:
+        feats = []
+        total = len(frames)
+        for i in range(0, total, self.frame_batch_size):
+            chunk = frames[i:i + self.frame_batch_size]
+            batch = torch.from_numpy(chunk).permute(0, 3, 1, 2).float() / 255.0
+            feats.append(model(batch.to(self.device)).cpu().numpy())
+            _emit_progress(self.progress_callback, phase, min(i + len(chunk), total), total)
+        return np.concatenate(feats, axis=0)
+
+    def _compute_video_features(
+        self,
+        video_pairs: list[tuple[np.ndarray, np.ndarray]],
+    ) -> tuple[np.ndarray, np.ndarray]:
+        return (
+            self._compute_s3d_features([gen for gen, _ in video_pairs], "fvd/gen"),
+            self._compute_s3d_features([gt for _, gt in video_pairs], "fvd/gt"),
+        )
+
+    def _compute_s3d_features(
+        self,
+        videos: list[np.ndarray],
+        phase: str,
+    ) -> np.ndarray:
+        feats = []
+        total = len(videos)
+        for i in range(0, total, self.video_batch_size):
+            chunk = videos[i:i + self.video_batch_size]
+            tensors = [
+                torch.from_numpy(video).permute(3, 0, 1, 2).float() / 255.0
+                for video in chunk
+            ]
+            batch = torch.stack(tensors, dim=0)
+            feats.append(self._video(batch.to(self.device)).cpu().numpy())
+            _emit_progress(self.progress_callback, phase, min(i + len(chunk), total), total)
+        return np.concatenate(feats, axis=0)
 
     @staticmethod
     def _find_pairs(step_dir: str) -> list[tuple[str, str]]:
