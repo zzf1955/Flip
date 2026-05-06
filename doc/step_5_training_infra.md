@@ -77,9 +77,11 @@ Seedance direct 的 1s 训练数据由 `src.pipeline.seedance_clip` 从
 - `Inspire_Put_Clothes_into_Washing_Machine`
 
 数据本身不再预先切成 `train/eval/ood_eval`。磁盘只按物理属性组织；
-训练时通过 CLI 指定 `--train-tasks` 与 `--ood-tasks`，再按 `--data-seed`
-运行时确定 train / in-task eval / OOD eval。默认 preset 使用 Basket + Washing
-作为 in-task，Pillow 作为 OOD。
+训练时通过 CLI 指定 `--train-tasks` 与 `--ood-tasks`。每个 task 的
+`training_data/pair/<data_type>/<duration>/<robot_task>/pair_order.jsonl`
+保存该 task 的固定 pair 乱序表；第一次训练缺失该表时用 `--data-seed`
+生成，之后训练只读取并校验，不会重新洗牌。默认 preset 使用 Basket +
+Washing 作为 in-task，Pillow 作为 OOD。
 
 四类数据类型：
 
@@ -105,7 +107,8 @@ training_data/pair/
         │   ├── video/pair_NNNN.mp4
         │   ├── control_video/pair_NNNN.mp4
         │   ├── metadata.csv
-        │   └── manifest.jsonl
+        │   ├── manifest.jsonl
+        │   └── pair_order.jsonl
         └── index.jsonl
 
 training_data/cache/
@@ -129,6 +132,23 @@ T5 embedding 不再重复嵌入每个样本文件。T5 cache 目录与数据类�
 正式训练入口通过 `src/pipeline/train_config.py` 的 `--task-name` 选择 preset，
 也可用 CLI 覆盖 `--data-type`、`--duration`、`--train-tasks`、`--ood-tasks`
 以及各类 size。
+
+运行时 split 规则：
+
+- pair 顺序来自各 task pair 目录下的 `pair_order.jsonl`。如果文件不存在，
+  训练入口会按 `--data-seed` 从该 task 的 `manifest.jsonl` 生成一次；如果文件
+  已存在，后续运行会复用该顺序并校验它与 manifest/cache 是否一致。
+- `--train-size` 是全局训练样本数；训练入口先按各 in-task task 在扣除 eval
+  尾部后的可用样本量做比例分配，再从每个 task 顺序表头部取对应数量。
+- `--in-task-eval-size` 为正数时表示全局 in-task eval 样本数，按 task 数据量
+  比例分配后从各 task 顺序表尾部取；`0/-1` 表示自动使用约 10% 的尾部样本，
+  并至少保留一个样本可用于训练。
+- `--ood-eval-size` 为正数时按 OOD task 数据量比例分配，并从各 OOD task
+  顺序表尾部取；`0/-1` 表示使用全部 OOD 样本。
+- eval video 子采样不再随 step 改变，同一个 run 的不同 eval step 使用同一批
+  eval video 样本，便于肉眼和指标对比。
+- 训练启动日志会打印每个 split 下各 task 的实际样本数，并在
+  `data_split/config.json` 记录 `split_counts` 和 `pair_order_paths`。
 
 ## 生成 Cache
 
@@ -312,7 +332,9 @@ scripts/train_lora_grid.py \
 | --- | --- |
 | `--merge-lora` | 空格或逗号分隔的 checkpoint 列表；训练入口会在加载时自动检测每个 merge LoRA 的 rank 与 target modules |
 | `--task-name` / `--data-type` / `--duration` | 数据 preset 与可选覆盖；默认 task 分配来自 `train_config.py` |
-| `--train-size` | 固定搜索用训练数据量；in-task/OOD eval/video size 可分别用对应参数设置 |
+| `--pair-root` | pair 数据根目录，默认 `MAIN_ROOT/training_data/pair`；其中每个 task 目录保存 `pair_order.jsonl` |
+| `--train-size` | 固定搜索用训练数据量；按各 train task 可用样本量比例分配，`0/-1` 使用扣除 eval 尾部后的全部训练样本 |
+| `--in-task-eval-size` | in-task eval 总样本数；正数按 task 比例分配并从顺序表尾部取，`0/-1` 自动使用约 10% 尾部样本 |
 | `--layouts` | layout 短名列表，支持 `self_qkv`、`self_qkvo`、`cross_qkv`、`cross_qkvo`、`self_qkv_cross_qkv`、`self_qkvo_cross_qkvo`、`ffn`、`self_qkv_ffn`、`self_qkvo_ffn`、`self_qkv_cross_qkv_ffn`、`self_qkvo_cross_qkvo_ffn` |
 | `--ranks` | 逗号分隔的 LoRA rank 列表 |
 | `--cuda` | 逗号分隔 CUDA id；展开后的实验按顺序轮转分配，并逐个等待完成 |
@@ -354,7 +376,7 @@ scripts/flip_run.sh train --cuda 2,3 --nproc 2 -- \
 `train` 的 DDP 评估规则：
 
 - `eval loss` 按 cache 文件索引在所有 rank 间切分，每个 rank 计算自己的子集，再 `all_reduce` 成全局均值；随机种子使用全局样本索引，避免 GPU 数量变化改变评估语义。
-- `eval video` 按待生成视频的全局样本索引在所有 rank 间切分；所有 rank 写入同一个 `step-XXXX/`，文件名仍为 `gen_00.mp4`、`gt_00.mp4`、`ctrl_00.mp4` 这类全局编号。
+- `eval video` 的样本集合由 `--data-seed` 和 eval split 固定，不随 step 改变；生成时按待生成视频的全局样本索引在所有 rank 间切分，所有 rank 写入同一个 `step-XXXX/`，文件名仍为 `gen_00.mp4`、`gt_00.mp4`、`ctrl_00.mp4` 这类全局编号。
 - CSV、W&B、eval video 上传和在线指标只在 rank 0 执行；视频生成完成后会用 DDP barrier 等待所有 rank 写完。默认在线指标为 PSNR/SSIM/LPIPS/CLIP/FID/FVD；FID 使用 InceptionV3 pool3 逐帧特征计算帧级 Frechet 距离，FVD 使用 torchvision S3D Kinetics-400 1024-d 时空视频特征计算视频级 Frechet 距离。在线指标当前按单帧 batch 执行帧级模型，并逐视频执行 S3D，以降低显存峰值，但会明显增加 eval 阶段耗时，并在 rank 0 训练卡上多占显存。如需关闭 FID/FVD，加 `--no-eval-video-frechet-metrics`；正式对比也可训练后用 `src.pipeline.evaluate_mitty_models` 或 `src.tools.eval_metrics` 离线计算。FID/FVD 是分布指标，样本太少时方差很大，正式汇报建议使用几十条以上视频。
 - 正式实验默认 `--max-steps 1000 --save-steps 100 --eval-steps 100 --eval-video-steps 100`；smoke/debug 可临时调小。
 - `--loss`、`--patch-dir` 已从正式训练入口移除，当前统一使用标准 Mitty loss。
