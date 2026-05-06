@@ -223,27 +223,30 @@ CUDA_VISIBLE_DEVICES=2 python -m src.pipeline.mitty_cache \
 
 ## 离线综合评估
 
-`src.pipeline.evaluate_mitty_models` 用于比较训练完成的 Mitty LoRA run：先从
-`training_data/cache/vae/pair_1s/{eval,ood_eval}` 读取 1s pair cache 生成视频，
-再使用 `training_data/pair/1s/{split}/video` 中的原始 robot MP4 作为 GT，
-计算 PSNR、SSIM、LPIPS、FID 和 FVD。默认评估：
+`src.pipeline.evaluate_mitty_models` 用于比较训练完成的 Mitty LoRA run：按
+训练入口相同的 task 级 `pair_order.jsonl` 顺序表选择样本，从每个 in-task
+task 和 OOD task 的顺序表尾部读取 `--eval-tail-percent`，再用对应 VAE cache
+生成视频，并复制 pair 目录中的原始 `video` / `control_video` 作为 GT 和
+Control，计算 PSNR、SSIM、LPIPS、FID 和 FVD。默认评估：
 
 - `Mitty-transfer-124d_r128_2000s_0425_1456/ckpt/step-2000.safetensors`
 - `Mitty-transfer2LoRA-124d_r128_2000s_0425_1425/ckpt/step-2000.safetensors`
-- `eval` 32 条 + `ood_eval` 32 条，即用户口径的 `32+32`
+- `pair_1s` preset 下每个 in-task/OOD task 的尾部 10%
 
 推荐通过统一入口运行 GPU 评估：
 
 ```bash
 scripts/flip_run.sh eval_mitty --cuda 2 -- \
   --device cuda:0 \
-  --samples-per-split 32
+  --eval-tail-percent 10
 ```
 
-输出目录默认是 `training_data/eval/mitty_pair_1s/`：每个 run/checkpoint/split
-下保存 `gen_*.mp4`、`gt_*.mp4`、`ctrl_*.mp4`，并在根目录写出
-`summary.csv` 与 `summary.json`。如只想复算已有视频的指标，可加
-`--no-generate`；如评估全集，可设 `--samples-per-split -1`。
+输出目录默认写在对应 ckpt 旁边：`training_data/log/<run>/ckpt/<step>_eval/`。
+每个 split 下保存 `gen_*.mp4`、`gt_*.mp4`、`ctrl_*.mp4`，并在该目录写出
+`summary.csv`、`summary.json` 和 `data_split/` 选择记录。可用 `--splits
+in_task_eval ood_eval` 指定 split；`eval` 是 `in_task_eval` 的兼容别名，
+`ood` 是 `ood_eval` 的兼容别名。如只想复算已有视频的指标，可加
+`--no-generate`；如需继续写到集中目录，可显式传 `--output-dir`。
 
 ### 冒烟训练
 
