@@ -36,8 +36,9 @@
 - `Inspire_Put_Clothes_into_Washing_Machine`
 
 数据目录不再预切 `train/eval/ood_eval`；磁盘按 `data_type / duration / robot_task`
-组织，训练运行时用 `--train-tasks` 和 `--ood-tasks` 决定 in-task 与 OOD。默认 preset
-使用 Basket + Washing 作为 in-task，Pillow 作为 OOD。
+组织，训练运行时用 `--train-tasks` 和 `--ood-tasks` 决定 in-task 与 OOD。每个
+task 的 pair 目录会保存一次性生成的 `pair_order.jsonl`，后续训练都从该固定顺序表
+划分 train/eval。默认 preset 使用 Basket + Washing 作为 in-task，Pillow 作为 OOD。
 
 ### Phase 1 数据结构
 
@@ -46,7 +47,8 @@ training_data/pair/identity_r2r/1s/<robot_task>/
 ├── video/pair_NNNN.mp4
 ├── control_video/pair_NNNN.mp4
 ├── metadata.csv
-└── manifest.jsonl
+├── manifest.jsonl
+└── pair_order.jsonl
 
 training_data/cache/vae/identity_r2r/1s/<robot_task>/
 ├── pair_NNNN.pth
@@ -55,6 +57,8 @@ training_data/cache/vae/identity_r2r/1s/<robot_task>/
 
 identity 数据中 `control_video` 和 `video` 内容一致，cache 内会记录
 `data_type=identity_r2r`、`robot_task`、`source_id`、`source_segment_id` 等运行时 split 字段。
+训练入口会从 `pair_order.jsonl` 的头部按 task 比例取训练样本，从尾部取 eval 样本；
+启动日志会打印每个 task 实际进入 train / in-task eval / OOD eval 的样本数。
 
 ### Phase 2 数据结构
 
