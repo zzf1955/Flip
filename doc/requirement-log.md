@@ -3,6 +3,27 @@
 ## 2026-05-06
 
 **用户原始需求：**
+> 看一下当前计算 metrics 的代码,加一个功能. 从 blur_r2r 的 mask 中读数据,将 Video 分割成 前景和背景,然后计算分割之后的视频的 fid/fvd in task/ood task
+
+**创建的任务：**
+- [040] mask-region FID/FVD eval for blur_r2r
+
+**完成改动：**
+- `src/tools/eval_metrics.py`：新增 SAM2 mask 路径解析、clip mask 对齐、前景/背景视频拆分，并在 `process_step` 中支持区域 Frechet 指标。
+- `src/pipeline/evaluate_mitty_models.py`：`data_type=blur_r2r` 时默认启用 mask-region 指标，覆盖 `in_task_eval` 和 `ood_eval`；支持 `--mask-region-metrics off/on/auto` 与 `--sam2-mask-root`。
+- `tests/test_eval_mask_regions.py`、`doc/step_5_training_infra.md`：补充 mask 对齐/区域拆分测试和离线评估文档。
+
+**追加改动：**
+- `src/tools/eval_metrics.py`：新增全局 `mse`，局部 `foreground_mse`、`foreground_psnr`、`foreground_ssim`、`background_mse`、`background_psnr`、`background_ssim`；局部 MSE/PSNR/SSIM 只统计 mask 内/外像素。
+- 区域 Frechet 字段改为黑底口径命名：`foreground_black_fid`、`foreground_black_fvd`、`background_black_fid`、`background_black_fvd`。
+- `--no-fid` 只关闭全局和黑底区域 FID/FVD，不关闭局部 MSE/PSNR/SSIM。
+- `src/pipeline/evaluate_mitty_models.py` 与文档同步输出字段。
+
+---
+
+## 2026-05-06
+
+**用户原始需求：**
 > 看一下当前计算 eval metrics 的代码。现在需要改成：1. 按照数据划分表，从表后面读取 k% 来进行 eval；2. eval 完之后，把结果写到对应 ckpt 的位置。
 
 **直接修改：**

@@ -248,6 +248,19 @@ in_task_eval ood_eval` 指定 split；`eval` 是 `in_task_eval` 的兼容别名�
 `ood` 是 `ood_eval` 的兼容别名。如只想复算已有视频的指标，可加
 `--no-generate`；如需继续写到集中目录，可显式传 `--output-dir`。
 
+当评估数据类型为 `blur_r2r` 时，`evaluate_mitty_models` 默认会启用
+mask-region Frechet 指标：从
+`training_data/sam2_mask/<task>/<episode>/<seg>.npz` 读取与该 clip 对齐的
+机器人 mask，按 `clip_start` / `clip_dur` / `augment` 对齐。summary 会额外写出
+全局 `mse`，以及局部 `foreground_mse`、`foreground_psnr`、
+`foreground_ssim`、`background_mse`、`background_psnr`、`background_ssim`；
+这些局部配对指标只统计 mask 内或 mask 外像素，不比较黑底区域。FID/FVD 仍需
+完整 RGB 视频输入，因此区域 Frechet 指标使用黑底视频口径，并写为
+`foreground_black_fid`、`foreground_black_fvd`、`background_black_fid`、
+`background_black_fvd`。缺少 mask 或 manifest 缺少对齐字段会直接报错。可用
+`--mask-region-metrics off` 关闭，或用 `--sam2-mask-root` 指向其他 SAM2 mask
+根目录。`--no-fid` 只会关闭全局和黑底区域 FID/FVD，局部 MSE/PSNR/SSIM 仍会计算。
+
 ### 冒烟训练
 
 ```bash

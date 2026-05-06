@@ -3,7 +3,10 @@
 The script evaluates one or more trained ``training_data/log/<run>`` folders on
 the task-level runtime data split. For each model and split it first generates
 ``gen_XX.mp4`` videos, writes matched ``gt_XX.mp4`` / ``ctrl_XX.mp4`` videos, then computes
-PSNR / SSIM / LPIPS / FID / FVD with ``src.tools.eval_metrics``.
+MSE / PSNR / SSIM / LPIPS / FID / FVD with ``src.tools.eval_metrics``.
+For ``blur_r2r`` it also reads the selected clip's SAM2 robot masks and computes
+foreground/background pairwise metrics plus black-background FID/FVD for both
+in-task and OOD splits.
 
 Default target:
   - Mitty-transfer-124d_r128_2000s_0425_1456
@@ -49,6 +52,7 @@ DEFAULT_RUNS = [
     "Mitty-transfer2LoRA-124d_r128_2000s_0425_1425",
 ]
 DEFAULT_SPLITS = ["in_task_eval", "ood_eval"]
+DEFAULT_SAM2_MASK_ROOT = Path(TRAINING_DATA_ROOT) / "sam2_mask"
 SPLIT_ALIASES = {
     "eval": "in_task_eval",
     "in_task": "in_task_eval",
@@ -215,6 +219,8 @@ def write_selected_records(base_dir: Path, splits: list[str], runtime_split: Run
         "train_tasks": args.train_tasks,
         "ood_tasks": args.ood_tasks,
         "eval_tail_percent": args.eval_tail_percent,
+        "mask_region_metrics": args.mask_region_metrics,
+        "sam2_mask_root": args.sam2_mask_root,
         "data_seed": args.data_seed,
         "cache_root": args.cache_root,
         "pair_root": args.pair_root,
@@ -293,6 +299,8 @@ def compute_rows(
     device: torch.device,
     no_lpips: bool,
     no_fid: bool,
+    runtime_split: RuntimeSplit,
+    sam2_mask_root: str | None,
 ) -> list[dict]:
     lpips_model, inception, video_extractor = metric_models(device, no_lpips, no_fid)
     rows = []
@@ -300,8 +308,16 @@ def compute_rows(
         base_dir = eval_base_dir(run, output_dir)
         for split in splits:
             split_out = base_dir / split
+            selected_records = records_for_split(split, runtime_split) if sam2_mask_root else None
             metrics = process_step(
-                str(split_out), lpips_model, inception, video_extractor, device)
+                str(split_out),
+                lpips_model,
+                inception,
+                video_extractor,
+                device,
+                selected_records=selected_records,
+                sam2_mask_root=sam2_mask_root,
+            )
             if not metrics:
                 raise RuntimeError(f"No gen/gt pairs found in {split_out}")
             row = {
@@ -320,7 +336,12 @@ def compute_rows(
 def write_csv(rows: list[dict], path: Path):
     headers = [
         "run", "checkpoint", "split", "n_samples",
-        "psnr", "ssim", "lpips", "fid", "fvd", "out_dir", "summary_dir",
+        "mse", "psnr", "ssim", "lpips", "fid", "fvd",
+        "foreground_mse", "foreground_psnr", "foreground_ssim",
+        "background_mse", "background_psnr", "background_ssim",
+        "foreground_black_fid", "foreground_black_fvd",
+        "background_black_fid", "background_black_fvd",
+        "out_dir", "summary_dir",
     ]
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="") as f:
@@ -384,6 +405,15 @@ def main():
     ap.add_argument("--no-lpips", action="store_true")
     ap.add_argument("--no-fid", action="store_true",
                     help="skip both FID and FVD")
+    ap.add_argument("--mask-region-metrics",
+                    choices=["auto", "on", "off"], default="auto",
+                    help="compute mask-region local metrics and black-background "
+                         "FID/FVD from SAM2 masks; auto enables this for blur_r2r")
+    ap.add_argument("--mask-region-frechet-metrics",
+                    choices=["auto", "on", "off"], default=None,
+                    help="deprecated alias for --mask-region-metrics")
+    ap.add_argument("--sam2-mask-root", default=str(DEFAULT_SAM2_MASK_ROOT),
+                    help="SAM2 mask root for mask-region FID/FVD")
     args = ap.parse_args()
     output_dir_provided = bool(args.output_dir)
 
@@ -419,6 +449,16 @@ def main():
 
     if args.no_generate and args.generate_only:
         ap.error("--no-generate and --generate-only are mutually exclusive")
+    if args.mask_region_frechet_metrics is not None:
+        args.mask_region_metrics = args.mask_region_frechet_metrics
+    mask_region_enabled = (
+        args.mask_region_metrics == "on"
+        or (
+            args.mask_region_metrics == "auto"
+            and args.data_type == "blur_r2r"
+        )
+    )
+    sam2_mask_root = str(resolve_path(args.sam2_mask_root)) if mask_region_enabled else None
 
     if not args.no_generate:
         t5_pos, t5_neg = load_t5_cache(str(t5_dir), device="cpu")
@@ -477,6 +517,8 @@ def main():
         device=device,
         no_lpips=args.no_lpips,
         no_fid=args.no_fid,
+        runtime_split=runtime_split,
+        sam2_mask_root=sam2_mask_root,
     )
 
     for run in run_specs:
