@@ -7,6 +7,7 @@ from pathlib import Path
 from src.pipeline.runtime_data import (
     PAIR_ORDER_FILENAME,
     build_runtime_split,
+    build_tail_eval_split,
     sample_eval_video_files,
 )
 
@@ -106,6 +107,53 @@ class RuntimeDataSplitTest(unittest.TestCase):
         later = sample_eval_video_files(files, 4, data_seed=42, step=100, split_name="in_task")
 
         self.assertEqual(first, later)
+
+    def test_tail_eval_split_reads_percent_from_pair_order_tail(self):
+        with tempfile.TemporaryDirectory() as tmp_name:
+            tmp = Path(tmp_name)
+            pair_root = tmp / "pair"
+            cache_root = tmp / "cache" / "vae"
+            _make_task(pair_root, cache_root, "h2r", "1s", "Task_A", 10)
+            _make_task(pair_root, cache_root, "h2r", "1s", "Task_B", 20)
+            _make_task(pair_root, cache_root, "h2r", "1s", "Task_C", 5)
+
+            args = _args(tmp, data_seed=42)
+            args.eval_tail_percent = 20.0
+            split = build_tail_eval_split(args)
+
+            expected_eval = []
+            for task in ("Task_A", "Task_B"):
+                order_path = pair_root / "h2r" / "1s" / task / PAIR_ORDER_FILENAME
+                ordered = [
+                    json.loads(line)["pair_id"]
+                    for line in order_path.read_text().splitlines()
+                ]
+                expected_eval.extend(
+                    (task, pair_id)
+                    for pair_id in ordered[-max(1, len(ordered) // 5):]
+                )
+
+            expected_ood = []
+            order_path = pair_root / "h2r" / "1s" / "Task_C" / PAIR_ORDER_FILENAME
+            ordered = [
+                json.loads(line)["pair_id"]
+                for line in order_path.read_text().splitlines()
+            ]
+            expected_ood.extend(("Task_C", pair_id) for pair_id in ordered[-1:])
+
+            actual_eval = [
+                (record["robot_task"], record["pair_id"])
+                for record in split.eval_records
+            ]
+            actual_ood = [
+                (record["robot_task"], record["pair_id"])
+                for record in split.ood_records
+            ]
+
+            self.assertEqual(actual_eval, expected_eval)
+            self.assertEqual(actual_ood, expected_ood)
+            self.assertEqual(split.split_counts["in_task_eval"], {"Task_A": 2, "Task_B": 4})
+            self.assertEqual(split.split_counts["ood_eval"], {"Task_C": 1})
 
 
 if __name__ == "__main__":

@@ -3,6 +3,18 @@
 ## 2026-05-06
 
 **用户原始需求：**
+> 看一下当前计算 eval metrics 的代码。现在需要改成：1. 按照数据划分表，从表后面读取 k% 来进行 eval；2. eval 完之后，把结果写到对应 ckpt 的位置。
+
+**直接修改：**
+- `src/pipeline/runtime_data.py`：新增 `build_tail_eval_split`，按每个 task 的 `pair_order.jsonl` 尾部百分比选择 in-task/OOD eval 样本。
+- `src/pipeline/evaluate_mitty_models.py`：离线综合评估改为读取 task 级顺序表尾部 `--eval-tail-percent`，默认结果写到 `training_data/log/<run>/ckpt/<step>_eval/`，并保存 `summary.*` 与 `data_split/`。
+- `tests/test_runtime_data.py`、`scripts/flip_run.sh`、`doc/step_5_training_infra.md`：补充尾部百分比选择测试、入口示例和离线评估文档。
+
+---
+
+## 2026-05-06
+
+**用户原始需求：**
 > 当前训练每一轮 eval 数据不同，需要统一。每个 task 的 pair 目录下生成一次乱序表，例如 `training_data/pair/blur_r2r/1s/Inspire_Collect_Clothes_MainCamOnly`；训练时从这个表取数据，按 pair 划分，不按 segment；`--train-size` 按 task 比例分配，并在训练前打印每个数据集选了多少 training size。
 
 **创建的任务：**
