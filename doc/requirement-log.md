@@ -3,6 +3,22 @@
 ## 2026-05-06
 
 **用户原始需求：**
+> eval mitty 脚本太大需要拆分；当前 FVD 是黑色背景 FVD，应改成 Local FVD；当前输出的 local fid 视频文件夹里视频没有标记哪些区域参与计算，需要改进。
+
+**创建的任务：**
+- [043] 重构 Mitty 离线评估与 Local FVD
+
+**完成改动：**
+- `src/pipeline/evaluate_mitty_models.py`：保留为离线 Mitty eval 入口，run/spec、CLI、生成、Local 视频输出和 summary 写入拆到 `src/pipeline/eval_mitty/`。
+- `src/tools/eval_metrics.py`：区域 FVD 改为 bbox crop Local FVD，输出字段为 `foreground_local_fvd`；旧黑底区域 FVD 字段不再输出。
+- `--write-local-videos`：除 Local crop 视频外，新增原始画面 overlay 视频和三列 overlay compare，用 mask 与 bbox 标出参与 Local FID / Local FVD 计算的区域。
+- `doc/step_5_training_infra.md`：同步 Local FVD 字段、`--no-fid` 影响范围和 Local 视频输出说明。
+
+---
+
+## 2026-05-06
+
+**用户原始需求：**
 > 看一下当前计算 metrics 的代码,加一个功能. 从 blur_r2r 的 mask 中读数据,将 Video 分割成 前景和背景,然后计算分割之后的视频的 fid/fvd in task/ood task
 
 **创建的任务：**

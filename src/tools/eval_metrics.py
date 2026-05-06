@@ -10,8 +10,8 @@ Metrics:
   - LPIPS  (perceptual distance via VGG, lower is better)
   - FID    (Frechet Inception Distance across all frames, lower is better)
   - FVD    (Frechet Video Distance via S3D video features, lower is better)
-  - foreground/background MSE/PSNR/SSIM, foreground Local FID, and
-    black-background FVD when SAM2 masks are available and selected
+  - foreground/background MSE/PSNR/SSIM plus foreground Local FID/FVD when
+    SAM2 masks are available and selected
 
 Usage:
   python -m src.tools.eval_metrics --run 2026-04-18_163933
@@ -47,7 +47,6 @@ FFMPEG = os.environ.get(
 FFPROBE = FFMPEG.replace("ffmpeg", "ffprobe")
 SEGMENT_FPS = 30.0
 TARGET_FPS = 16.0
-REGION_NAMES = ("foreground", "background")
 LOCAL_FID_MARGIN = 24
 LOCAL_FID_SIZE = 299
 DEFAULT_METRIC_WORKERS = min(8, os.cpu_count() or 1)
@@ -157,18 +156,6 @@ def load_clip_mask_stack(
             f"mask={clip_masks.shape[1:]}, frame={(expected_h, expected_w)}"
         )
     return (clip_masks > 128)
-
-
-def split_video_by_mask(frames: np.ndarray, masks: np.ndarray) -> dict[str, np.ndarray]:
-    if frames.ndim != 4 or frames.shape[-1] != 3:
-        raise ValueError(f"Expected video frames shape (T,H,W,3), got {frames.shape}")
-    if masks.shape != frames.shape[:3]:
-        raise ValueError(f"Mask shape {masks.shape} does not match frames {frames.shape[:3]}")
-    keep_foreground = masks[..., None]
-    return {
-        "foreground": np.where(keep_foreground, frames, 0).astype(np.uint8),
-        "background": np.where(~keep_foreground, frames, 0).astype(np.uint8),
-    }
 
 
 def mask_bbox(mask: np.ndarray, margin: int = LOCAL_FID_MARGIN) -> tuple[int, int, int, int]:
@@ -606,6 +593,40 @@ def collect_video_features(
     return np.concatenate(feats, axis=0)
 
 
+def collect_local_video_features(
+    video_arrays: list[np.ndarray],
+    mask_arrays: list[np.ndarray],
+    extractor: VideoFeatureExtractor,
+    device: torch.device,
+    margin: int = LOCAL_FID_MARGIN,
+    batch_size: int = DEFAULT_FVD_BATCH_SIZE,
+    progress_callback: ProgressCallback | None = None,
+    progress_phase: str = "local_fvd",
+) -> np.ndarray:
+    """Extract S3D features from mask-bbox video crops for Local FVD."""
+    if len(video_arrays) != len(mask_arrays):
+        raise ValueError(
+            f"Video/mask count mismatch: {len(video_arrays)} vs {len(mask_arrays)}"
+        )
+    cropped_videos = [
+        crop_video_by_mask_bbox(
+            video,
+            masks,
+            margin=margin,
+            output_size=VideoFeatureExtractor.SIZE,
+        )
+        for video, masks in zip(video_arrays, mask_arrays)
+    ]
+    return collect_video_features(
+        cropped_videos,
+        extractor,
+        device,
+        batch_size=batch_size,
+        progress_callback=progress_callback,
+        progress_phase=progress_phase,
+    )
+
+
 def compute_fvd(
     gen_videos: list[np.ndarray],
     gt_videos: list[np.ndarray],
@@ -631,6 +652,47 @@ def compute_fvd(
     )
     feats_gt = collect_video_features(
         gt_videos,
+        extractor,
+        device,
+        batch_size=batch_size,
+        progress_callback=progress_callback,
+        progress_phase=f"{progress_prefix}/gt",
+    )
+    mu_gen, sigma_gen = feats_gen.mean(0), np.cov(feats_gen, rowvar=False)
+    mu_gt, sigma_gt = feats_gt.mean(0), np.cov(feats_gt, rowvar=False)
+    if sigma_gen.ndim < 2:
+        return None
+    return frechet_distance(mu_gen, sigma_gen, mu_gt, sigma_gt)
+
+
+def compute_local_fvd(
+    gen_videos: list[np.ndarray],
+    gt_videos: list[np.ndarray],
+    masks: list[np.ndarray],
+    extractor: VideoFeatureExtractor,
+    device: torch.device,
+    batch_size: int = DEFAULT_FVD_BATCH_SIZE,
+    progress_callback: ProgressCallback | None = None,
+    progress_prefix: str = "foreground_local_fvd",
+) -> float | None:
+    """Compute Local FVD from mask-bbox video crops.
+
+    Returns None if too few videos are available for covariance estimation.
+    """
+    if len(gen_videos) < 2:
+        return None
+    feats_gen = collect_local_video_features(
+        gen_videos,
+        masks,
+        extractor,
+        device,
+        batch_size=batch_size,
+        progress_callback=progress_callback,
+        progress_phase=f"{progress_prefix}/gen",
+    )
+    feats_gt = collect_local_video_features(
+        gt_videos,
+        masks,
         extractor,
         device,
         batch_size=batch_size,
@@ -745,8 +807,6 @@ def process_step(
         "background_ssim": [],
     }
     gen_videos, gt_videos = [], []
-    region_gen_videos = {name: [] for name in REGION_NAMES}
-    region_gt_videos = {name: [] for name in REGION_NAMES}
     local_fid_masks = []
     pair_data: list[PairMetricData] = []
 
@@ -782,11 +842,6 @@ def process_step(
         gt_videos.append(gt_frames)
 
         if masks is not None:
-            split_gen = split_video_by_mask(gen_frames, masks)
-            split_gt = split_video_by_mask(gt_frames, masks)
-            for name in REGION_NAMES:
-                region_gen_videos[name].append(split_gen[name])
-                region_gt_videos[name].append(split_gt[name])
             local_fid_masks.append(masks)
 
         m = item.metrics
@@ -858,18 +913,18 @@ def process_step(
         if fvd is not None:
             result["fvd"] = fvd
         if selected_records is not None:
-            for name in REGION_NAMES:
-                fvd = compute_fvd(
-                    region_gen_videos[name],
-                    region_gt_videos[name],
-                    video_extractor,
-                    device,
-                    batch_size=fvd_batch_size,
-                    progress_callback=progress_callback,
-                    progress_prefix=f"{name}_black_fvd",
-                )
-                if fvd is not None:
-                    result[f"{name}_black_fvd"] = fvd
+            fvd = compute_local_fvd(
+                gen_videos,
+                gt_videos,
+                local_fid_masks,
+                video_extractor,
+                device,
+                batch_size=fvd_batch_size,
+                progress_callback=progress_callback,
+                progress_prefix="foreground_local_fvd",
+            )
+            if fvd is not None:
+                result["foreground_local_fvd"] = fvd
 
     return result
 
@@ -1012,8 +1067,7 @@ def main():
         "mse", "psnr", "ssim", "lpips", "fid", "fvd",
         "foreground_mse", "foreground_psnr", "foreground_ssim",
         "background_mse", "background_psnr", "background_ssim",
-        "foreground_local_fid",
-        "foreground_black_fvd", "background_black_fvd",
+        "foreground_local_fid", "foreground_local_fvd",
     ]
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=headers, extrasaction="ignore")
@@ -1024,8 +1078,7 @@ def main():
                 "mse", "psnr", "ssim", "lpips", "fid", "fvd",
                 "foreground_mse", "foreground_psnr", "foreground_ssim",
                 "background_mse", "background_psnr", "background_ssim",
-                "foreground_local_fid",
-                "foreground_black_fvd", "background_black_fvd",
+                "foreground_local_fid", "foreground_local_fvd",
             ]:
                 if k in r:
                     row[k] = (
