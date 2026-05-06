@@ -4,11 +4,14 @@ Scans a training run's eval/ directory, pairs gen_XX.mp4 with gt_XX.mp4,
 and computes per-frame and per-video metrics.
 
 Metrics:
+  - MSE    (pixel-level, lower is better)
   - PSNR   (pixel-level, higher is better)
   - SSIM   (structural similarity, higher is better)
   - LPIPS  (perceptual distance via VGG, lower is better)
   - FID    (Frechet Inception Distance across all frames, lower is better)
   - FVD    (Frechet Video Distance via S3D video features, lower is better)
+  - foreground/background MSE/PSNR/SSIM and black-background FID/FVD when
+    SAM2 masks are available and selected
 
 Usage:
   python -m src.tools.eval_metrics --run 2026-04-18_163933
@@ -38,6 +41,9 @@ FFMPEG = os.environ.get(
     "/home/leadtek/miniconda3/envs/flip/bin/ffmpeg",
 )
 FFPROBE = FFMPEG.replace("ffmpeg", "ffprobe")
+SEGMENT_FPS = 30.0
+TARGET_FPS = 16.0
+REGION_NAMES = ("foreground", "background")
 
 
 # ── Video IO ──────��──────────────────────────────���────────────────────
@@ -64,6 +70,140 @@ def read_video_frames(path: str) -> np.ndarray:
         raise RuntimeError(f"ffmpeg failed on {path}: {proc.stderr.decode()}")
     raw = np.frombuffer(proc.stdout, dtype=np.uint8).copy()
     return raw.reshape(-1, h, w, 3)
+
+
+# ── SAM2 mask region helpers ─────────────────────────────────────────
+
+
+def clip_mask_indices(clip_start: float, clip_dur: float,
+                      num_frames: int, mask_count: int) -> list[int]:
+    """Map output video frames to original 30fps segment mask frame indices."""
+    if num_frames <= 0:
+        raise ValueError("num_frames must be positive")
+    if mask_count <= 0:
+        raise ValueError("mask_count must be positive")
+    base = int(round(clip_start * SEGMENT_FPS))
+    clip_frames = max(1, int(round(clip_dur * SEGMENT_FPS)))
+    indices = []
+    for i in range(num_frames):
+        offset = min(round(i * SEGMENT_FPS / TARGET_FPS), clip_frames - 1)
+        indices.append(min(max(base + offset, 0), mask_count - 1))
+    return indices
+
+
+def resolve_sam2_mask_path(record: dict, mask_root: str | Path) -> Path:
+    task = record.get("robot_task") or record.get("task")
+    episode = record.get("episode")
+    seg = record.get("seg")
+    missing = [
+        name for name, value in (
+            ("robot_task/task", task),
+            ("episode", episode),
+            ("seg", seg),
+        )
+        if not value
+    ]
+    if missing:
+        raise ValueError(f"Selected record missing SAM2 mask fields {missing}: {record}")
+    return Path(mask_root) / str(task) / str(episode) / f"{seg}.npz"
+
+
+def load_clip_mask_stack(
+    record: dict,
+    mask_root: str | Path,
+    num_frames: int,
+    frame_shape: tuple[int, int],
+) -> np.ndarray:
+    mask_path = resolve_sam2_mask_path(record, mask_root)
+    if not mask_path.is_file():
+        raise FileNotFoundError(f"SAM2 mask not found for region metrics: {mask_path}")
+    for field in ("clip_start", "clip_dur"):
+        if field not in record:
+            raise ValueError(f"Selected record missing {field} for SAM2 mask alignment: {record}")
+    with np.load(mask_path) as mask_npz:
+        masks = mask_npz["masks"]
+    if masks.ndim != 3:
+        raise ValueError(f"Invalid SAM2 mask shape in {mask_path}: {masks.shape}")
+    indices = clip_mask_indices(
+        float(record["clip_start"]), float(record["clip_dur"]), num_frames, len(masks),
+    )
+    clip_masks = masks[indices]
+    if record.get("augment") == "hflip":
+        clip_masks = clip_masks[:, :, ::-1]
+    expected_h, expected_w = frame_shape
+    if clip_masks.shape[1:] != (expected_h, expected_w):
+        raise ValueError(
+            f"Mask/frame shape mismatch for {mask_path}: "
+            f"mask={clip_masks.shape[1:]}, frame={(expected_h, expected_w)}"
+        )
+    return (clip_masks > 128)
+
+
+def split_video_by_mask(frames: np.ndarray, masks: np.ndarray) -> dict[str, np.ndarray]:
+    if frames.ndim != 4 or frames.shape[-1] != 3:
+        raise ValueError(f"Expected video frames shape (T,H,W,3), got {frames.shape}")
+    if masks.shape != frames.shape[:3]:
+        raise ValueError(f"Mask shape {masks.shape} does not match frames {frames.shape[:3]}")
+    keep_foreground = masks[..., None]
+    return {
+        "foreground": np.where(keep_foreground, frames, 0).astype(np.uint8),
+        "background": np.where(~keep_foreground, frames, 0).astype(np.uint8),
+    }
+
+
+def region_masks(masks: np.ndarray) -> dict[str, np.ndarray]:
+    return {
+        "foreground": masks,
+        "background": ~masks,
+    }
+
+
+def mse_to_psnr(mse: float, data_range: float = 255.0) -> float:
+    if mse < 0.0:
+        raise ValueError(f"MSE must be non-negative, got {mse}")
+    if mse == 0.0:
+        return float("inf")
+    return float(20.0 * np.log10(data_range / np.sqrt(mse)))
+
+
+def masked_mse(gen_frames: np.ndarray, gt_frames: np.ndarray, mask: np.ndarray) -> float:
+    if mask.shape != gen_frames.shape[:3]:
+        raise ValueError(f"Mask shape {mask.shape} does not match frames {gen_frames.shape[:3]}")
+    if not mask.any():
+        raise ValueError("Masked MSE region has no pixels")
+    diff = (
+        gen_frames.astype(np.float64) - gt_frames.astype(np.float64)
+    ) ** 2
+    return float(diff[mask].mean())
+
+
+def masked_ssim(
+    gen_frames: np.ndarray,
+    gt_frames: np.ndarray,
+    mask: np.ndarray,
+) -> float:
+    if mask.shape != gen_frames.shape[:3]:
+        raise ValueError(f"Mask shape {mask.shape} does not match frames {gen_frames.shape[:3]}")
+    values = []
+    for t in range(len(gen_frames)):
+        frame_mask = mask[t]
+        if not frame_mask.any():
+            continue
+        _, ssim_map = structural_similarity(
+            gt_frames[t],
+            gen_frames[t],
+            channel_axis=2,
+            data_range=255,
+            full=True,
+        )
+        if ssim_map.ndim == 3:
+            weighted = ssim_map[frame_mask].mean()
+        else:
+            weighted = ssim_map[frame_mask].mean()
+        values.append(float(weighted))
+    if not values:
+        raise ValueError("Masked SSIM region has no pixels")
+    return float(np.mean(values))
 
 
 # ── LPIPS (self-contained VGG) ───────────────��────────────────────────
@@ -166,6 +306,7 @@ def compute_pairwise_metrics(
     gt_frames: np.ndarray,
     lpips_model: LPIPS | None,
     device: torch.device,
+    masks: np.ndarray | None = None,
 ) -> dict:
     """Compute PSNR, SSIM, LPIPS between paired frame arrays (T,H,W,3)."""
     if len(gen_frames) != len(gt_frames):
@@ -174,6 +315,9 @@ def compute_pairwise_metrics(
             f"gt has {len(gt_frames)} frames")
     T = len(gen_frames)
     psnrs, ssims, lpipss = [], [], []
+    global_mse = float(np.mean(
+        (gen_frames.astype(np.float64) - gt_frames.astype(np.float64)) ** 2
+    ))
 
     for t in range(T):
         psnrs.append(peak_signal_noise_ratio(gt_frames[t], gen_frames[t], data_range=255))
@@ -189,9 +333,16 @@ def compute_pairwise_metrics(
             lpipss.extend(d.cpu().tolist())
 
     result = {
+        "mse": global_mse,
         "psnr": float(np.mean(psnrs)),
         "ssim": float(np.mean(ssims)),
     }
+    if masks is not None:
+        for name, region_mask in region_masks(masks).items():
+            region_mse = masked_mse(gen_frames, gt_frames, region_mask)
+            result[f"{name}_mse"] = region_mse
+            result[f"{name}_psnr"] = mse_to_psnr(region_mse)
+            result[f"{name}_ssim"] = masked_ssim(gen_frames, gt_frames, region_mask)
     if lpipss:
         result["lpips"] = float(np.mean(lpipss))
     return result
@@ -314,14 +465,40 @@ def process_step(
     inception: InceptionFeatureExtractor | None,
     video_extractor: VideoFeatureExtractor | None,
     device: torch.device,
+    selected_records: list[dict] | None = None,
+    sam2_mask_root: str | Path | None = None,
 ) -> dict:
     """Compute all metrics for one eval step directory."""
     pairs = find_pairs(step_dir)
     if not pairs:
         return {}
+    if selected_records is not None and len(selected_records) != len(pairs):
+        raise ValueError(
+            f"Selected record count {len(selected_records)} does not match "
+            f"video pair count {len(pairs)} in {step_dir}"
+        )
+    if (selected_records is None) != (sam2_mask_root is None):
+        raise ValueError("selected_records and sam2_mask_root must be provided together")
+    records_by_index = (
+        {idx: record for idx, record in enumerate(selected_records)}
+        if selected_records is not None else {}
+    )
 
-    all_psnr, all_ssim, all_lpips = [], [], []
+    metric_values: dict[str, list[float]] = {
+        "mse": [],
+        "psnr": [],
+        "ssim": [],
+        "lpips": [],
+        "foreground_mse": [],
+        "foreground_psnr": [],
+        "foreground_ssim": [],
+        "background_mse": [],
+        "background_psnr": [],
+        "background_ssim": [],
+    }
     gen_videos, gt_videos = [], []
+    region_gen_videos = {name: [] for name in REGION_NAMES}
+    region_gt_videos = {name: [] for name in REGION_NAMES}
     per_sample = []
 
     for gen_path, gt_path, idx in pairs:
@@ -329,27 +506,47 @@ def process_step(
         gt_frames = read_video_frames(gt_path)
         if len(gen_frames) != len(gt_frames):
             raise ValueError(
-                f"Frame count mismatch: {gen_path} has {len(gen_frames)} frames, "
-                f"{gt_path} has {len(gt_frames)} frames")
+            f"Frame count mismatch: {gen_path} has {len(gen_frames)} frames, "
+            f"{gt_path} has {len(gt_frames)} frames")
         gen_videos.append(gen_frames)
         gt_videos.append(gt_frames)
+        masks = None
 
-        m = compute_pairwise_metrics(gen_frames, gt_frames, lpips_model, device)
+        if selected_records is not None and sam2_mask_root is not None:
+            if idx not in records_by_index:
+                raise ValueError(f"No selected record for sample index {idx} in {step_dir}")
+            masks = load_clip_mask_stack(
+                records_by_index[idx],
+                sam2_mask_root,
+                len(gen_frames),
+                gen_frames.shape[1:3],
+            )
+            split_gen = split_video_by_mask(gen_frames, masks)
+            split_gt = split_video_by_mask(gt_frames, masks)
+            for name in REGION_NAMES:
+                region_gen_videos[name].append(split_gen[name])
+                region_gt_videos[name].append(split_gt[name])
+
+        m = compute_pairwise_metrics(
+            gen_frames,
+            gt_frames,
+            lpips_model,
+            device,
+            masks=masks,
+        )
         m["sample"] = idx
         per_sample.append(m)
-        all_psnr.append(m["psnr"])
-        all_ssim.append(m["ssim"])
-        if "lpips" in m:
-            all_lpips.append(m["lpips"])
+        for key in metric_values:
+            if key in m:
+                metric_values[key].append(m[key])
 
     result = {
-        "psnr": float(np.mean(all_psnr)),
-        "ssim": float(np.mean(all_ssim)),
         "n_samples": len(pairs),
         "per_sample": per_sample,
     }
-    if all_lpips:
-        result["lpips"] = float(np.mean(all_lpips))
+    for key, values in metric_values.items():
+        if values:
+            result[key] = float(np.mean(values))
 
     if inception is not None:
         total_gen_frames = sum(len(v) for v in gen_videos)
@@ -357,11 +554,30 @@ def process_step(
             feats_gen = collect_inception_features(gen_videos, inception, device)
             feats_gt = collect_inception_features(gt_videos, inception, device)
             result["fid"] = compute_fid(feats_gen, feats_gt)
+        if selected_records is not None:
+            for name in REGION_NAMES:
+                total_region_frames = sum(len(v) for v in region_gen_videos[name])
+                if total_region_frames >= 2:
+                    feats_gen = collect_inception_features(
+                        region_gen_videos[name], inception, device)
+                    feats_gt = collect_inception_features(
+                        region_gt_videos[name], inception, device)
+                    result[f"{name}_black_fid"] = compute_fid(feats_gen, feats_gt)
 
     if video_extractor is not None:
         fvd = compute_fvd(gen_videos, gt_videos, video_extractor, device)
         if fvd is not None:
             result["fvd"] = fvd
+        if selected_records is not None:
+            for name in REGION_NAMES:
+                fvd = compute_fvd(
+                    region_gen_videos[name],
+                    region_gt_videos[name],
+                    video_extractor,
+                    device,
+                )
+                if fvd is not None:
+                    result[f"{name}_black_fvd"] = fvd
 
     return result
 
@@ -441,7 +657,7 @@ def main():
             result["step"] = step_name
             all_results.append(result)
 
-            line = f"  PSNR={result['psnr']:.2f}  SSIM={result['ssim']:.4f}"
+            line = f"  MSE={result['mse']:.2f}  PSNR={result['psnr']:.2f}  SSIM={result['ssim']:.4f}"
             if "lpips" in result:
                 line += f"  LPIPS={result['lpips']:.4f}"
             if "fid" in result:
@@ -452,7 +668,10 @@ def main():
             print(line)
 
             for s in result.get("per_sample", []):
-                det = f"    sample {s['sample']:02d}: PSNR={s['psnr']:.2f} SSIM={s['ssim']:.4f}"
+                det = (
+                    f"    sample {s['sample']:02d}: "
+                    f"MSE={s['mse']:.2f} PSNR={s['psnr']:.2f} SSIM={s['ssim']:.4f}"
+                )
                 if "lpips" in s:
                     det += f" LPIPS={s['lpips']:.4f}"
                 print(det)
@@ -462,15 +681,32 @@ def main():
         return
 
     csv_path = args.csv or str(run_dir / "eval_metrics.csv")
-    headers = ["split", "step", "n_samples", "psnr", "ssim", "lpips", "fid", "fvd"]
+    headers = [
+        "split", "step", "n_samples",
+        "mse", "psnr", "ssim", "lpips", "fid", "fvd",
+        "foreground_mse", "foreground_psnr", "foreground_ssim",
+        "background_mse", "background_psnr", "background_ssim",
+        "foreground_black_fid", "foreground_black_fvd",
+        "background_black_fid", "background_black_fvd",
+    ]
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=headers, extrasaction="ignore")
         writer.writeheader()
         for r in all_results:
             row = {h: r.get(h, "") for h in headers}
-            for k in ["psnr", "ssim", "lpips", "fid", "fvd"]:
+            for k in [
+                "mse", "psnr", "ssim", "lpips", "fid", "fvd",
+                "foreground_mse", "foreground_psnr", "foreground_ssim",
+                "background_mse", "background_psnr", "background_ssim",
+                "foreground_black_fid", "foreground_black_fvd",
+                "background_black_fid", "background_black_fvd",
+            ]:
                 if k in r:
-                    row[k] = f"{r[k]:.4f}" if k in ("ssim", "lpips") else f"{r[k]:.2f}"
+                    row[k] = (
+                        f"{r[k]:.4f}"
+                        if k.endswith("ssim") or k == "lpips"
+                        else f"{r[k]:.2f}"
+                    )
             writer.writerow(row)
     print(f"\nCSV saved: {csv_path}")
 
@@ -481,10 +717,10 @@ def main():
             continue
         title = split if split else "(flat)"
         print(f"\n  {title}:")
-        print(f"  {'step':<12} {'PSNR':>7} {'SSIM':>7} {'LPIPS':>7} {'FID':>8} {'FVD':>8}")
-        print(f"  {'─' * 12} {'─' * 7} {'─' * 7} {'─' * 7} {'─' * 8} {'─' * 8}")
+        print(f"  {'step':<12} {'MSE':>8} {'PSNR':>7} {'SSIM':>7} {'LPIPS':>7} {'FID':>8} {'FVD':>8}")
+        print(f"  {'-' * 12} {'-' * 8} {'-' * 7} {'-' * 7} {'-' * 7} {'-' * 8} {'-' * 8}")
         for r in rows:
-            line = f"  {r['step']:<12} {r['psnr']:>7.2f} {r['ssim']:>7.4f}"
+            line = f"  {r['step']:<12} {r['mse']:>8.2f} {r['psnr']:>7.2f} {r['ssim']:>7.4f}"
             line += f" {r['lpips']:>7.4f}" if "lpips" in r else f" {'':>7}"
             line += f" {r['fid']:>8.1f}" if "fid" in r else f" {'':>8}"
             line += f" {r['fvd']:>8.1f}" if "fvd" in r else f" {'':>8}"
