@@ -32,6 +32,7 @@ class TrainTaskConfig:
     train_tasks: str = _csv_tasks(DEFAULT_TRAIN_TASKS)
     ood_tasks: str = _csv_tasks(DEFAULT_OOD_TASKS)
     cache_root: str = ""
+    pair_root: str = ""
     t5_cache_dir: str = ""
     output_dir: str = ""
     description: str = ""
@@ -62,6 +63,7 @@ def _preset(
         duration=duration,
         t5_cache_dir=_task_t5_cache(data_type, duration),
         cache_root=_main("training_data", "cache", "vae"),
+        pair_root=_main("training_data", "pair"),
         output_dir=os.path.join(TRAINING_DATA_ROOT, "log"),
         description=description,
     )
@@ -126,6 +128,7 @@ TRAIN_TASKS: dict[str, TrainTaskConfig] = {
         train_tasks=short_task_name(DEFAULT_TRAIN_TASKS[0]),
         ood_tasks="",
         cache_root=_base("tmp", "smoke_test", "gpu", "cache_generated"),
+        pair_root=_base("tmp", "smoke_test", "gpu", "pair"),
         t5_cache_dir=_base("tmp", "smoke_test", "gpu", "t5"),
         output_dir=_base("tmp", "smoke_test", "gpu", "e2e_train_run"),
         description="Local one-sample GPU smoke task.",
@@ -157,6 +160,7 @@ def apply_train_task_config(args) -> None:
     _apply_default(args, "train_tasks", cfg.train_tasks)
     _apply_default(args, "ood_tasks", cfg.ood_tasks)
     _apply_default(args, "cache_root", cfg.cache_root)
+    _apply_default(args, "pair_root", cfg.pair_root)
     _apply_default(args, "t5_cache_dir", cfg.t5_cache_dir)
     _apply_default(args, "output_dir", cfg.output_dir)
     args.task_description = cfg.description

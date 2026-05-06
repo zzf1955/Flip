@@ -276,6 +276,14 @@ def train(args, spec: MethodSpec):
     info(f"Data config: type={args.data_type} duration={args.duration} "
          f"train_tasks={args.train_tasks} ood_tasks={args.ood_tasks} "
          f"data_seed={args.data_seed}")
+    for split_name, counts in runtime_split.split_counts.items():
+        if counts:
+            summary = ", ".join(f"{task}={count}" for task, count in counts.items())
+        else:
+            summary = "<empty>"
+        info(f"Data split [{split_name}]: {summary}")
+    for task, order_path in sorted(runtime_split.order_paths.items()):
+        info(f"Data order [{task}]: {order_path}")
     info(f"Paths: t5={args.t5_cache_dir or '<none>'}")
 
     # ── T5 cache (shared embeddings for new-format VAE-only caches) ──
@@ -589,6 +597,9 @@ def main():
                     help="comma-separated robot task short names for OOD eval")
     ap.add_argument("--cache-root", default="",
                     help="root containing <data_type>/<duration>/<task>/manifest.jsonl")
+    ap.add_argument("--pair-root", default="",
+                    help="root containing <data_type>/<duration>/<task>/manifest.jsonl "
+                         "and pair_order.jsonl; default is MAIN_ROOT/training_data/pair")
     ap.add_argument("--t5-cache-dir", default="",
                     help="T5 cache dir; default comes from --task-name preset")
     ap.add_argument("--output-dir", default="",
@@ -596,7 +607,7 @@ def main():
     ap.add_argument("--train-size", type=int, default=0,
                     help="runtime train clip count (0=all, -1=all)")
     ap.add_argument("--in-task-eval-size", type=int, default=0,
-                    help="runtime in-task eval clip count (0=all, -1=all)")
+                    help="runtime in-task eval clip count (0/-1=auto 10%% tail holdout)")
     ap.add_argument("--in-task-video-size", type=int, default=4,
                     help="in-task eval videos per trigger (0/-1=all)")
     ap.add_argument("--ood-eval-size", type=int, default=0,
