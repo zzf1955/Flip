@@ -220,7 +220,8 @@ def train(args, spec: MethodSpec):
     ood_files = runtime_split.ood_files
 
     # ── Run name + dirs ──
-    run_name = build_run_name(spec.name, args, n_train=len(train_files))
+    auto_run_name = build_run_name(spec.name, args, n_train=len(train_files))
+    run_name = args.wandb_run_name or auto_run_name
     run_dir = Path(args.output_dir) / run_name
     ckpt_dir = run_dir / "ckpt"
     eval_dir = run_dir / "eval"
@@ -250,7 +251,7 @@ def train(args, spec: MethodSpec):
 
     wb = WandbLogger(
         project=args.wandb_project if is_main else None,
-        run_name=args.wandb_run_name or run_name,
+        run_name=run_name,
         config=vars(args),
         tags=build_wandb_tags(spec.wandb_tag, args,
                               n_train=len(train_files),
@@ -604,6 +605,8 @@ def main():
                     help="T5 cache dir; default comes from --task-name preset")
     ap.add_argument("--output-dir", default="",
                     help="training output root; default comes from --task-name preset")
+    ap.add_argument("--run-prefix", default="",
+                    help="literal prefix for local log dir and default W&B run name")
     ap.add_argument("--train-size", type=int, default=0,
                     help="runtime train clip count (0=all, -1=all)")
     ap.add_argument("--in-task-eval-size", type=int, default=0,
@@ -628,7 +631,8 @@ def main():
 
     # LoRA
     ap.add_argument("--lora-rank", type=int, default=None,
-                    help="LoRA rank; defaults to 96, or auto-detects from --init-lora")
+                    help="LoRA rank; defaults to 96, or auto-detects from "
+                         "--init-lora/--continue-lora")
     ap.add_argument("--lora-target-modules", default=None,
                     help="explicit comma-separated PEFT target suffixes, e.g. "
                          "self_attn.q,cross_attn.v,ffn.0; overrides "
@@ -641,6 +645,16 @@ def main():
                          "is omitted: q,k,v,o")
     ap.add_argument("--init-lora", default="",
                     help="path to .safetensors LoRA checkpoint to initialize from")
+    ap.add_argument("--continue-lora", default="",
+                    help="preferred alias for --init-lora when continuing the "
+                         "same trainable LoRA across stages")
+    ap.add_argument("--train-lora", default="",
+                    help="trainable LoRA checkpoint to continue; omit it and "
+                         "use rank/target args to create a fresh trainable LoRA")
+    ap.add_argument("--train-lora-rank", type=int, default=None,
+                    help="alias for --lora-rank for the trainable LoRA")
+    ap.add_argument("--train-lora-target-modules", default=None,
+                    help="alias for --lora-target-modules for the trainable LoRA")
     ap.add_argument("--merge-lora", action="append", default=None,
                     help="LoRA checkpoint to merge into base weights "
                          "(can be specified multiple times)")
@@ -682,7 +696,7 @@ def main():
     ap.add_argument("--wandb-project", default="Flip",
                     help="W&B project name (default: 'Flip'; set to '' to disable)")
     ap.add_argument("--wandb-run-name", default=None,
-                    help="W&B run name (default: auto run name)")
+                    help="local run dir name and W&B run name (default: auto run name)")
     ap.add_argument("--wandb-tags", nargs="+", default=[],
                     help="extra W&B tags")
     ap.add_argument("--wandb-log-videos", action=argparse.BooleanOptionalAction,
@@ -704,10 +718,38 @@ def main():
         args.in_task_eval_size = args.max_eval_files
 
     # Resolve shared checkpoint inputs against MAIN_ROOT for worktree runs.
-    for attr in ("init_lora",):
+    for attr in ("init_lora", "continue_lora", "train_lora"):
         val = getattr(args, attr)
         if val and not os.path.isabs(val):
             setattr(args, attr, os.path.join(MAIN_ROOT, val))
+    train_lora_paths = [
+        (flag, getattr(args, attr))
+        for flag, attr in [
+            ("--init-lora", "init_lora"),
+            ("--continue-lora", "continue_lora"),
+            ("--train-lora", "train_lora"),
+        ]
+        if getattr(args, attr)
+    ]
+    if train_lora_paths:
+        _, train_lora_path = train_lora_paths[0]
+        for flag, path in train_lora_paths[1:]:
+            if path != train_lora_path:
+                ap.error(
+                    f"{flag} points to a different file than {train_lora_paths[0][0]}"
+                )
+        args.init_lora = train_lora_path
+        args.continue_lora = train_lora_path
+        args.train_lora = train_lora_path
+    if args.train_lora_rank is not None:
+        if args.lora_rank is not None and args.lora_rank != args.train_lora_rank:
+            ap.error("--lora-rank and --train-lora-rank disagree")
+        args.lora_rank = args.train_lora_rank
+    if args.train_lora_target_modules:
+        if (args.lora_target_modules and
+                args.lora_target_modules != args.train_lora_target_modules):
+            ap.error("--lora-target-modules and --train-lora-target-modules disagree")
+        args.lora_target_modules = args.train_lora_target_modules
     if args.merge_lora:
         args.merge_lora = [
             os.path.join(MAIN_ROOT, p) if not os.path.isabs(p) else p

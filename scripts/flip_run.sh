@@ -16,12 +16,12 @@ Subcommands:
   nvidia-smi       Run NVIDIA-SMI on the host GPU device.
   mitty_cache      Run python -m src.pipeline.mitty_cache.
   sam2_precompute  Run python -m src.pipeline.sam2_precompute.
-  train            Run torchrun -m src.pipeline.train.
+  train            Run python -m torch.distributed.run -m src.pipeline.train.
   eval_mitty       Run python -m src.pipeline.evaluate_mitty_models.
 
 Launcher options:
   --cuda IDS       Set CUDA_VISIBLE_DEVICES inside this launcher, e.g. 0 or 2,3.
-  --nproc N        Set torchrun --nproc_per_node for train.
+  --nproc N        Set torch.distributed.run --nproc_per_node for train.
   -h, --help       Show this help.
 
 Examples:
@@ -132,7 +132,11 @@ case "$subcommand" in
         nproc="1"
       fi
     fi
-    exec torchrun --nproc_per_node="$nproc" -m src.pipeline.train "${script_args[@]}"
+    exec "$PYTHON_BIN" -m torch.distributed.run \
+      --standalone \
+      --nproc_per_node="$nproc" \
+      -m src.pipeline.train \
+      "${script_args[@]}"
     ;;
   eval_mitty)
     exec "$PYTHON_BIN" -m src.pipeline.evaluate_mitty_models "${script_args[@]}"

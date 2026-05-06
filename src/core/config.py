@@ -79,13 +79,13 @@ ALL_TASKS = [
 # ── Maintained data task subset ──
 # Data is stored by robot task. In-task vs OOD is decided at training runtime.
 CANONICAL_DATA_TASKS = [
+    "G1_WBT_Inspire_Collect_Clothes_MainCamOnly",
     "G1_WBT_Inspire_Pickup_Pillow_MainCamOnly",
-    "G1_WBT_Inspire_Put_Clothes_Into_Basket",
     "G1_WBT_Inspire_Put_Clothes_into_Washing_Machine",
 ]
 
 DEFAULT_TRAIN_TASKS = [
-    "G1_WBT_Inspire_Put_Clothes_Into_Basket",
+    "G1_WBT_Inspire_Collect_Clothes_MainCamOnly",
     "G1_WBT_Inspire_Put_Clothes_into_Washing_Machine",
 ]
 

@@ -257,7 +257,12 @@ def build_run_name(prefix: str, args, *, n_train: int = 0) -> str:
     Format: {Backbone}-{task_name}-{n_train}d_{params}_{MMDD_HHMMSS}
     Example: Mitty-identity-1200d_r96_qkvo_500s_0422_143015
     """
-    backbone = _BACKBONE_DISPLAY.get(prefix, prefix.capitalize())
+    run_prefix = getattr(args, "run_prefix", "")
+    backbone = (
+        run_prefix
+        if run_prefix
+        else _BACKBONE_DISPLAY.get(prefix, prefix.capitalize())
+    )
     task_name = getattr(args, "task_name", "")
 
     head = [backbone]

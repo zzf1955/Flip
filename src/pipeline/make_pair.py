@@ -1,9 +1,11 @@
 """
 Generate split-free task-organized training pairs and comparison videos.
 
-Matches segment (robot) videos with human videos (seedance_direct, overlay, or
-seedance_advance), resamples both to 16fps, and writes three independent
-subdirectories per semantic data type, duration, and robot task:
+For h2r/r2h, matches segment (robot) videos with human videos
+(seedance_direct, overlay, or seedance_advance). For blur_r2r, enumerates robot
+segments directly because no human source is involved. The script resamples to
+16fps and writes independent subdirectories per semantic data type, duration,
+and robot task:
   pair/<data_type>/<second>/<task>/video/
   pair/<data_type>/<second>/<task>/control_video/
 
@@ -68,9 +70,11 @@ COMPARE_DIR = os.path.join(TRAINING_DATA_ROOT, "compare")
 PROMPT = "A first-person view robot arm performing household tasks flip_v2v"
 DEFAULT_BLUR_KSIZE = 51
 DEFAULT_BLUR_PIXEL_EXPAND = 16
+SEGMENT_DURATION = 4.0
 
 # 4k+1 frame counts at 16fps for each clip duration
 FRAMES_4K1 = {"1s": 17, "2s": 33, "4s": 65}
+DURATION_SECONDS = {"1s": 1.0, "2s": 2.0, "4s": 4.0}
 
 HUMAN_SOURCE_MAP = {
     "seedance_direct": _MAIN_SEEDANCE_DIRECT,
@@ -428,6 +432,47 @@ def collect_pairs(task: str, second: str, human_root: str,
     return pairs
 
 
+def collect_segment_pairs(task: str, second: str) -> list[dict]:
+    """Build robot-only pairs from every segment for blur_r2r."""
+    task_dir = os.path.join(_MAIN_SEGMENT, task)
+    if not os.path.isdir(task_dir):
+        return []
+
+    dur_sec = DURATION_SECONDS[second]
+    clips_per_seg_float = SEGMENT_DURATION / dur_sec
+    if not clips_per_seg_float.is_integer():
+        raise ValueError(
+            f"{second} does not evenly divide {SEGMENT_DURATION:g}s segments")
+    clips_per_seg = int(clips_per_seg_float)
+
+    pairs = []
+    for root, _, files in os.walk(task_dir):
+        for fname in sorted(files):
+            m = re.match(r"(seg\d+)_video\.mp4$", fname)
+            if not m:
+                continue
+            seg = m.group(1)
+            ep_dir = os.path.relpath(root, task_dir)
+            robot_src = os.path.join(root, fname)
+            for clip_idx in range(clips_per_seg):
+                pairs.append({
+                    "task": task,
+                    "episode": ep_dir,
+                    "seg": seg,
+                    "clip_idx": clip_idx,
+                    "window_idx": clip_idx,
+                    "augment": "normal",
+                    "robot_src": robot_src,
+                    "clip_start": clip_idx * dur_sec,
+                    "clip_dur": dur_sec,
+                    "source_segment_id": f"{task}/{ep_dir}/{seg}",
+                    "source_id": f"{task}/{ep_dir}/{seg}_clip{clip_idx:02d}",
+                })
+
+    pairs.sort(key=lambda p: p["source_id"])
+    return pairs
+
+
 # ── splitting ──────────────────────────────────────────────────────────
 
 def split_by_task(all_pairs: list[dict], ood_tasks: set[str],
@@ -638,6 +683,9 @@ def main():
     if args.blur_pixel_expand < 0:
         raise ValueError("--blur-pixel-expand must be non-negative")
 
+    if args.data_type == "blur_r2r" and args.source_second is not None:
+        raise ValueError("--source-second is only valid for human-matched data")
+
     human_root = HUMAN_SOURCE_MAP[args.human_source]
     seconds = ["1s", "2s", "4s"] if args.second == "all" else [args.second]
 
@@ -647,7 +695,10 @@ def main():
     print(f"  tasks:         {tasks}")
     print(f"  seconds:       {seconds}")
     print(f"  data type:     {args.data_type}")
-    print(f"  human:         {args.human_source} ({human_root})")
+    if args.data_type == "blur_r2r":
+        print(f"  human:         (unused for blur_r2r)")
+    else:
+        print(f"  human:         {args.human_source} ({human_root})")
     print(f"  fps:           {TARGET_FPS}")
     print(f"  compare:       {args.compare}")
     print(f"  workers:       {args.workers}")
@@ -671,11 +722,14 @@ def main():
             _clean_sec_dir(sec_dir)
         os.makedirs(sec_dir, exist_ok=True)
 
-        # Collect all pairs across tasks for this duration
+        # Collect all pairs across tasks for this duration.
         all_pairs = []
         for task in tasks:
-            pairs = collect_pairs(task, sec, human_root,
-                                  source_second=source_second)
+            if args.data_type == "blur_r2r":
+                pairs = collect_segment_pairs(task, sec)
+            else:
+                pairs = collect_pairs(task, sec, human_root,
+                                      source_second=source_second)
             all_pairs.extend(pairs)
 
         if not all_pairs:
@@ -740,13 +794,14 @@ def main():
                     "clip_dur": p["clip_dur"],
                     "source_segment_id": p.get("source_segment_id"),
                     "source_id": p["source_id"],
-                    "human_src": p["human_src"],
                     "robot_src": p["robot_src"],
                     "video": f"video/{name}",
                     "control_video": f"control_video/{name}",
                     "input_role": input_role,
                     "target_role": target_role,
                 }
+                if "human_src" in p:
+                    p["manifest"]["human_src"] = p["human_src"]
                 if args.data_type == "blur_r2r":
                     p["manifest"].update({
                         "control_degrade": "sam2_blur",

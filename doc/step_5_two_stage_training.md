@@ -25,20 +25,20 @@
 
 **输入**：human 视频 → **输出**：对应 robot 视频
 
-用 Phase 1 的 LoRA checkpoint 作为 `--init-lora`，继续在真实的 (human, robot) pair 数据上训练。模型已经掌握了重建能力，只需额外学习跨外观的映射。
+用 Phase 1 的 LoRA checkpoint 作为 `--train-lora`，继续在真实的 (human, robot) pair 数据上训练。模型已经掌握了重建能力，只需额外学习跨外观的映射。`--train-lora` 表示同一个 LoRA adapter 继续作为唯一可训练参数；`--merge-lora` 表示把旧 LoRA 合入 frozen base，再训练另一套 adapter。
 
 ## 数据准备
 
 当前维护的数据 Task 固定为三个机器人 Task：
 
 - `Inspire_Pickup_Pillow_MainCamOnly`
-- `Inspire_Put_Clothes_Into_Basket`
+- `Inspire_Collect_Clothes_MainCamOnly`
 - `Inspire_Put_Clothes_into_Washing_Machine`
 
 数据目录不再预切 `train/eval/ood_eval`；磁盘按 `data_type / duration / robot_task`
 组织，训练运行时用 `--train-tasks` 和 `--ood-tasks` 决定 in-task 与 OOD。每个
 task 的 pair 目录会保存一次性生成的 `pair_order.jsonl`，后续训练都从该固定顺序表
-划分 train/eval。默认 preset 使用 Basket + Washing 作为 in-task，Pillow 作为 OOD。
+划分 train/eval。默认 preset 使用 Collect + Washing 作为 in-task，Pillow 作为 OOD。
 
 ### Phase 1 数据结构
 
@@ -83,15 +83,15 @@ python -m src.pipeline.make_robot_pair \
 
 # 1. 为每个 robot task 生成 identity cache
 python -m src.pipeline.mitty_cache \
-  --pair-dir training_data/pair/identity_r2r/1s/Inspire_Put_Clothes_Into_Basket \
-  --output   training_data/cache/vae/identity_r2r/1s/Inspire_Put_Clothes_Into_Basket \
+  --pair-dir training_data/pair/identity_r2r/1s/Inspire_Collect_Clothes_MainCamOnly \
+  --output   training_data/cache/vae/identity_r2r/1s/Inspire_Collect_Clothes_MainCamOnly \
   --t5-cache-dir training_data/cache/t5/identity_r2r/1s \
   --device   cuda:2
 
 # 2. Phase 1 训练（恒等重建）；in-task/OOD 运行时决定
 scripts/flip_run.sh train --cuda 2 -- \
   --task-name identity_r2r_1s \
-  --train-tasks Inspire_Put_Clothes_Into_Basket,Inspire_Put_Clothes_into_Washing_Machine \
+  --train-tasks Inspire_Collect_Clothes_MainCamOnly,Inspire_Put_Clothes_into_Washing_Machine \
   --ood-tasks Inspire_Pickup_Pillow_MainCamOnly \
   --max-steps 400 --save-steps 100 --eval-steps 100 \
   --eval-video-steps 100
@@ -103,7 +103,7 @@ scripts/flip_run.sh train --cuda 2 -- \
 # 生成 h2r pair/cache 后，用 Phase 1 最佳 ckpt 初始化
 scripts/flip_run.sh train --cuda 2 -- \
   --task-name h2r_1s \
-  --init-lora training_data/log/<phase1-run>/ckpt/step-0400.safetensors \
+  --train-lora training_data/log/<phase1-run>/ckpt/step-0400.safetensors \
   --train-size 0 \
   --in-task-eval-size 32 \
   --in-task-video-size 4 \
@@ -122,9 +122,33 @@ scripts/flip_run.sh train --cuda 0,1,2,3 --nproc 4 -- \
 
 scripts/flip_run.sh train --cuda 0,1,2,3 --nproc 4 -- \
   --task-name h2r_1s \
-  --init-lora training_data/log/<phase1-run>/ckpt/step-0400.safetensors \
+  --train-lora training_data/log/<phase1-run>/ckpt/step-0400.safetensors \
   --max-steps 400 --save-steps 100 --eval-steps 100
 ```
+
+### 单 LoRA 三阶段版本
+
+如果要在 identity、blur、h2r 三个任务之间始终只开放一个 LoRA 训练，直接用
+三阶段 launcher：
+
+```bash
+scripts/train_three_stage_single_lora.py \
+  --cuda 0,1,2 \
+  --nproc 3 \
+  --stage identity_r2r_1s:1000 \
+  --stage blur_r2r_1s:1000 \
+  --stage h2r_1s:1000 \
+  --lora-attn-types self \
+  --lora-attn-projections q,k,v,o \
+  --train-size 0 \
+  --in-task-eval-size 16 \
+  --ood-eval-size 16
+```
+
+脚本会把 stage 1 输出的 checkpoint 作为 stage 2 的 `--train-lora`，
+再把 stage 2 输出作为 stage 3 的 `--train-lora`。整个链路没有
+`--merge-lora`，因此不会把前一阶段 LoRA 固化进 base weight，也不会新增第二套
+adapter。
 
 ## 训练预期
 

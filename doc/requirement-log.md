@@ -579,6 +579,128 @@
 - `manifest.jsonl` 为 `blur_r2r` 记录 `control_degrade=sam2_blur`、`blur_ksize`、`blur_pixel_expand`，便于 cache 与训练追溯。
 - `doc/step_5_training_infra.md` 补充 blur_r2r 生成方式、SAM2 mask 依赖和正式命令。
 
+## 2026-04-29 外观替换 LoRA 网格搜索脚本
+
+**用户原始需求：**
+> 用 `Mitty-identity_r2r_1s-10000d_r64_ffn0ffn2_1000s_0429_185108` 的 LoRA，在 cuda0/1/2 上跑外观替换搜索；LoRA 位置为 ffn/qk/vo/qkvo/ffn+qkvo，rank 为 64/128/256；使用 `flip_run_2.sh` 生成笛卡尔乘积，一个卡一个任务，跑完再下一个；不要改 Task name。
+
+**直接修改：**
+- 新增 `scripts/train_h2r_lora_grid.sh`，固定 `--task-name h2r_1s`，默认 merge `step-0900.safetensors`，按 5 个 LoRA layout × 3 个 rank 调度到 CUDA 0/1/2。
+
+## 2026-04-30 全量 LoRA 搜索布局
+
+**用户原始需求：**
+> Cross Attention 和 FFN 都放开，改成 FFN + Cross attention qkvo + Self Attention qkvo 试一试，就是全量 LoRA；LoRA 就一种，然后三种 rank。
+
+**直接修改：**
+- 更新 `scripts/train_h2r_lora_grid.sh`，LoRA layout 从多种局部组合改为单一 `full_lora`，target modules 为 self attention q/k/v/o、cross attention q/k/v/o 和 `ffn.0,ffn.2`；rank 仍为 64/128/256。
+
+## 2026-04-30 — 当前训练 Task 改回 Collect
+
+**用户原始需求：**
+> 数据有点问题。更新当前的 Task，把 basket 换成 Inspire_Collect_Clothes_MainCamOnly；统计 training_data/segment 下的视频数量；解释当前 clip 出来的样本数量和 segment 下的样本数量为什么对不上。
+
+**直接修改：**
+- `src/core/config.py` 将 canonical/default 训练 Task 从 Basket + Pillow + Washing 改为 Collect + Pillow + Washing；默认 in-task 为 Collect + Washing，OOD 仍为 Pillow。
+- `scripts/smoke_test_gpu.py` 的 `SMOKE_TASK` 同步改为 `Inspire_Collect_Clothes_MainCamOnly`。
+- `doc/step_5_training_infra.md` 与 `doc/step_5_two_stage_training.md` 同步更新当前 Task 集合、默认 in-task 说明和示例路径。
+- 新增 `doc/notice.md`，记录 `seedance_direct/1s` clip 与 `training_data/segment` 全量 segment 不同口径：1 条 4s human source 会生成 14 条 1s clip，而 identity_r2r 是每条 robot segment 生成 4 条 1s clip。
+
+**数据现状：**
+- `training_data/seedance_direct/1s/Inspire_Collect_Clothes_MainCamOnly/manifest.jsonl` 已存在 112 条 1s clip，来自 8 条 4s human source。
+- `training_data/pair/{h2r,blur_r2r,identity_r2r}/1s/` 与 `training_data/cache/vae/*/1s/` 当前仍缺少 Collect 目录，需要按新 Task 集合重建 pair/cache 后训练入口才能直接使用。
+
+## 2026-04-30 — blur_r2r 改为使用全量 segment
+
+**用户原始需求：**
+> blur 那一块，使用全部的 segment 数据，不是从 Seedance 中匹配；只有 h2r 和 r2h 是从 Seedance 匹配，这一步不涉及 Human，所以是三个 Task 的全部 segment 数据。改一下代码，然后给我重新构造数据+cache 的指令。
+
+**直接修改：**
+- `src/pipeline/make_pair.py` 为 `blur_r2r` 新增 robot-only segment 枚举路径：`--task all` 展开三个 canonical Task，并直接遍历 `training_data/segment/<task>/ep*/seg*_video.mp4`。
+- `blur_r2r` 的 1s 数据现在每条 4s segment 生成 4 条非重叠 robot clip；`h2r` / `r2h` 仍使用 human source 与 Seedance/overlay manifest 匹配。
+- `blur_r2r` manifest 不再写入 `human_src`，继续记录 `robot_src`、`source_segment_id`、`clip_start`、`clip_dur` 和 SAM2 blur 参数。
+- `doc/step_5_training_infra.md` 与 `doc/notice.md` 同步更新 blur_r2r 数据来源说明。
+
+## 2026-05-01 — H2R/blur grid 支持多 LoRA merge 与时间戳 run name
+
+**用户原始需求：**
+> 这个应该合并两个 LoRA，一个是当前的，一个是 `scripts/train_h2r_lora_grid_cuda3_serial.sh`。然后注意 wb 的实验名字要加时间。
+
+**直接修改：**
+- `scripts/train_h2r_lora_grid_cuda3_serial.sh` 与 `scripts/train_h2r_lora_grid.sh` 支持 `MERGE_LORAS` 环境变量，接受空格或逗号分隔的多个 `.safetensors`，并展开为多个 `--merge-lora`。
+- 保留旧 `MERGE_LORA` 单路径兼容；未设置 `MERGE_LORAS` 时沿用原默认 identity LoRA。
+- W&B run name 追加 `RUN_TIMESTAMP`，默认格式为 `MMDD_HHMMSS`；同一轮 grid 共用同一个时间戳，并把 `run:<timestamp>` 加入 W&B tags。
+
+## 2026-05-01 — H2R 双 LoRA qkvo stack 三卡并行脚本
+
+**用户原始需求：**
+> 改成跑一个 qkvo(self), qkvo(self+cross), qkvo(self+cross)+ffn, qkvo(self)+ffn，三卡并行 cuda012，flip_run_2 新写一个脚本，参考 `scripts/train_h2r_lora_grid_cuda3_serial.sh`，两个 lora+h2r 任务+三卡并行。
+
+**直接修改：**
+- 新增 `scripts/train_h2r_lora_qkvo_stack_cuda012.sh`，使用 `scripts/flip_run_2.sh` 在 CUDA 0/1/2 上并行调度 H2R 训练。
+- 默认合并两个 LoRA：identity `step-0900.safetensors` 和 blur_r2r r256 `step-0500.safetensors`；可用 `MERGE_LORAS` 覆盖。
+- 默认跑四个 layout：`qkvo(self)`、`qkvo(self+cross)`、`qkvo(self+cross)+ffn`、`qkvo(self)+ffn`；默认 rank 为 256，可用 `LORA_RANKS` 覆盖为多 rank。
+- 默认 `TRAIN_SIZE=490`，匹配当前 H2R Collect + Washing runtime train pool。
+
+## 2026-05-01 — blur 多卡 LoRA 搜索改为 qkvo 组合
+
+**用户原始需求：**
+> 改成跑一个 qkvo(self), qkvo(self+cross), qkvo(self+cross)+ffn, qkvo(self)+ffn，三卡并行 cuda012，flip_run_2。
+
+**直接修改：**
+- `scripts/train_h2r_lora_grid.sh` 保持默认 `FLIP_RUNNER=scripts/flip_run_2.sh` 与 `CUDA_DEVICES=0,1,2`。
+- LoRA layout 改为 `qkvo_self`、`qkvo_self_cross`、`qkvo_self_cross_ffn`、`qkvo_self_ffn` 四种。
+- `qkvo_self` 使用 `--lora-attn-types self --lora-attn-projections q,k,v,o`；`qkvo_self_cross` 使用 self+cross q/k/v/o；带 ffn 的组合显式指定对应 `self_attn.*`、`cross_attn.*` 与 `ffn.0,ffn.2` target modules。
+
+## 2026-05-01 — H2R grid W&B 命名修正
+
+**用户原始需求：**
+> 为什么 wb 上实验是 appearance? 不应该是 h2r 吗
+
+**直接修改：**
+- `scripts/train_h2r_lora_grid.sh` 默认 `TASK_NAME` 从 `blur_r2r_1s` 改为 `h2r_1s`。
+- 默认 `TRAIN_SIZE` 从 `2000` 改为当前 H2R runtime split 可用的 `490`。
+- W&B run name 前缀从 `appearance_` 改为 `h2r_`，tags 从 `appearance` 改为 `h2r`。
+
+## 2026-04-30 恢复局部 LoRA 搜索布局
+
+**用户原始需求：**
+> 全量 LoRA 效果不太行，改回去。
+
+**直接修改：**
+- 将 `scripts/train_h2r_lora_grid.sh` 的 LoRA layout 从单一 `full_lora` 恢复为 `ffn/qk/vo/qkvo/ffn_qkvo` 五种组合，rank 仍为 64/128/256。
+
+## 2026-05-01 H2R CUDA3 串行 LoRA 搜索脚本
+
+**用户原始需求：**
+> 写一个新脚本，在 cuda3 上，使用 h2r 任务，搜索 LoRA 布局和 rank，串行跑。
+
+**直接修改：**
+- 新增 `scripts/train_h2r_lora_grid_cuda3_serial.sh`，固定默认 `--task-name h2r_1s`、`CUDA_DEVICE=3`，串行运行 `ffn/qk/vo/qkvo/ffn_qkvo × 64/128/256` 的 LoRA 搜索。
+
+## 2026-05-01 — H2R merge identity + blur_r512 后三布局 LoRA
+
+**用户原始需求：**
+> 写一个 bash 脚本. 跑 h2r 的任务,lora 合并 Mitty-blur_r2r_1s-2000d_r512_selfattnqselfattnkselfattnvselfattnoffn0ffn2_1000s_0501_005940和这个训练使用的前一个 identity lora. 然后新加一个 LoRA, 256 维度,位置有三种 FFN qkvo(self) ffn+qkvo(self) 给出指令
+
+**直接修改：**
+- 新增 `scripts/train_h2r_lora_blur_r512_stack3_cuda012.sh`，默认使用 `scripts/flip_run_2.sh` 在 CUDA 0/1/2 上并行运行 H2R。
+- 默认按顺序 merge blur_r2r r512 训练使用的 identity LoRA `Mitty-identity_r2r_1s-10000d_r64_ffn0ffn2_1000s_0429_185108/ckpt/step-0900.safetensors`，再 merge `Mitty-blur_r2r_1s-2000d_r512_selfattnqselfattnkselfattnvselfattnoffn0ffn2_1000s_0501_005940/ckpt/step-1000.safetensors`。
+- 新增训练 LoRA 固定默认 rank 256，跑三种 layout：`ffn`、`qkvo(self)`、`ffn+qkvo(self)`；可通过 `MERGE_LORAS`、`BLUR_MERGE_LORA`、`IDENTITY_MERGE_LORA`、`CUDA_DEVICES`、`LORA_RANK` 覆盖。
+
+## 2026-05-01 — mitty_h2r self-attn qkvo LoRA 256/512 双卡脚本
+
+**用户原始需求：**
+> 1. 改回去 2. 新写一个脚本 3. log 目录和wb 的目录中,名字前缀是 mitty_h2r
+
+**直接修改：**
+- 将 `scripts/train_h2r_lora_qkvo_stack_cuda012.sh` 恢复为原 stack 脚本行为：默认 `scripts/flip_run_2.sh`、CUDA 0/1/2、合并 identity + blur LoRA、四个 qkvo stack layout。
+- 新增 `scripts/train_mitty_h2r_lora_self_qkvo_cuda01.sh`，使用 `scripts/flip_run.sh` 跑 H2R 数据，不传任何 `--merge-lora`，仅在 self attention 的 q/k/v/o 上加新 LoRA。
+- 新脚本默认在 CUDA 0/1 上并行跑 rank 256/512，并把 W&B run name 设为 `mitty_h2r_qkvo_self_r{rank}_{timestamp}`。
+- `src/pipeline/train.py` 新增 `--run-prefix`，`src/core/train_utils.py` 使用该前缀生成本地 log run 目录；新脚本默认传 `--run-prefix mitty_h2r`，使 `training_data/log/` 下目录前缀为 `mitty_h2r-...`。
+- `scripts/flip_run.sh train` 改为通过固定 flip Python 执行 `torch.distributed.run`，不再依赖交互 shell PATH 中存在裸 `torchrun`。
+- `doc/step_5_training_infra.md` 补充 `--run-prefix` 的命名规则。
+
 ## 2026-05-02 — LoRA layout/rank 搜索脚本整理
 
 用户要求：
@@ -590,3 +712,44 @@
 - 内置 `self_qkv`、`cross_qkv`、`self_qkv_cross_qkv` 等 qkv-only layout，以及 qkvo/ffn 组合 layout；本地 run dir 与 W&B run name 使用 `{task}_{layout}_r{rank}_{YYYYMMDD_HHMMSS}`。
 - `src/core/train_utils.py` 将显式 LoRA target modules 压缩为 `self_qkv_cross_qkv_ffn` 这类短名，避免目录名展开过长。
 - 更新 `doc/step_5_training_infra.md` 与 `doc/scripts_inventory.md` 的使用说明。
+
+## 2026-05-02 — grid launcher 按机器 IP 选择 runner
+
+用户要求：
+> DEFAULT_FLIP_RUNNER = PROJECT_ROOT / "scripts" / "flip_run.sh" 这个地方改一下,按照机器的 ip 来. 当前机器的 ip 可能是 10.20.1.4, 如果是 .1.2 的话,就是用 flip_run_2.sh
+
+直接修改：
+- `scripts/train_lora_grid.py` 新增本机 IP 探测逻辑；默认 runner 仍为 `scripts/flip_run.sh`，但当本机 IPv4 命中 `10.20.1.2` 时自动切到 `scripts/flip_run_2.sh`。
+- 保留 `--runner` 参数作为显式覆盖入口，避免特例机器需要临时指定 launcher。
+
+## 2026-05-04 — 三阶段训练改为单 LoRA 继续训练语义
+
+用户要求：
+> 当前训练的 pipeline 想改成全程只用一个 LoRA，三个阶段任务不同，但是开放一个 LoRA 被训练；可能要改现有的 LoRA 加载代码。
+
+直接修改：
+- `src/pipeline/train.py` 和 `src/pipeline/train_mitty.py` 新增 `--continue-lora`，作为 `--init-lora` 的语义化别名，明确表示继续训练同一个 adapter；若同时传入不同的 `--init-lora` 和 `--continue-lora` 会直接报错。
+- `scripts/train_lora_grid.py` 同步支持 `--continue-lora`，展开训练命令时使用语义更明确的 `--train-lora`。
+- 新增 `scripts/train_three_stage_single_lora.py`，默认串行运行 `identity_r2r_1s -> blur_r2r_1s -> h2r_1s`，每个 stage 成功后把最新 checkpoint 传给下一 stage 的 `--train-lora`，不使用 `--merge-lora`。
+- 文档明确区分：`--continue-lora`/`--init-lora` 是可训练 LoRA 继续训练；`--merge-lora` 是把旧 LoRA 合并进 frozen base 后再新开一个 LoRA，属于 stack 实验，不是单 LoRA 三阶段。
+
+## 2026-05-04 — 启动时显式选择 merge LoRA 与 train LoRA
+
+用户要求：
+> 调整一下. 在启动指令的时候,选择 merge 哪些 LoRA, 训练哪些 LoRA. 训练的 LoRA 如果传入已有的 LoRA 就继续训练,如果传入参数就新建一个 LoRA 训练. 这样更灵活.
+
+直接修改：
+- `src/pipeline/train.py`、`src/pipeline/train_mitty.py` 新增 `--train-lora`、`--train-lora-rank`、`--train-lora-target-modules`。`--train-lora <ckpt>` 表示继续训练该 checkpoint；未传 `--train-lora` 时按 rank/target/attn 参数新建可训练 LoRA。
+- `--merge-lora` 继续表示冻结合并，可和 `--train-lora` 同时使用；入口会拒绝 `--init-lora`、`--continue-lora`、`--train-lora` 指向不同 checkpoint。
+- `scripts/train_lora_grid.py` 支持 `--train-lora`，展开命令时使用新参数名。
+- `scripts/train_three_stage_single_lora.py` 支持 stage 级 `task=...;steps=...;merge=...;train=path|fresh|previous;rank=...;targets=...`，可以逐 stage 决定哪些 LoRA merge、哪套 LoRA 训练。
+
+## 2026-05-06 — 统一显式 W&B run name 与本地 log 目录名
+
+用户要求：
+> 现在需要改一下文件夹命名,当前 wb 的时间戳和本地 log 不一致,应该是创建时间不同,这个统一一下
+
+直接修改：
+- `src/pipeline/train.py` 和 `src/pipeline/train_mitty.py` 在传入 `--wandb-run-name` 时直接复用该值作为本地 run 目录名和 W&B run name。
+- grid/bash launcher 只需在外层生成一次带时间戳的 run name；训练入口不再为本地目录另取一次创建时间，避免 W&B 面板和 `training_data/log/` 后缀不一致。
+- `doc/step_5_training_infra.md` 同步说明 `--wandb-run-name` 现在同时控制本地 log 目录和 W&B run name。
