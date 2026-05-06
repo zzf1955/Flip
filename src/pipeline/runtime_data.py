@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import random
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -20,6 +21,7 @@ from typing import Iterable
 from src.core.config import MAIN_ROOT
 
 DATA_TYPES = {"identity_r2r", "blur_r2r", "h2r", "r2h"}
+PAIR_ORDER_FILENAME = "pair_order.jsonl"
 
 
 @dataclass(frozen=True)
@@ -30,6 +32,8 @@ class RuntimeSplit:
     train_records: list[dict]
     eval_records: list[dict]
     ood_records: list[dict]
+    split_counts: dict[str, dict[str, int]]
+    order_paths: dict[str, str]
 
 
 def short_task_name(task: str) -> str:
@@ -49,22 +53,24 @@ def parse_task_list(value: str | Iterable[str], *, allow_empty: bool = False) ->
     return tasks
 
 
-def _sample(records: list[dict], size: int, seed: str, label: str) -> list[dict]:
-    if size < 0:
-        return list(records)
-    if size == 0:
-        return list(records)
-    if size > len(records):
-        raise ValueError(
-            f"Requested {label} size {size}, but only {len(records)} samples are available"
-        )
-    shuffled = list(records)
-    random.Random(seed).shuffle(shuffled)
-    return sorted(shuffled[:size], key=_record_sort_key)
+def _pair_id_from_path(value: str) -> str:
+    if not value:
+        raise ValueError("Pair/cache path is empty")
+    return Path(value).stem
 
 
-def _record_sort_key(record: dict) -> tuple[str, str]:
-    return (str(record.get("source_id", "")), str(record.get("cache_path", "")))
+def _pair_id_from_pair_record(record: dict, task_dir: Path) -> str:
+    raw_path = record.get("video") or record.get("cache_path")
+    if not raw_path:
+        raise ValueError(f"Pair manifest record missing video in {task_dir}")
+    return _pair_id_from_path(str(raw_path))
+
+
+def _pair_id_from_cache_record(record: dict, task_dir: Path) -> str:
+    raw_path = record.get("cache_path")
+    if not raw_path:
+        raise ValueError(f"Cache manifest record missing cache_path in {task_dir}")
+    return _pair_id_from_path(str(raw_path))
 
 
 def _read_jsonl(path: Path) -> list[dict]:
@@ -97,57 +103,205 @@ def _resolve_cache_path(task_dir: Path, record: dict) -> str:
     return str(path)
 
 
-def _load_task_records(root: Path, data_type: str, duration: str, task: str) -> list[dict]:
+def _validate_manifest_record(
+    record: dict, task_dir: Path, data_type: str, duration: str, task: str,
+) -> None:
+    record_data_type = record.get("data_type", data_type)
+    record_duration = record.get("duration", duration)
+    record_task = short_task_name(record.get("robot_task", record.get("task", task)))
+    if record_data_type != data_type:
+        raise ValueError(
+            f"Manifest data_type mismatch in {task_dir}: {record_data_type} != {data_type}"
+        )
+    if record_duration != duration:
+        raise ValueError(
+            f"Manifest duration mismatch in {task_dir}: {record_duration} != {duration}"
+        )
+    if record_task != task:
+        raise ValueError(
+            f"Manifest robot_task mismatch in {task_dir}: {record_task} != {task}"
+        )
+
+
+def _load_cache_task_records(root: Path, data_type: str, duration: str, task: str) -> list[dict]:
     task_dir = root / task
     rows = _read_jsonl(task_dir / "manifest.jsonl")
     records = []
     for row in rows:
         record = dict(row)
-        record_data_type = record.get("data_type", data_type)
-        record_duration = record.get("duration", duration)
-        record_task = short_task_name(record.get("robot_task", record.get("task", task)))
-        if record_data_type != data_type:
-            raise ValueError(
-                f"Manifest data_type mismatch in {task_dir}: {record_data_type} != {data_type}"
-            )
-        if record_duration != duration:
-            raise ValueError(
-                f"Manifest duration mismatch in {task_dir}: {record_duration} != {duration}"
-            )
-        if record_task != task:
-            raise ValueError(
-                f"Manifest robot_task mismatch in {task_dir}: {record_task} != {task}"
-            )
+        _validate_manifest_record(record, task_dir, data_type, duration, task)
         record["data_type"] = data_type
         record["duration"] = duration
         record["robot_task"] = task
         record["cache_path"] = _resolve_cache_path(task_dir, record)
+        record["pair_id"] = _pair_id_from_cache_record(record, task_dir)
         record.setdefault("source_segment_id", record.get("source_id", record["cache_path"]))
         records.append(record)
-    return sorted(records, key=_record_sort_key)
+    pair_ids = [record["pair_id"] for record in records]
+    duplicates = sorted(pair_id for pair_id, n in Counter(pair_ids).items() if n > 1)
+    if duplicates:
+        raise ValueError(f"Duplicate cache pair_id values in {task_dir}: {duplicates[:5]}")
+    return sorted(records, key=lambda record: record["pair_id"])
 
 
-def _heldout_eval_pool(records: list[dict], seed: int, task: str) -> tuple[list[dict], list[dict]]:
-    by_segment: dict[str, list[dict]] = {}
-    for record in records:
-        by_segment.setdefault(str(record["source_segment_id"]), []).append(record)
-    segment_ids = sorted(by_segment)
-    if len(segment_ids) < 2:
-        if len(records) == 1:
-            return list(records), list(records)
+def _load_pair_manifest_records(
+    pair_root: Path, data_type: str, duration: str, task: str,
+) -> tuple[Path, list[dict]]:
+    task_dir = pair_root / data_type / duration / task
+    rows = _read_jsonl(task_dir / "manifest.jsonl")
+    records = []
+    for row in rows:
+        record = dict(row)
+        _validate_manifest_record(record, task_dir, data_type, duration, task)
+        record["data_type"] = data_type
+        record["duration"] = duration
+        record["robot_task"] = task
+        record["pair_id"] = _pair_id_from_pair_record(record, task_dir)
+        record.setdefault("source_segment_id", record.get("source_id", record["pair_id"]))
+        records.append(record)
+    pair_ids = [record["pair_id"] for record in records]
+    duplicates = sorted(pair_id for pair_id, n in Counter(pair_ids).items() if n > 1)
+    if duplicates:
+        raise ValueError(f"Duplicate pair_id values in {task_dir}: {duplicates[:5]}")
+    return task_dir, sorted(records, key=lambda record: record["pair_id"])
+
+
+def _pair_order_entry(record: dict, index: int, seed: int) -> dict:
+    return {
+        "order_index": index,
+        "pair_id": record["pair_id"],
+        "source_id": record.get("source_id", record["pair_id"]),
+        "source_segment_id": record.get("source_segment_id", ""),
+        "video": record.get("video", ""),
+        "control_video": record.get("control_video", ""),
+        "data_type": record["data_type"],
+        "duration": record["duration"],
+        "robot_task": record["robot_task"],
+        "order_seed": seed,
+    }
+
+
+def _write_order_table_once(order_path: Path, entries: list[dict]) -> None:
+    tmp_path = order_path.with_name(f".{order_path.name}.{os.getpid()}.tmp")
+    with tmp_path.open("w") as fh:
+        for entry in entries:
+            fh.write(json.dumps(entry, sort_keys=True) + "\n")
+    try:
+        os.link(tmp_path, order_path)
+    except FileExistsError:
+        pass
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+def _read_or_create_pair_order(
+    pair_dir: Path,
+    pair_records: list[dict],
+    data_seed: int,
+    data_type: str,
+    duration: str,
+    task: str,
+) -> tuple[Path, list[dict]]:
+    order_path = pair_dir / PAIR_ORDER_FILENAME
+    if not order_path.exists():
+        shuffled = list(pair_records)
+        random.Random(f"{data_seed}:pair_order:{data_type}:{duration}:{task}").shuffle(shuffled)
+        entries = [
+            _pair_order_entry(record, index, data_seed)
+            for index, record in enumerate(shuffled)
+        ]
+        _write_order_table_once(order_path, entries)
+
+    entries = _read_jsonl(order_path)
+    pair_ids = [str(entry.get("pair_id", "")) for entry in entries]
+    if any(not pair_id for pair_id in pair_ids):
+        raise ValueError(f"Pair order table has empty pair_id values: {order_path}")
+    duplicates = sorted(pair_id for pair_id, n in Counter(pair_ids).items() if n > 1)
+    if duplicates:
+        raise ValueError(f"Duplicate pair_id values in {order_path}: {duplicates[:5]}")
+    expected_pair_ids = {record["pair_id"] for record in pair_records}
+    actual_pair_ids = set(pair_ids)
+    if actual_pair_ids != expected_pair_ids:
+        missing = sorted(expected_pair_ids - actual_pair_ids)
+        extra = sorted(actual_pair_ids - expected_pair_ids)
         raise ValueError(
-            f"Task {task} needs at least 2 source_segment_id groups for runtime train/eval split"
+            f"Pair order table does not match manifest: {order_path}; "
+            f"missing={missing[:5]} extra={extra[:5]}"
         )
-    random.Random(f"{seed}:segment:{task}").shuffle(segment_ids)
-    n_eval_segments = max(1, int(len(segment_ids) * 0.1))
-    n_eval_segments = min(n_eval_segments, len(segment_ids) - 1)
-    eval_segments = set(segment_ids[:n_eval_segments])
-    train_records = []
-    eval_records = []
-    for segment_id in segment_ids:
-        bucket = eval_records if segment_id in eval_segments else train_records
-        bucket.extend(by_segment[segment_id])
-    return sorted(train_records, key=_record_sort_key), sorted(eval_records, key=_record_sort_key)
+    return order_path, entries
+
+
+def _load_ordered_task_records(
+    cache_root: Path,
+    pair_root: Path,
+    data_type: str,
+    duration: str,
+    task: str,
+    data_seed: int,
+) -> tuple[list[dict], Path]:
+    pair_dir, pair_records = _load_pair_manifest_records(pair_root, data_type, duration, task)
+    order_path, order_entries = _read_or_create_pair_order(
+        pair_dir, pair_records, data_seed, data_type, duration, task,
+    )
+    cache_records = _load_cache_task_records(cache_root, data_type, duration, task)
+    cache_by_pair = {record["pair_id"]: record for record in cache_records}
+    order_pair_ids = [entry["pair_id"] for entry in order_entries]
+    missing = sorted(set(order_pair_ids) - set(cache_by_pair))
+    extra = sorted(set(cache_by_pair) - set(order_pair_ids))
+    if missing or extra:
+        raise ValueError(
+            f"Cache manifest does not match pair order for {task}: "
+            f"missing_cache={missing[:5]} extra_cache={extra[:5]}"
+        )
+    ordered_records = []
+    for order_index, entry in enumerate(order_entries):
+        record = dict(cache_by_pair[entry["pair_id"]])
+        record["order_index"] = order_index
+        record["pair_order_path"] = str(order_path)
+        ordered_records.append(record)
+    return ordered_records, order_path
+
+
+def _auto_in_task_eval_size(total: int) -> int:
+    if total <= 1:
+        raise ValueError("In-task data needs at least 2 samples for train/eval separation")
+    return min(max(1, int(total * 0.1)), total - 1)
+
+
+def _allocate_counts(capacity_by_task: dict[str, int], size: int, label: str) -> dict[str, int]:
+    total = sum(capacity_by_task.values())
+    if size < 0 or size == 0:
+        return dict(capacity_by_task)
+    if size > total:
+        raise ValueError(
+            f"Requested {label} size {size}, but only {total} samples are available"
+        )
+    if total == 0:
+        raise ValueError(f"No samples are available for {label}")
+    raw = {
+        task: size * capacity / total
+        for task, capacity in capacity_by_task.items()
+    }
+    counts = {task: int(value) for task, value in raw.items()}
+    remaining = size - sum(counts.values())
+    remainders = sorted(
+        capacity_by_task,
+        key=lambda task: (raw[task] - counts[task], capacity_by_task[task], task),
+        reverse=True,
+    )
+    for task in remainders:
+        if remaining == 0:
+            break
+        if counts[task] < capacity_by_task[task]:
+            counts[task] += 1
+            remaining -= 1
+    if remaining:
+        raise RuntimeError(f"Unable to allocate {remaining} {label} samples")
+    return counts
+
+
+def _task_counts(records: list[dict]) -> dict[str, int]:
+    return dict(sorted(Counter(record["robot_task"] for record in records).items()))
 
 
 def build_runtime_split(args) -> RuntimeSplit:
@@ -164,32 +318,67 @@ def build_runtime_split(args) -> RuntimeSplit:
     cache_root = getattr(args, "cache_root", "") or str(
         Path(MAIN_ROOT) / "training_data" / "cache" / "vae"
     )
-    root = Path(cache_root) / data_type / duration
-    train_pool: list[dict] = []
-    eval_pool: list[dict] = []
-    ood_pool: list[dict] = []
+    pair_root = getattr(args, "pair_root", "") or str(
+        Path(MAIN_ROOT) / "training_data" / "pair"
+    )
+    cache_task_root = Path(cache_root) / data_type / duration
+    pair_root_path = Path(pair_root)
+    records_by_task: dict[str, list[dict]] = {}
+    order_paths: dict[str, str] = {}
 
     for task in train_tasks:
-        records = _load_task_records(root, data_type, duration, task)
-        task_train, task_eval = _heldout_eval_pool(records, args.data_seed, task)
-        train_pool.extend(task_train)
-        eval_pool.extend(task_eval)
+        records, order_path = _load_ordered_task_records(
+            cache_task_root, pair_root_path, data_type, duration, task, args.data_seed,
+        )
+        records_by_task[task] = records
+        order_paths[task] = str(order_path)
 
     for task in ood_tasks:
-        ood_pool.extend(_load_task_records(root, data_type, duration, task))
+        records, order_path = _load_ordered_task_records(
+            cache_task_root, pair_root_path, data_type, duration, task, args.data_seed,
+        )
+        records_by_task[task] = records
+        order_paths[task] = str(order_path)
 
-    train_records = _sample(
-        sorted(train_pool, key=_record_sort_key), args.train_size,
-        f"{args.data_seed}:train", "train",
+    train_task_sizes = {task: len(records_by_task[task]) for task in train_tasks}
+    in_task_total = sum(train_task_sizes.values())
+    if args.in_task_eval_size < 0 or args.in_task_eval_size == 0:
+        in_task_eval_size = _auto_in_task_eval_size(in_task_total)
+    else:
+        in_task_eval_size = args.in_task_eval_size
+    if in_task_eval_size >= in_task_total:
+        raise ValueError(
+            f"Requested in-task eval size {in_task_eval_size}, but only "
+            f"{in_task_total} in-task samples are available; at least one sample "
+            "must remain available for training"
+        )
+    eval_counts = _allocate_counts(
+        train_task_sizes, in_task_eval_size, "in-task eval",
     )
-    eval_records = _sample(
-        sorted(eval_pool, key=_record_sort_key), args.in_task_eval_size,
-        f"{args.data_seed}:in_task_eval", "in-task eval",
-    )
-    ood_records = _sample(
-        sorted(ood_pool, key=_record_sort_key), args.ood_eval_size,
-        f"{args.data_seed}:ood_eval", "OOD eval",
-    )
+    train_capacity = {
+        task: train_task_sizes[task] - eval_counts[task]
+        for task in train_tasks
+    }
+    train_counts = _allocate_counts(train_capacity, args.train_size, "train")
+
+    train_records: list[dict] = []
+    eval_records: list[dict] = []
+    for task in train_tasks:
+        task_records = records_by_task[task]
+        n_eval = eval_counts[task]
+        n_train = train_counts[task]
+        train_limit = len(task_records) - n_eval
+        train_records.extend(task_records[:n_train])
+        eval_records.extend(task_records[train_limit:])
+
+    ood_records: list[dict] = []
+    if ood_tasks:
+        ood_task_sizes = {task: len(records_by_task[task]) for task in ood_tasks}
+        ood_counts = _allocate_counts(ood_task_sizes, args.ood_eval_size, "OOD eval")
+        for task in ood_tasks:
+            n_ood = ood_counts[task]
+            if n_ood:
+                ood_records.extend(records_by_task[task][-n_ood:])
 
     return RuntimeSplit(
         train_files=[record["cache_path"] for record in train_records],
@@ -198,6 +387,12 @@ def build_runtime_split(args) -> RuntimeSplit:
         train_records=train_records,
         eval_records=eval_records,
         ood_records=ood_records,
+        split_counts={
+            "train": _task_counts(train_records),
+            "in_task_eval": _task_counts(eval_records),
+            "ood_eval": _task_counts(ood_records),
+        },
+        order_paths=order_paths,
     )
 
 
@@ -211,7 +406,7 @@ def sample_eval_video_files(
             f"Requested {split_name} eval video size {size}, but only {len(files)} eval samples are available"
         )
     sampled = list(files)
-    random.Random(f"{data_seed}:video:{split_name}:{step}").shuffle(sampled)
+    random.Random(f"{data_seed}:video:{split_name}").shuffle(sampled)
     return sorted(sampled[:size])
 
 
@@ -238,5 +433,8 @@ def write_runtime_split(run_dir: Path, args, split: RuntimeSplit) -> None:
         "ood_eval_size": args.ood_eval_size,
         "ood_video_size": args.ood_video_size,
         "data_seed": args.data_seed,
+        "pair_root": getattr(args, "pair_root", ""),
+        "split_counts": split.split_counts,
+        "pair_order_paths": split.order_paths,
     }
     (out_dir / "config.json").write_text(json.dumps(config, indent=2, sort_keys=True))

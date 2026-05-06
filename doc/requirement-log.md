@@ -1,5 +1,22 @@
 # 需求日志
 
+## 2026-05-06
+
+**用户原始需求：**
+> 当前训练每一轮 eval 数据不同，需要统一。每个 task 的 pair 目录下生成一次乱序表，例如 `training_data/pair/blur_r2r/1s/Inspire_Collect_Clothes_MainCamOnly`；训练时从这个表取数据，按 pair 划分，不按 segment；`--train-size` 按 task 比例分配，并在训练前打印每个数据集选了多少 training size。
+
+**创建的任务：**
+- [039] 固定 task 级 pair 顺序表的数据划分
+
+**完成改动：**
+- `src/pipeline/runtime_data.py`：新增 task 级 `pair_order.jsonl` 生成/读取/校验；训练从顺序表头部按比例取 train，从尾部取 in-task/OOD eval；eval video 子采样不再随 step 变化。
+- `src/pipeline/train.py`：新增 `--pair-root`，训练启动日志打印每个 split/task 的实际样本数和顺序表路径。
+- `src/pipeline/train_config.py`、`scripts/smoke_test_gpu.py`：为训练 preset 补充 `pair_root`，让 smoke 使用自己的临时结构化 pair 目录，避免临时 cache 与主数据完整 manifest 混用。
+- `tests/test_runtime_data.py`：覆盖顺序表首次生成与复用、train size 按 task 比例分配、train/eval 分离、eval video step 固定。
+- `doc/step_5_training_infra.md`、`doc/step_5_two_stage_training.md`：记录 `pair_order.jsonl` 位置、划分规则和参数语义。
+
+---
+
 ## 2026-04-29
 
 **用户原始需求：**

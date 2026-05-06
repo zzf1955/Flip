@@ -98,10 +98,10 @@ def record_gpu_status(log_path: Path) -> None:
 
 
 def prepare_inputs() -> None:
-    pair_dir = SMOKE_ROOT / "pair_src"
+    pair_dir = SMOKE_ROOT / "pair" / "h2r" / "1s" / SMOKE_TASK
     cache_task = SMOKE_ROOT / "cache_generated" / "h2r" / "1s" / SMOKE_TASK
     t5_dir = SMOKE_ROOT / "t5"
-    for path in (pair_dir, SMOKE_ROOT / "cache_generated", t5_dir):
+    for path in (SMOKE_ROOT / "pair", SMOKE_ROOT / "cache_generated", t5_dir):
         if path.exists():
             shutil.rmtree(path)
     (pair_dir / "video").mkdir(parents=True)
@@ -145,7 +145,7 @@ def main() -> int:
     run(
         [
             str(PYTHON), "-m", "src.pipeline.mitty_cache",
-            "--pair-dir", str(SMOKE_ROOT / "pair_src"),
+            "--pair-dir", str(SMOKE_ROOT / "pair" / "h2r" / "1s" / SMOKE_TASK),
             "--output", str(SMOKE_ROOT / "cache_generated" / "h2r" / "1s" / SMOKE_TASK),
             "--t5-cache-dir", str(SMOKE_ROOT / "t5"),
             "--device", "cuda:0",
