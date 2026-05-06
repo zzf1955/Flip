@@ -7,11 +7,12 @@ import torch
 
 from src.tools.eval_metrics import (
     clip_mask_indices,
+    collect_local_video_features,
     compute_pairwise_metrics,
+    crop_video_by_mask_bbox,
     load_clip_mask_stack,
     mse_to_psnr,
     resolve_sam2_mask_path,
-    split_video_by_mask,
 )
 
 
@@ -56,7 +57,7 @@ class EvalMaskRegionTest(unittest.TestCase):
             self.assertTrue(clip_masks[0, :, 2].all())
             self.assertTrue(clip_masks[1, :, 1].all())
 
-    def test_split_video_by_mask_keeps_foreground_and_background_regions(self):
+    def test_crop_video_by_mask_bbox_uses_local_region(self):
         frames = np.arange(2 * 2 * 2 * 3, dtype=np.uint8).reshape(2, 2, 2, 3)
         masks = np.array(
             [
@@ -65,12 +66,35 @@ class EvalMaskRegionTest(unittest.TestCase):
             ]
         )
 
-        split = split_video_by_mask(frames, masks)
+        cropped = crop_video_by_mask_bbox(frames, masks, margin=0, output_size=2)
 
-        self.assertTrue((split["foreground"][masks] == frames[masks]).all())
-        self.assertTrue((split["foreground"][~masks] == 0).all())
-        self.assertTrue((split["background"][~masks] == frames[~masks]).all())
-        self.assertTrue((split["background"][masks] == 0).all())
+        self.assertEqual(cropped.shape, (2, 2, 2, 3))
+        self.assertEqual(cropped.dtype, np.uint8)
+
+    def test_collect_local_video_features_crops_before_fvd_features(self):
+        class DummyVideoExtractor(torch.nn.Module):
+            def forward(self, x):
+                self.last_shape = tuple(x.shape)
+                return x.mean(dim=(2, 3, 4))
+
+        video = np.zeros((2, 4, 4, 3), dtype=np.uint8)
+        video[:, 1:3, 1:3, :] = 255
+        masks = np.zeros((2, 4, 4), dtype=bool)
+        masks[:, 1:3, 1:3] = True
+        extractor = DummyVideoExtractor()
+
+        features = collect_local_video_features(
+            [video],
+            [masks],
+            extractor,
+            torch.device("cpu"),
+            margin=0,
+            batch_size=1,
+        )
+
+        self.assertEqual(features.shape, (1, 3))
+        self.assertTrue(np.allclose(features, 1.0))
+        self.assertEqual(extractor.last_shape, (1, 3, 2, 224, 224))
 
     def test_pairwise_metrics_include_global_and_masked_regions(self):
         gt = np.zeros((1, 16, 16, 3), dtype=np.uint8)
