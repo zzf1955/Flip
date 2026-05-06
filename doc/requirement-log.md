@@ -786,3 +786,30 @@
 - `src/pipeline/train.py` 和 `src/pipeline/train_mitty.py` 在传入 `--wandb-run-name` 时直接复用该值作为本地 run 目录名和 W&B run name。
 - grid/bash launcher 只需在外层生成一次带时间戳的 run name；训练入口不再为本地目录另取一次创建时间，避免 W&B 面板和 `training_data/log/` 后缀不一致。
 - `doc/step_5_training_infra.md` 同步说明 `--wandb-run-name` 现在同时控制本地 log 目录和 W&B run name。
+
+## 2026-05-06 — Local FID 替换黑底区域 Frechet 指标
+
+**用户原始需求：**
+> 你先实现 Local FID, 把当前那个黑色背景的方法替换成这个 Local FID
+
+**创建的任务：**
+- [041] Local FID 替换黑底区域 Frechet 指标
+
+## 2026-05-06 — Count-based eval selection 与 Local FID 可视化输出
+
+**用户原始需求：**
+> 当前的 eval 要适配新的随机数据表；每次 eval 输入 in task 样本数量和 ood 样本数量，in task 按照比例划分，从表的最后开始读取后 k 个作为 eval，ood task 只有一个；输出 Local 的视频，patch 数据应该可以按照数据索引对应回去。
+
+**创建的任务：**
+- [042] Count-based eval selection 与 Local FID 可视化输出
+
+## 2026-05-06 — Mitty eval metrics 并行与进度输出
+
+用户要求：
+> 我把代码改了,现在并行程度高了, 会输出中间进度了, 两个模型并行跑一下
+
+落实：
+- `src/tools/eval_metrics.py`：`process_step()` 使用可配置 `metric_workers` 并行读取视频和计算 CPU pairwise 指标；LPIPS、FID/Local FID、S3D FVD 改为跨视频合批执行，并提供阶段进度回调。
+- `src/pipeline/evaluate_mitty_models.py`：新增 `--metric-workers`、`--lpips-batch-size`、`--feature-batch-size`、`--fvd-batch-size`、`--no-progress`；generation、Local crop 和 metrics 阶段默认打印进度。
+- `src/core/eval_metrics.py`、`src/pipeline/train.py`、`src/pipeline/train_mitty.py`：训练时在线 eval metrics 也改为 frame/video batch，并在训练日志中打印指标阶段进度。
+- 已并行跑完 qkv 与 qkvo_ffn 的 `step-1000`、`80` 个 in-task 和 `42` 个 OOD 样本评估，summary 与 Local 视频均输出到 `training_data/log/eval_h2r_80in_42ood_local_0506`。
