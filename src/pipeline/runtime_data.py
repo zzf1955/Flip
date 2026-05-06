@@ -268,6 +268,17 @@ def _auto_in_task_eval_size(total: int) -> int:
     return min(max(1, int(total * 0.1)), total - 1)
 
 
+def _tail_percent_count(total: int, percent: float, label: str) -> int:
+    if total <= 0:
+        raise ValueError(f"No samples are available for {label}")
+    if percent <= 0.0 or percent > 100.0:
+        raise ValueError(f"{label} tail percent must be in (0, 100], got {percent}")
+    count = int(total * percent / 100.0)
+    if count * 100.0 < total * percent:
+        count += 1
+    return min(max(1, count), total)
+
+
 def _allocate_counts(capacity_by_task: dict[str, int], size: int, label: str) -> dict[str, int]:
     total = sum(capacity_by_task.values())
     if size < 0 or size == 0:
@@ -389,6 +400,75 @@ def build_runtime_split(args) -> RuntimeSplit:
         ood_records=ood_records,
         split_counts={
             "train": _task_counts(train_records),
+            "in_task_eval": _task_counts(eval_records),
+            "ood_eval": _task_counts(ood_records),
+        },
+        order_paths=order_paths,
+    )
+
+
+def build_tail_eval_split(args) -> RuntimeSplit:
+    """Select eval records from the tail of each task-level pair order table."""
+    data_type = args.data_type
+    duration = args.duration
+    if data_type not in DATA_TYPES:
+        raise ValueError(f"Unknown data type '{data_type}'. Available: {sorted(DATA_TYPES)}")
+    train_tasks = parse_task_list(args.train_tasks)
+    ood_tasks = parse_task_list(args.ood_tasks, allow_empty=True)
+    overlap = sorted(set(train_tasks) & set(ood_tasks))
+    if overlap:
+        raise ValueError(f"Tasks cannot be both train and OOD: {overlap}")
+
+    cache_root = getattr(args, "cache_root", "") or str(
+        Path(MAIN_ROOT) / "training_data" / "cache" / "vae"
+    )
+    pair_root = getattr(args, "pair_root", "") or str(
+        Path(MAIN_ROOT) / "training_data" / "pair"
+    )
+    cache_task_root = Path(cache_root) / data_type / duration
+    pair_root_path = Path(pair_root)
+    records_by_task: dict[str, list[dict]] = {}
+    order_paths: dict[str, str] = {}
+
+    for task in train_tasks:
+        records, order_path = _load_ordered_task_records(
+            cache_task_root, pair_root_path, data_type, duration, task, args.data_seed,
+        )
+        records_by_task[task] = records
+        order_paths[task] = str(order_path)
+
+    for task in ood_tasks:
+        records, order_path = _load_ordered_task_records(
+            cache_task_root, pair_root_path, data_type, duration, task, args.data_seed,
+        )
+        records_by_task[task] = records
+        order_paths[task] = str(order_path)
+
+    eval_records: list[dict] = []
+    for task in train_tasks:
+        task_records = records_by_task[task]
+        n_eval = _tail_percent_count(
+            len(task_records), args.eval_tail_percent, f"in-task eval for {task}",
+        )
+        eval_records.extend(task_records[-n_eval:])
+
+    ood_records: list[dict] = []
+    for task in ood_tasks:
+        task_records = records_by_task[task]
+        n_ood = _tail_percent_count(
+            len(task_records), args.eval_tail_percent, f"OOD eval for {task}",
+        )
+        ood_records.extend(task_records[-n_ood:])
+
+    return RuntimeSplit(
+        train_files=[],
+        eval_files=[record["cache_path"] for record in eval_records],
+        ood_files=[record["cache_path"] for record in ood_records],
+        train_records=[],
+        eval_records=eval_records,
+        ood_records=ood_records,
+        split_counts={
+            "train": {},
             "in_task_eval": _task_counts(eval_records),
             "ood_eval": _task_counts(ood_records),
         },

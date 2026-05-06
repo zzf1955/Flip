@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parents[1]
 MAIN_ROOT = Path(os.environ.get("FLIP_MAIN_ROOT", "/disk_n/zzf/flip"))
 PYTHON = Path(sys.executable)
 SMOKE_ROOT = ROOT / "tmp" / "smoke_test" / "gpu"
-SMOKE_TASK = "Inspire_Put_Clothes_Into_Basket"
+SMOKE_TASK = "Inspire_Collect_Clothes_MainCamOnly"
 PAIR_SRC = MAIN_ROOT / "training_data" / "pair" / "h2r" / "1s" / SMOKE_TASK
 T5_SRC = MAIN_ROOT / "training_data" / "cache" / "t5" / "h2r" / "1s"
 

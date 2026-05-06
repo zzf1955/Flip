@@ -73,23 +73,24 @@ Seedance direct 的 1s 训练数据由 `src.pipeline.seedance_clip` 从
 当前维护的数据 Task 固定为三个机器人 Task：
 
 - `Inspire_Pickup_Pillow_MainCamOnly`
-- `Inspire_Put_Clothes_Into_Basket`
+- `Inspire_Collect_Clothes_MainCamOnly`
 - `Inspire_Put_Clothes_into_Washing_Machine`
 
 数据本身不再预先切成 `train/eval/ood_eval`。磁盘只按物理属性组织；
 训练时通过 CLI 指定 `--train-tasks` 与 `--ood-tasks`。每个 task 的
 `training_data/pair/<data_type>/<duration>/<robot_task>/pair_order.jsonl`
 保存该 task 的固定 pair 乱序表；第一次训练缺失该表时用 `--data-seed`
-生成，之后训练只读取并校验，不会重新洗牌。默认 preset 使用 Basket +
+生成，之后训练只读取并校验，不会重新洗牌。默认 preset 使用 Collect +
 Washing 作为 in-task，Pillow 作为 OOD。
 
 四类数据类型：
 
 - `identity_r2r`：清晰机器人 → 同一清晰机器人。
-- `blur_r2r`：模糊机器人 → 清晰机器人。`video/` 是清晰 robot target；
-  `control_video/` 由同一 robot clip 结合 `training_data/sam2_mask/` 全身 mask
-  做局部 Gaussian blur 生成，语义与旧 `1s_patch` 的 blur 数据一致，但输出为
-  当前 task-organized 布局。
+- `blur_r2r`：模糊机器人 → 清晰机器人。该数据不依赖 human/Seedance，
+  直接枚举三个 canonical robot Task 的全部 `training_data/segment/` 数据；
+  `video/` 是清晰 robot target，`control_video/` 由同一 robot clip 结合
+  `training_data/sam2_mask/` 全身 mask 做局部 Gaussian blur 生成，语义与旧
+  `1s_patch` 的 blur 数据一致，但输出为当前 task-organized 布局。
 - `h2r`：人 → 机器人。
 - `r2h`：机器人 → 人。
 
@@ -163,8 +164,8 @@ python -m src.pipeline.make_pair \
   --clean
 
 CUDA_VISIBLE_DEVICES=2 python -m src.pipeline.mitty_cache \
-  --pair-dir training_data/pair/h2r/1s/Inspire_Put_Clothes_Into_Basket \
-  --output training_data/cache/vae/h2r/1s/Inspire_Put_Clothes_Into_Basket \
+  --pair-dir training_data/pair/h2r/1s/Inspire_Collect_Clothes_MainCamOnly \
+  --output training_data/cache/vae/h2r/1s/Inspire_Collect_Clothes_MainCamOnly \
   --t5-cache-dir training_data/cache/t5/h2r/1s \
   --device cuda:0 \
   --batch-size 4 \
@@ -184,9 +185,10 @@ python scripts/migrate_task_layout.py --data-type identity_r2r --duration 1s --c
 
 ### Blur R2R 数据
 
-`blur_r2r` 仍通过 `make_pair.py` 生成，以便复用 `seedance_direct/1s`
-manifest 中的 0.5s 滑窗和 hflip 信息；human 视频只用于收集可用 clip 与对齐
-source segment，不写入 pair。生成 control 时要求对应
+`blur_r2r` 通过 `make_pair.py` 生成，但不再从 `seedance_direct/1s`
+匹配可用 human clip；它直接使用三个 canonical robot Task 的全部
+`training_data/segment/` 数据。1s 数据对每条 4s segment 生成 4 个非重叠
+robot clip。生成 control 时要求对应
 `training_data/sam2_mask/<task>/<episode>/<seg>.npz` 已存在，缺失会直接报错。
 
 ```bash
@@ -194,7 +196,6 @@ python -m src.pipeline.make_pair \
   --task all \
   --second 1s \
   --data-type blur_r2r \
-  --human-source seedance_direct \
   --workers 64 \
   --clean
 ```
@@ -211,8 +212,8 @@ python -m src.pipeline.make_robot_pair \
   --clean
 
 CUDA_VISIBLE_DEVICES=2 python -m src.pipeline.mitty_cache \
-  --pair-dir training_data/pair/identity_r2r/1s/Inspire_Put_Clothes_Into_Basket \
-  --output training_data/cache/vae/identity_r2r/1s/Inspire_Put_Clothes_Into_Basket \
+  --pair-dir training_data/pair/identity_r2r/1s/Inspire_Collect_Clothes_MainCamOnly \
+  --output training_data/cache/vae/identity_r2r/1s/Inspire_Collect_Clothes_MainCamOnly \
   --t5-cache-dir training_data/cache/t5/identity_r2r/1s \
   --device cuda:0 \
   --batch-size 4
@@ -278,6 +279,16 @@ CUDA_VISIBLE_DEVICES=2 python -m src.pipeline.train \
 其中 `lora_targets` 会把 `--lora-target-modules` 压成文件名安全的短签名，
 例如 `self_attn.q,self_attn.k,self_attn.v,cross_attn.q,cross_attn.k,cross_attn.v,ffn.0,ffn.2`
 → `self_qkv_cross_qkv_ffn`，`ffn.0,ffn.2` → `ffn`。时间戳精确到秒，避免同一分钟内启动多个实验时目录重名。
+如果显式传 `--wandb-run-name <name>`，训练入口会直接用 `<name>` 作为
+本地 `training_data/log/<name>/` 目录名和 W&B run name；grid/bash launcher
+只需要在外层生成一次带时间戳的 run name，避免 W&B 与本地 log 目录各自取
+创建时间导致后缀不一致。
+`scripts/flip_run.sh train` 通过 flip 环境的 Python 执行
+`torch.distributed.run`，避免依赖交互 shell 的 `torchrun` PATH。
+
+需要让本地训练目录与默认 W&B run name 使用实验族前缀时，传
+`--run-prefix <prefix>`；该值会原样替换默认 `Mitty` 前缀，例如
+`--run-prefix mitty_h2r` 会生成 `training_data/log/mitty_h2r-...`。
 
 LoRA 注入默认走细粒度 Attention 控制：
 
@@ -313,6 +324,8 @@ scripts/flip_run.sh train --cuda 2 -- \
 `scripts/train_lora_grid.py` 是维护中的 LoRA 搜索入口，用于把
 `LoRA layout × LoRA rank` 展开成一组单卡训练命令，并在指定 CUDA 列表上轮转顺序执行。
 实际训练仍通过 `scripts/flip_run.sh train --nproc 1` 启动，因此会复用统一环境变量、cache 和 GPU 入口。
+默认 launcher 会按机器 IP 自动选择：普通机器用 `scripts/flip_run.sh`，`10.20.1.2`
+会自动切到 `scripts/flip_run_2.sh`；如需强制指定，可传 `--runner`。
 
 常用示例：
 
@@ -331,6 +344,7 @@ scripts/train_lora_grid.py \
 | 参数 | 说明 |
 | --- | --- |
 | `--merge-lora` | 空格或逗号分隔的 checkpoint 列表；训练入口会在加载时自动检测每个 merge LoRA 的 rank 与 target modules |
+| `--train-lora` | 可训练 LoRA checkpoint；不显式传 `--ranks` / `--layouts` 时会让训练入口自动检测 rank 与 target modules |
 | `--task-name` / `--data-type` / `--duration` | 数据 preset 与可选覆盖；默认 task 分配来自 `train_config.py` |
 | `--pair-root` | pair 数据根目录，默认 `MAIN_ROOT/training_data/pair`；其中每个 task 目录保存 `pair_order.jsonl` |
 | `--train-size` | 固定搜索用训练数据量；按各 train task 可用样本量比例分配，`0/-1` 使用扣除 eval 尾部后的全部训练样本 |
@@ -341,15 +355,69 @@ scripts/train_lora_grid.py \
 | `--dry-run` | 只打印命令，不启动训练 |
 
 layout 名称直接写入本地 log 目录和 W&B run name，例如
-`h2r_1s_self_qkv_cross_qkv_ffn_r128_20260502_153000`。需要临时 layout 时可写
+`h2r_1s_self_qkv_cross_qkv_ffn_r128_20260502_153000`。该名字由 launcher 一次性生成并
+通过 `--wandb-run-name` 传给训练入口，因此本地目录和 W&B 面板使用同一个
+时间戳。需要临时 layout 时可写
 `name=target1,target2`，例如 `self_q=self_attn.q`。
 对比 qkv-only 时使用 `self_qkv` / `cross_qkv` / `self_qkv_cross_qkv`，这些 layout 不会在 `o` projection 上加 LoRA。
 
-加载训练好的 LoRA 时，`--init-lora` 会从 checkpoint 的 LoRA A/B tensor
+加载训练好的 LoRA 时，`--train-lora` / `--continue-lora` / `--init-lora`
+会从 checkpoint 的 LoRA A/B tensor
 自动检测 rank 和 target modules；未显式传 `--lora-rank` /
 `--lora-target-modules` 时不需要手动维护这些参数。若显式传入的 rank 与
 checkpoint 不一致，训练会直接报错；若注入后的 LoRA tensor 没有从 checkpoint
 完整加载，也会直接报错，避免部分随机初始化。
+
+推荐新命令使用更明确的两组参数：
+
+| 参数 | 语义 |
+| --- | --- |
+| `--merge-lora <ckpt>` | 把 checkpoint 的 LoRA delta 写入 frozen base weight；可重复传多个 |
+| `--train-lora <ckpt>` | 选择当前唯一开放训练的 LoRA checkpoint；会继续训练这套 adapter |
+| `--train-lora-rank` / `--train-lora-target-modules` | 不传 `--train-lora` 时，按这些参数新建一套可训练 LoRA |
+
+`--init-lora` 和 `--continue-lora` 仍保留为兼容别名。`--merge-lora` 与
+`--train-lora` 可以同时使用：前者是冻结背景能力，后者是本次 optimizer
+实际更新的 LoRA。若要“全程只有一个 LoRA 被训练”，不要传 `--merge-lora`，
+只让后一阶段用上一阶段 checkpoint 作为 `--train-lora`。
+
+### 单 LoRA 三阶段训练
+
+需要让 identity → blur → h2r 三个任务共用一个 LoRA 时，使用
+`scripts/train_three_stage_single_lora.py` 串行启动三个 stage。脚本在每个
+stage 结束后读取该 run 最新 checkpoint，并作为下一 stage 的 `--train-lora`：
+
+```bash
+scripts/train_three_stage_single_lora.py \
+  --cuda 0,1 \
+  --nproc 2 \
+  --lora-target-modules self_attn.q,self_attn.k,self_attn.v,self_attn.o,ffn.0,ffn.2 \
+  --stage identity_r2r_1s:1000 \
+  --stage blur_r2r_1s:1000 \
+  --stage h2r_1s:1000 \
+  --train-size 0 \
+  --in-task-eval-size 16 \
+  --ood-eval-size 16
+```
+
+如果第一阶段要接着已有 checkpoint 继续训练，传
+`--train-lora <ckpt.safetensors>`；否则第一阶段从随机初始化的单个 LoRA
+开始。三个 stage 默认会自动串联上一阶段 checkpoint。
+
+也可以在 stage 里显式选择 merge 哪些 LoRA、训练哪套 LoRA：
+
+```bash
+scripts/train_three_stage_single_lora.py \
+  --cuda 0,1 \
+  --nproc 2 \
+  --stage 'task=identity_r2r_1s;steps=1000;train=fresh;rank=64;targets=ffn.0,ffn.2' \
+  --stage 'task=blur_r2r_1s;steps=1000;train=previous' \
+  --stage 'task=h2r_1s;steps=1000;merge=training_data/log/frozen_style/ckpt/step-1000.safetensors;train=previous'
+```
+
+其中 `train=fresh` 表示新建可训练 LoRA，`train=previous` 表示继续上一阶段
+输出，`train=<ckpt>` 表示从指定 checkpoint 继续训练。`merge=<ckpt1>,<ckpt2>`
+表示这些 LoRA 只合并进 frozen base，不进入 optimizer。
 
 单卡：
 

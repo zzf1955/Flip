@@ -1,14 +1,14 @@
 """Offline generation + metric evaluation for trained Mitty LoRA runs.
 
 The script evaluates one or more trained ``training_data/log/<run>`` folders on
-the 1s pair cache. For each model and split it first generates ``gen_XX.mp4``
-videos, writes matched ``gt_XX.mp4`` / ``ctrl_XX.mp4`` videos, then computes
+the task-level runtime data split. For each model and split it first generates
+``gen_XX.mp4`` videos, writes matched ``gt_XX.mp4`` / ``ctrl_XX.mp4`` videos, then computes
 PSNR / SSIM / LPIPS / FID / FVD with ``src.tools.eval_metrics``.
 
 Default target:
   - Mitty-transfer-124d_r128_2000s_0425_1456
   - Mitty-transfer2LoRA-124d_r128_2000s_0425_1425
-  - 32 samples from ``eval`` + 32 samples from ``ood_eval``
+  - tail 10% from each configured in-task and OOD task ``pair_order.jsonl``
 """
 
 from __future__ import annotations
@@ -25,15 +25,16 @@ from pathlib import Path
 import torch
 from diffsynth.diffusion.flow_match import FlowMatchScheduler
 
-from src.core.config import MAIN_ROOT, T5_CACHE_DIR, TRAINING_DATA_ROOT
+from src.core.config import MAIN_ROOT, TRAINING_DATA_ROOT
 from src.core.train_utils import (
-    load_cached_files,
     load_sample,
     load_t5_cache,
     save_video,
     tensor_to_frames,
 )
 from src.pipeline.backbones import get_mitty_spec
+from src.pipeline.runtime_data import RuntimeSplit, build_tail_eval_split
+from src.pipeline.train_config import apply_train_task_config
 from src.pipeline.train_mitty import DEFAULT_DIT_DIR, DEFAULT_TOKENIZER, DEFAULT_VAE
 from src.tools.eval_metrics import (
     InceptionFeatureExtractor,
@@ -47,7 +48,14 @@ DEFAULT_RUNS = [
     "Mitty-transfer-124d_r128_2000s_0425_1456",
     "Mitty-transfer2LoRA-124d_r128_2000s_0425_1425",
 ]
-DEFAULT_SPLITS = ["eval", "ood_eval"]
+DEFAULT_SPLITS = ["in_task_eval", "ood_eval"]
+SPLIT_ALIASES = {
+    "eval": "in_task_eval",
+    "in_task": "in_task_eval",
+    "in_task_eval": "in_task_eval",
+    "ood": "ood_eval",
+    "ood_eval": "ood_eval",
+}
 
 
 @dataclass(frozen=True)
@@ -76,6 +84,19 @@ def resolve_path(path: str | Path) -> Path:
     if p.is_absolute():
         return p
     return Path(MAIN_ROOT) / p
+
+
+def normalize_splits(values: list[str]) -> list[str]:
+    splits = []
+    for value in values:
+        if value not in SPLIT_ALIASES:
+            raise ValueError(
+                f"Unknown split '{value}'. Available: {sorted(SPLIT_ALIASES)}"
+            )
+        split = SPLIT_ALIASES[value]
+        if split not in splits:
+            splits.append(split)
+    return splits
 
 
 def find_latest_checkpoint(run_dir: Path) -> Path:
@@ -155,12 +176,65 @@ def load_model(
     return model, spec
 
 
+def records_for_split(split: str, runtime_split: RuntimeSplit) -> list[dict]:
+    if split == "in_task_eval":
+        return runtime_split.eval_records
+    if split == "ood_eval":
+        return runtime_split.ood_records
+    raise ValueError(f"Unsupported split: {split}")
+
+
+def resolve_pair_media(record: dict, kind: str) -> Path:
+    raw_path = record.get(kind)
+    if not raw_path:
+        raise ValueError(f"Selected record missing {kind}: {record}")
+    path = Path(str(raw_path))
+    if path.is_absolute():
+        return path
+    pair_dir = record.get("pair_dir")
+    if not pair_dir:
+        raise ValueError(f"Selected record missing pair_dir for relative {kind}: {record}")
+    return Path(str(pair_dir)) / path
+
+
+def write_selected_records(base_dir: Path, splits: list[str], runtime_split: RuntimeSplit, args) -> None:
+    split_dir = base_dir / "data_split"
+    split_dir.mkdir(parents=True, exist_ok=True)
+    payloads = {
+        "in_task_eval": runtime_split.eval_records,
+        "ood_eval": runtime_split.ood_records,
+    }
+    for split in splits:
+        with (split_dir / f"{split}.jsonl").open("w") as fh:
+            for record in payloads[split]:
+                fh.write(json.dumps(record, sort_keys=True) + "\n")
+    config = {
+        "task_name": args.task_name,
+        "data_type": args.data_type,
+        "duration": args.duration,
+        "train_tasks": args.train_tasks,
+        "ood_tasks": args.ood_tasks,
+        "eval_tail_percent": args.eval_tail_percent,
+        "data_seed": args.data_seed,
+        "cache_root": args.cache_root,
+        "pair_root": args.pair_root,
+        "split_counts": runtime_split.split_counts,
+        "pair_order_paths": runtime_split.order_paths,
+    }
+    (split_dir / "config.json").write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
+
+
+def eval_base_dir(run: RunSpec, output_dir: str) -> Path:
+    if output_dir:
+        return resolve_path(output_dir) / run.name / run.checkpoint.stem
+    return run.checkpoint.parent / f"{run.checkpoint.stem}_eval"
+
+
 @torch.no_grad()
 def generate_split(
     model,
     spec,
-    files: list[str],
-    pair_split_dir: Path,
+    records: list[dict],
     out_dir: Path,
     device: str,
     num_inference_steps: int,
@@ -177,7 +251,8 @@ def generate_split(
         shift=5.0,
     )
 
-    for idx, path in enumerate(files):
+    for idx, record in enumerate(records):
+        path = record["cache_path"]
         sample = load_sample(path, device=device, t5_pos=t5_pos, t5_neg=t5_neg)
         denoised = spec.eval_denoise_fn(
             pipe=pipe,
@@ -194,9 +269,8 @@ def generate_split(
         sample_id = f"{idx:05d}"
         save_video(tensor_to_frames(gen_video), str(out_dir / f"gen_{sample_id}.mp4"))
 
-        pair_name = Path(path).stem + ".mp4"
-        gt_path = pair_split_dir / "video" / pair_name
-        ctrl_path = pair_split_dir / "control_video" / pair_name
+        gt_path = resolve_pair_media(record, "video")
+        ctrl_path = resolve_pair_media(record, "control_video")
         if not gt_path.is_file():
             raise FileNotFoundError(f"GT video not found: {gt_path}")
         if not ctrl_path.is_file():
@@ -215,7 +289,7 @@ def metric_models(device: torch.device, no_lpips: bool, no_fid: bool):
 def compute_rows(
     run_specs: list[RunSpec],
     splits: list[str],
-    out_root: Path,
+    output_dir: str,
     device: torch.device,
     no_lpips: bool,
     no_fid: bool,
@@ -223,8 +297,9 @@ def compute_rows(
     lpips_model, inception, video_extractor = metric_models(device, no_lpips, no_fid)
     rows = []
     for run in run_specs:
+        base_dir = eval_base_dir(run, output_dir)
         for split in splits:
-            split_out = out_root / run.name / run.checkpoint.stem / split
+            split_out = base_dir / split
             metrics = process_step(
                 str(split_out), lpips_model, inception, video_extractor, device)
             if not metrics:
@@ -234,6 +309,7 @@ def compute_rows(
                 "checkpoint": run.checkpoint.name,
                 "split": split,
                 "out_dir": str(split_out),
+                "summary_dir": str(base_dir),
                 **{k: v for k, v in metrics.items() if k != "per_sample"},
             }
             rows.append(row)
@@ -244,7 +320,7 @@ def compute_rows(
 def write_csv(rows: list[dict], path: Path):
     headers = [
         "run", "checkpoint", "split", "n_samples",
-        "psnr", "ssim", "lpips", "fid", "fvd", "out_dir",
+        "psnr", "ssim", "lpips", "fid", "fvd", "out_dir", "summary_dir",
     ]
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="") as f:
@@ -265,15 +341,25 @@ def main():
     ap.add_argument("--no-auto-merge-lora", action="store_true",
                     help="do not replay merge_lora paths recorded in train.log")
     ap.add_argument("--splits", nargs="+", default=DEFAULT_SPLITS,
-                    choices=["train", "eval", "ood_eval"])
-    ap.add_argument("--cache-root", default="training_data/cache/vae/pair_1s",
-                    help="VAE cache root containing split subdirs")
-    ap.add_argument("--pair-root", default="training_data/pair/1s",
-                    help="pair root containing split/video and split/control_video")
-    ap.add_argument("--t5-cache-dir", default=T5_CACHE_DIR)
-    ap.add_argument("--output-dir", default="training_data/eval/mitty_pair_1s")
-    ap.add_argument("--samples-per-split", type=int, default=32,
-                    help="samples per split; -1 means all cached samples")
+                    help="splits to evaluate: in_task_eval/eval and/or ood_eval/ood")
+    ap.add_argument("--task-name", default="pair_1s",
+                    help="training data preset used to fill data/cache/pair defaults")
+    ap.add_argument("--data-type", default="")
+    ap.add_argument("--duration", default="")
+    ap.add_argument("--train-tasks", default="")
+    ap.add_argument("--ood-tasks", default="")
+    ap.add_argument("--cache-root", default="",
+                    help="VAE cache root; default comes from --task-name")
+    ap.add_argument("--pair-root", default="",
+                    help="pair root; default comes from --task-name")
+    ap.add_argument("--t5-cache-dir", default="",
+                    help="T5 cache dir; default comes from --task-name")
+    ap.add_argument("--data-seed", type=int, default=42,
+                    help="seed used only when pair_order.jsonl must be created")
+    ap.add_argument("--eval-tail-percent", type=float, default=10.0,
+                    help="tail percentage to read from each task pair_order.jsonl")
+    ap.add_argument("--output-dir", default="",
+                    help="optional output root; default writes to <run>/ckpt/<step>_eval")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--lora-rank", type=int, default=None,
                     help="LoRA rank; auto-detected from each checkpoint by default")
@@ -300,19 +386,28 @@ def main():
                     help="skip both FID and FVD")
     args = ap.parse_args()
 
+    try:
+        apply_train_task_config(args)
+        args.splits = normalize_splits(args.splits)
+    except ValueError as exc:
+        ap.error(str(exc))
+
     run_specs = parse_run_specs(
         args.runs,
         args.checkpoint,
         auto_merge_lora=not args.no_auto_merge_lora,
     )
-    cache_root = resolve_path(args.cache_root)
-    pair_root = resolve_path(args.pair_root)
-    out_root = resolve_path(args.output_dir)
     t5_dir = resolve_path(args.t5_cache_dir)
+    args.cache_root = str(resolve_path(args.cache_root))
+    args.pair_root = str(resolve_path(args.pair_root))
 
-    t5_pos, t5_neg = load_t5_cache(str(t5_dir), device="cpu")
-    if t5_neg is None:
-        raise FileNotFoundError(f"negative T5 cache not found in {t5_dir}")
+    runtime_split = build_tail_eval_split(args)
+
+    print(
+        "Selected eval samples from pair_order tails: "
+        + json.dumps(runtime_split.split_counts, ensure_ascii=False, sort_keys=True),
+        flush=True,
+    )
 
     device = torch.device(args.device)
 
@@ -320,6 +415,10 @@ def main():
         ap.error("--no-generate and --generate-only are mutually exclusive")
 
     if not args.no_generate:
+        t5_pos, t5_neg = load_t5_cache(str(t5_dir), device="cpu")
+        if t5_neg is None:
+            raise FileNotFoundError(f"negative T5 cache not found in {t5_dir}")
+
         for run in run_specs:
             print(f"\n=== {run.name} | {run.checkpoint.name} ===", flush=True)
             if run.merge_lora_paths:
@@ -340,17 +439,16 @@ def main():
                 tokenizer_dir=args.tokenizer_dir,
             )
 
+            base_dir = eval_base_dir(run, args.output_dir)
+            write_selected_records(base_dir, args.splits, runtime_split, args)
             for split in args.splits:
-                split_files = load_cached_files(str(cache_root / split))
-                if args.samples_per_split >= 0:
-                    split_files = split_files[:args.samples_per_split]
-                split_out = out_root / run.name / run.checkpoint.stem / split
-                print(f"[{run.name}] {split}: {len(split_files)} samples -> {split_out}", flush=True)
+                split_records = records_for_split(split, runtime_split)
+                split_out = base_dir / split
+                print(f"[{run.name}] {split}: {len(split_records)} samples -> {split_out}", flush=True)
                 generate_split(
                     model=model,
                     spec=spec,
-                    files=split_files,
-                    pair_split_dir=pair_root / split,
+                    records=split_records,
                     out_dir=split_out,
                     device=args.device,
                     num_inference_steps=args.num_inference_steps,
@@ -369,18 +467,22 @@ def main():
     rows = compute_rows(
         run_specs=run_specs,
         splits=args.splits,
-        out_root=out_root,
+        output_dir=args.output_dir,
         device=device,
         no_lpips=args.no_lpips,
         no_fid=args.no_fid,
     )
 
-    csv_path = out_root / "summary.csv"
-    json_path = out_root / "summary.json"
-    write_csv(rows, csv_path)
-    json_path.write_text(json.dumps(rows, ensure_ascii=False, indent=2) + "\n")
-    print(f"\nSaved summary: {csv_path}")
-    print(f"Saved summary: {json_path}")
+    for run in run_specs:
+        base_dir = eval_base_dir(run, args.output_dir)
+        run_rows = [row for row in rows if row["run"] == run.name]
+        write_selected_records(base_dir, args.splits, runtime_split, args)
+        csv_path = base_dir / "summary.csv"
+        json_path = base_dir / "summary.json"
+        write_csv(run_rows, csv_path)
+        json_path.write_text(json.dumps(run_rows, ensure_ascii=False, indent=2) + "\n")
+        print(f"\nSaved summary: {csv_path}")
+        print(f"Saved summary: {json_path}")
 
 
 if __name__ == "__main__":

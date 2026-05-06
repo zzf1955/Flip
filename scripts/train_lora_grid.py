@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import argparse
 import shlex
+import socket
 import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -20,6 +22,9 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MAIN_ROOT = PROJECT_ROOT if PROJECT_ROOT.name != "t038" else PROJECT_ROOT.parents[1]
 DEFAULT_FLIP_RUNNER = PROJECT_ROOT / "scripts" / "flip_run.sh"
+IP_RUNNERS = {
+    "10.20.1.2": PROJECT_ROOT / "scripts" / "flip_run_2.sh",
+}
 
 LAYOUT_TARGETS: dict[str, list[str]] = {
     "self_qkv": ["self_attn.q", "self_attn.k", "self_attn.v"],
@@ -55,7 +60,7 @@ LAYOUT_TARGETS: dict[str, list[str]] = {
 @dataclass(frozen=True)
 class RunSpec:
     layout: str
-    rank: int
+    rank: int | None
     cuda: str
     run_name: str
     command: list[str]
@@ -88,6 +93,27 @@ def _resolve_existing_file(path_text: str) -> str:
             return str(candidate)
     path = candidates[-1]
     raise FileNotFoundError(f"LoRA checkpoint not found: {path}")
+
+
+def _local_ip_addresses() -> set[str]:
+    addresses = set()
+    hostname = socket.gethostname()
+    for host in (hostname, socket.getfqdn(), ""):
+        try:
+            infos = socket.getaddrinfo(host, None, family=socket.AF_INET)
+        except socket.gaierror:
+            continue
+        for info in infos:
+            addresses.add(info[4][0])
+    return addresses
+
+
+def _default_runner() -> Path:
+    addresses = _local_ip_addresses()
+    for ip_address, runner in IP_RUNNERS.items():
+        if ip_address in addresses:
+            return runner
+    return DEFAULT_FLIP_RUNNER
 
 
 def _parse_layout(value: str) -> tuple[str, list[str]]:
@@ -125,25 +151,49 @@ def _optional_int_flag(cmd: list[str], flag: str, value: int) -> None:
 
 
 def _build_runs(args: argparse.Namespace) -> list[RunSpec]:
-    layouts = [_parse_layout(item) for item in _csv(args.layouts)]
-    ranks = _positive_int_csv(args.ranks, label="rank")
     cuda_devices = _csv(args.cuda)
     if not cuda_devices:
         raise ValueError("--cuda is empty")
 
+    train_lora_args = [
+        (flag, value)
+        for flag, value in [
+            ("--init-lora", args.init_lora),
+            ("--continue-lora", args.continue_lora),
+            ("--train-lora", args.train_lora),
+        ]
+        if value
+    ]
+    init_lora = ""
+    if train_lora_args:
+        init_lora = _resolve_existing_file(train_lora_args[0][1])
+        for flag, value in train_lora_args[1:]:
+            path = _resolve_existing_file(value)
+            if path != init_lora:
+                raise ValueError(
+                    f"{flag} points to a different file than {train_lora_args[0][0]}"
+                )
     merge_loras = [_resolve_existing_file(path) for path in _merge_lora_items(args.merge_lora)]
-    init_lora = _resolve_existing_file(args.init_lora) if args.init_lora else ""
+    if init_lora and not args.layouts_explicit:
+        layouts = [("continued", [])]
+    else:
+        layouts = [_parse_layout(item) for item in _csv(args.layouts)]
+    if init_lora and not args.ranks_explicit:
+        ranks = [None]
+    else:
+        ranks = _positive_int_csv(args.ranks, label="rank")
 
     timestamp = args.timestamp or datetime.now().strftime("%Y%m%d_%H%M%S")
     prefix = args.name_prefix or args.task_name
-    runner = str(Path(args.runner).expanduser())
+    runner = str(Path(args.runner).expanduser()) if args.runner else str(_default_runner())
 
     runs: list[RunSpec] = []
     index = 0
     for layout, targets in layouts:
         for rank in ranks:
             cuda = cuda_devices[index % len(cuda_devices)]
-            run_name = f"{prefix}_{layout}_r{rank}_{timestamp}"
+            rank_part = f"r{rank}" if rank is not None else "auto"
+            run_name = f"{prefix}_{layout}_{rank_part}_{timestamp}"
             cmd = [runner, "train", "--cuda", cuda, "--nproc", "1", "--"]
             cmd.extend(["--task-name", args.task_name])
             if args.data_type:
@@ -163,9 +213,11 @@ def _build_runs(args: argparse.Namespace) -> list[RunSpec]:
             for lora_path in merge_loras:
                 cmd.extend(["--merge-lora", lora_path])
             if init_lora:
-                cmd.extend(["--init-lora", init_lora])
-            cmd.extend(["--lora-rank", str(rank)])
-            cmd.extend(["--lora-target-modules", ",".join(targets)])
+                cmd.extend(["--train-lora", init_lora])
+            if rank is not None:
+                cmd.extend(["--lora-rank", str(rank)])
+            if targets:
+                cmd.extend(["--lora-target-modules", ",".join(targets)])
             cmd.extend(["--batch-size", str(args.batch_size)])
             _optional_int_flag(cmd, "--train-size", args.train_size)
             _optional_int_flag(cmd, "--in-task-eval-size", args.in_task_eval_size)
@@ -187,10 +239,13 @@ def _build_runs(args: argparse.Namespace) -> list[RunSpec]:
                 "--wandb-tags",
                 args.task_name,
                 f"layout:{layout}",
-                f"rank:{rank}",
                 f"grid:{timestamp}",
                 f"cuda:{cuda}",
             ])
+            if rank is not None:
+                cmd.append(f"rank:{rank}")
+            else:
+                cmd.append("rank:auto")
             cmd.extend(args.extra_train_arg)
             runs.append(RunSpec(layout=layout, rank=rank, cuda=cuda, run_name=run_name, command=cmd))
             index += 1
@@ -213,6 +268,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--merge-lora", nargs="*", default=[], help="one or more LoRA checkpoints merged before training")
     parser.add_argument("--init-lora", default="", help="optional LoRA checkpoint used to initialize trainable LoRA")
+    parser.add_argument("--continue-lora", default="", help="preferred alias for --init-lora when continuing one trainable LoRA")
+    parser.add_argument("--train-lora", default="", help="trainable LoRA checkpoint to continue")
     parser.add_argument("--task-name", default="h2r_1s", help="src.pipeline.train task preset")
     parser.add_argument("--data-type", default="", help="override semantic data type")
     parser.add_argument("--duration", default="", help="override data duration")
@@ -242,10 +299,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb-project", default="Flip")
     parser.add_argument("--name-prefix", default="", help="prefix for W&B run name; default is task-name")
     parser.add_argument("--timestamp", default="", help="fixed YYYYMMDD_HHMMSS-like run timestamp")
-    parser.add_argument("--runner", default=str(DEFAULT_FLIP_RUNNER))
+    parser.add_argument("--runner", default="", help="override launcher; default uses flip_run_2.sh on 10.20.1.2, otherwise flip_run.sh")
     parser.add_argument("--dry-run", action="store_true", help="print commands without launching training")
     parser.add_argument("extra_train_arg", nargs=argparse.REMAINDER, help="extra train.py args after --")
     args = parser.parse_args()
+    args.layouts_explicit = any(
+        arg == "--layouts" or arg.startswith("--layouts=") for arg in sys.argv
+    )
+    args.ranks_explicit = any(
+        arg == "--ranks" or arg.startswith("--ranks=") for arg in sys.argv
+    )
     if args.extra_train_arg and args.extra_train_arg[0] == "--":
         args.extra_train_arg = args.extra_train_arg[1:]
     return args
@@ -253,12 +316,28 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    runs = _build_runs(args)
+    try:
+        runs = _build_runs(args)
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"train_lora_grid.py: {exc}", flush=True)
+        raise SystemExit(2) from None
     print(f"Expanded {len(runs)} single-card run(s).", flush=True)
     for run in runs:
         _print_run(run)
         if not args.dry_run:
-            subprocess.run(run.command, cwd=PROJECT_ROOT, check=True)
+            proc = subprocess.run(run.command, cwd=PROJECT_ROOT, check=False)
+            if proc.returncode != 0:
+                print(
+                    "\ntrain_lora_grid.py: run failed\n"
+                    f"  run: {run.run_name}\n"
+                    f"  cuda: {run.cuda}\n"
+                    f"  layout: {run.layout}\n"
+                    f"  rank: {run.rank}\n"
+                    f"  exit_code: {proc.returncode}\n"
+                    f"  command: {shlex.join(run.command)}",
+                    flush=True,
+                )
+                raise SystemExit(proc.returncode) from None
 
 
 if __name__ == "__main__":

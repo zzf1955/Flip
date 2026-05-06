@@ -64,6 +64,14 @@ scripts/flip_run.sh nvidia-smi
 
 ## 任务工作流
 
+## Codex Skills
+
+- 当前项目的 Claude 旧 skill 已迁移为 Codex 可发现的全局 skill，位于 `/home/leadtek/.codex/skills/flip-*`。
+- 用户提到 `/discuss`、`/develop`、`/fix`、`/review`，或提出对应类型需求时，优先使用对应的 `flip-discuss`、`flip-develop`、`flip-fix`、`flip-review` skill。
+- Skill 只提供项目工作流提示；本文件和用户当前指令优先级更高。
+- 迁移后的 skill 已移除 Claude 专用行为；除非用户明确要求或确认任务工作流步骤，不要自动 commit、建分支、合并或清理 worktree。
+- 如果 skill 内容与本文件冲突，以本文件为准，并在执行前向用户说明冲突点。
+
 ### 小修改
 
 - 可在 `main` 分支直接修改。
