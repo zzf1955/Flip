@@ -210,6 +210,10 @@ def save_lora_ckpt(model, path: str) -> int:
 def save_video(frames: list[Image.Image], path: str, fps: int = 16):
     """Save list of PIL.Image frames as H.264 MP4 via ffmpeg pipe."""
     w, h = frames[0].size
+    if w % 2 != 0 or h % 2 != 0:
+        raise ValueError(
+            f"H.264 yuv420p video size must be even, got {w}x{h} for {path}"
+        )
     cmd = [
         FFMPEG, "-y",
         "-f", "rawvideo", "-pix_fmt", "rgb24",
