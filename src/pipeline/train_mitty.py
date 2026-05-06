@@ -1029,6 +1029,10 @@ def train(args):
                         if not has_files:
                             continue
                         sd = str(eval_dir / split_name / f"step-{step:04d}")
+                        online_metrics.progress_callback = (
+                            lambda phase, done, total, split_name=split_name:
+                            info(f"  METRICS progress [{split_name}] {phase} {done}/{total}")
+                        )
                         m = online_metrics.compute_step(sd)
                         if not m:
                             continue
