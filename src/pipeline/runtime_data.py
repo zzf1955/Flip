@@ -476,6 +476,110 @@ def build_tail_eval_split(args) -> RuntimeSplit:
     )
 
 
+def build_count_eval_split(args) -> RuntimeSplit:
+    """Select fixed-size eval records from task-level pair order table tails.
+
+    In-task counts are allocated across train tasks in proportion to each
+    task's available pair count. OOD counts use the same allocator, which
+    reduces to taking the requested tail count when a single OOD task is used.
+    """
+    data_type = args.data_type
+    duration = args.duration
+    if data_type not in DATA_TYPES:
+        raise ValueError(f"Unknown data type '{data_type}'. Available: {sorted(DATA_TYPES)}")
+    train_tasks = parse_task_list(args.train_tasks)
+    ood_tasks = parse_task_list(args.ood_tasks, allow_empty=True)
+    overlap = sorted(set(train_tasks) & set(ood_tasks))
+    if overlap:
+        raise ValueError(f"Tasks cannot be both train and OOD: {overlap}")
+
+    if args.in_task_eval_size is None and args.ood_eval_size is None:
+        raise ValueError("Count eval split requires at least one explicit eval size")
+    if args.in_task_eval_size is not None and args.in_task_eval_size <= 0:
+        raise ValueError(
+            f"--in-task-eval-size must be positive when set, got {args.in_task_eval_size}"
+        )
+    if args.ood_eval_size is not None and args.ood_eval_size <= 0:
+        raise ValueError(
+            f"--ood-eval-size must be positive when set, got {args.ood_eval_size}"
+        )
+
+    cache_root = getattr(args, "cache_root", "") or str(
+        Path(MAIN_ROOT) / "training_data" / "cache" / "vae"
+    )
+    pair_root = getattr(args, "pair_root", "") or str(
+        Path(MAIN_ROOT) / "training_data" / "pair"
+    )
+    cache_task_root = Path(cache_root) / data_type / duration
+    pair_root_path = Path(pair_root)
+    records_by_task: dict[str, list[dict]] = {}
+    order_paths: dict[str, str] = {}
+
+    for task in train_tasks:
+        records, order_path = _load_ordered_task_records(
+            cache_task_root, pair_root_path, data_type, duration, task, args.data_seed,
+        )
+        records_by_task[task] = records
+        order_paths[task] = str(order_path)
+
+    for task in ood_tasks:
+        records, order_path = _load_ordered_task_records(
+            cache_task_root, pair_root_path, data_type, duration, task, args.data_seed,
+        )
+        records_by_task[task] = records
+        order_paths[task] = str(order_path)
+
+    eval_records: list[dict] = []
+    if args.in_task_eval_size is None:
+        for task in train_tasks:
+            task_records = records_by_task[task]
+            n_eval = _tail_percent_count(
+                len(task_records), args.eval_tail_percent, f"in-task eval for {task}",
+            )
+            eval_records.extend(task_records[-n_eval:])
+    else:
+        train_task_sizes = {task: len(records_by_task[task]) for task in train_tasks}
+        eval_counts = _allocate_counts(
+            train_task_sizes, args.in_task_eval_size, "in-task eval",
+        )
+        for task in train_tasks:
+            n_eval = eval_counts[task]
+            if n_eval:
+                eval_records.extend(records_by_task[task][-n_eval:])
+
+    ood_records: list[dict] = []
+    if ood_tasks:
+        if args.ood_eval_size is None:
+            for task in ood_tasks:
+                task_records = records_by_task[task]
+                n_ood = _tail_percent_count(
+                    len(task_records), args.eval_tail_percent, f"OOD eval for {task}",
+                )
+                ood_records.extend(task_records[-n_ood:])
+        else:
+            ood_task_sizes = {task: len(records_by_task[task]) for task in ood_tasks}
+            ood_counts = _allocate_counts(ood_task_sizes, args.ood_eval_size, "OOD eval")
+            for task in ood_tasks:
+                n_ood = ood_counts[task]
+                if n_ood:
+                    ood_records.extend(records_by_task[task][-n_ood:])
+
+    return RuntimeSplit(
+        train_files=[],
+        eval_files=[record["cache_path"] for record in eval_records],
+        ood_files=[record["cache_path"] for record in ood_records],
+        train_records=[],
+        eval_records=eval_records,
+        ood_records=ood_records,
+        split_counts={
+            "train": {},
+            "in_task_eval": _task_counts(eval_records),
+            "ood_eval": _task_counts(ood_records),
+        },
+        order_paths=order_paths,
+    )
+
+
 def sample_eval_video_files(
     files: list[str], size: int, data_seed: int, step: int, split_name: str,
 ) -> list[str]:
