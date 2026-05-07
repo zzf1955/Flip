@@ -123,7 +123,13 @@ def resolve_pair_media(record: dict, kind: str) -> Path:
     return Path(str(pair_dir)) / path
 
 
-def eval_base_dir(run: RunSpec, output_dir: str) -> Path:
+def eval_base_dir(
+    run: RunSpec,
+    output_dir: str,
+    output_exact_dir: str = "",
+) -> Path:
+    if output_exact_dir:
+        return resolve_path(output_exact_dir)
     if output_dir:
         return resolve_path(output_dir) / run.name / run.checkpoint.stem
     return run.checkpoint.parent / f"{run.checkpoint.stem}_eval"
@@ -160,6 +166,7 @@ def write_selected_records(
         "in_task_eval_size": args.in_task_eval_size,
         "ood_eval_size": args.ood_eval_size,
         "eval_tail_percent": args.eval_tail_percent,
+        "output_exact_dir": args.output_exact_dir,
         "mask_region_metrics": args.mask_region_metrics,
         "sam2_mask_root": args.sam2_mask_root,
         "write_local_videos": args.write_local_videos,

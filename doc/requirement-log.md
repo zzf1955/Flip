@@ -3,6 +3,37 @@
 ## 2026-05-07
 
 **用户原始需求：**
+> 你看一下计算 metrics 的代码,你写一个代码,将 1000 步跑完了,还没有测试 metrics 的, final 开头的 training log 中的 ckpt,跑完整的测评
+
+**直接修改：**
+- 新增 `scripts/eval_final_step1000_missing.py`：扫描 `training_data/log/final*`，
+  找出已完成 `step=1000/1000`、存在 `ckpt/step-1000.safetensors`、但缺少离线
+  `ckpt/step-1000_eval/summary.*` 的 run，并按训练日志中的数据配置调用
+  `scripts/flip_run.sh eval_mitty` 补跑完整离线评估。
+- 根据追加要求，脚本默认跳过 `data_type=r2h`，并对其余 run 显式添加
+  `--mask-region-metrics on`，保证离线 summary 包含 Local FID / Local FVD 和
+  前景/背景局部指标。
+- 根据追加要求，脚本同时显式添加 `--patch-fid`，保证离线 summary 包含
+  `foreground_patch_fid` 和 patch 选择配置字段。
+- 根据追加要求，脚本固定沿用旧评估口径 `80 in-task + 42 OOD`，并把每个 run 的
+  视频、summary、`data_split/` 和执行日志写到该 run 的 `full_eval/`。
+- 根据追加要求，脚本新增 `--runner {flip_run,flip_run_2}`，可选择通过
+  `scripts/flip_run.sh` 或 `scripts/flip_run_2.sh` 启动评估。
+- 根据追加要求，脚本新增 `--cuda-list` 队列调度：用户给出可用 CUDA 后，脚本为
+  每张卡启动一个 worker，每张卡同时只跑一个 eval，跑完自动取下一个 run。
+- 根据追加要求，脚本默认跳过 `final_ours_step1*` 和 `final_ours_step2*`，并提供
+  `--include-ours-step1-step2` 作为显式纳入开关；dry-run 会打印跳过原因统计。
+- `src.pipeline.evaluate_mitty_models` 新增 `--output-exact-dir`，用于让批处理脚本
+  把单个 run 的评估产物精确写到 `<run>/full_eval/`，不经过
+  `--output-dir/<run>/<step>` 嵌套。
+- `doc/step_5_training_infra.md`：记录批量补跑 final step-1000 离线评估的
+  dry-run、执行命令、筛选规则和输出位置。
+
+---
+
+## 2026-05-07
+
+**用户原始需求：**
 > 先做 patch FID，评测的时候加一个开关只跑 patch FID，中间结果要输出 patch 位置的 overlay，能看出来视频的每一帧选的是哪些 patch；用 `training_data/log/eval_h2r_80in_42ood_local_0506/Mitty-h2r_1s-400d_r96_self_qkv_1000s_0503_154657/step-1000/in_task_eval` 这个数据做。
 
 **创建的任务：**

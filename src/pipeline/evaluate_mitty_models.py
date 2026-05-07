@@ -98,7 +98,7 @@ def _generate_outputs(args, run_specs, runtime_split, t5_dir) -> None:
             tokenizer_dir=args.tokenizer_dir,
         )
 
-        base_dir = eval_base_dir(run, args.output_dir)
+        base_dir = eval_base_dir(run, args.output_dir, args.output_exact_dir)
         write_selected_records(base_dir, args.splits, runtime_split, args)
         for split in args.splits:
             split_records = records_for_split(split, runtime_split)
@@ -127,7 +127,7 @@ def _generate_outputs(args, run_specs, runtime_split, t5_dir) -> None:
 
 def _write_local_outputs(args, run_specs, runtime_split, sam2_mask_root: str) -> None:
     for run in run_specs:
-        base_dir = eval_base_dir(run, args.output_dir)
+        base_dir = eval_base_dir(run, args.output_dir, args.output_exact_dir)
         for split in args.splits:
             split_records = records_for_split(split, runtime_split)
             split_out = base_dir / split
@@ -149,7 +149,7 @@ def _write_local_outputs(args, run_specs, runtime_split, sam2_mask_root: str) ->
 
 def _write_patch_outputs(args, run_specs, runtime_split, sam2_mask_root: str) -> None:
     for run in run_specs:
-        base_dir = eval_base_dir(run, args.output_dir)
+        base_dir = eval_base_dir(run, args.output_dir, args.output_exact_dir)
         for split in args.splits:
             split_records = records_for_split(split, runtime_split)
             split_out = base_dir / split
@@ -174,7 +174,7 @@ def _write_patch_outputs(args, run_specs, runtime_split, sam2_mask_root: str) ->
 
 def _write_summaries(args, run_specs, rows, runtime_split) -> None:
     for run in run_specs:
-        base_dir = eval_base_dir(run, args.output_dir)
+        base_dir = eval_base_dir(run, args.output_dir, args.output_exact_dir)
         run_rows = [row for row in rows if row["run"] == run.name]
         write_selected_records(base_dir, args.splits, runtime_split, args)
         csv_path = base_dir / "summary.csv"
@@ -196,6 +196,8 @@ def main() -> None:
         args.checkpoint,
         auto_merge_lora=not args.no_auto_merge_lora,
     )
+    if args.output_exact_dir and len(run_specs) != 1:
+        parser.error("--output-exact-dir requires exactly one --runs value")
     t5_dir = resolve_path(args.t5_cache_dir)
     args.cache_root = str(resolve_path(args.cache_root))
     args.pair_root = str(resolve_path(args.pair_root))
@@ -228,6 +230,7 @@ def main() -> None:
         run_specs=run_specs,
         splits=args.splits,
         output_dir=args.output_dir,
+        output_exact_dir=args.output_exact_dir,
         device=device,
         no_lpips=args.no_lpips,
         no_fid=args.no_fid,
