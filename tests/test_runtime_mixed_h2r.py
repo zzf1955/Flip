@@ -66,6 +66,33 @@ def _make_task(
     _write_jsonl(cache_dir / "manifest.jsonl", cache_rows)
 
 
+def _append_uncached_pair_rows(pair_root: Path, task: str, start: int, n: int) -> None:
+    data_type = "h2r"
+    duration = "1s"
+    pair_dir = pair_root / data_type / duration / task
+    rows = [
+        json.loads(line)
+        for line in (pair_dir / "manifest.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    for i in range(start, start + n):
+        pair_id = f"pair_{i:04d}"
+        rows.append({
+            **rows[-1],
+            "pair_id": pair_id,
+            "source_id": f"{task}/uncached/{pair_id}",
+            "source_segment_id": f"{task}/uncached/{pair_id}",
+            "robot_source_key": f"{task}/uncached/{pair_id}",
+            "video": f"video/{pair_id}.mp4",
+            "control_video": f"control_video/{pair_id}.mp4",
+        })
+        (pair_dir / "video" / f"{pair_id}.mp4").parent.mkdir(parents=True, exist_ok=True)
+        (pair_dir / "control_video" / f"{pair_id}.mp4").parent.mkdir(parents=True, exist_ok=True)
+        (pair_dir / "video" / f"{pair_id}.mp4").write_bytes(b"")
+        (pair_dir / "control_video" / f"{pair_id}.mp4").write_bytes(b"")
+    _write_jsonl(pair_dir / "manifest.jsonl", rows)
+
+
 def _args(tmp: Path, **overrides) -> Namespace:
     values = {
         "data_type": "h2r",
@@ -213,6 +240,33 @@ class MixedH2RSplitTest(unittest.TestCase):
                     in_task_eval_size=2,
                     ood_eval_size=0,
                 ))
+
+    def test_syn_train_uses_available_cache_when_pair_manifest_has_uncached_tail(self):
+        with tempfile.TemporaryDirectory() as tmp_name:
+            tmp = Path(tmp_name)
+            pair_root = tmp / "pair"
+            cache_root = tmp / "cache" / "vae"
+            _make_task(pair_root, cache_root, "Task_A", 10)
+            _make_task(pair_root, cache_root, "Task_A_syn", 5, source_offset=100)
+            _append_uncached_pair_rows(pair_root, "Task_A_syn", start=5, n=3)
+            args = _args(
+                tmp,
+                original_train_tasks="Task_A",
+                syn_train_tasks="Task_A_syn",
+                ood_eval_tasks="",
+                original_train_size=4,
+                syn_train_size=0,
+                in_task_eval_size=2,
+                ood_eval_size=0,
+            )
+
+            split = build_mixed_h2r_split(args)
+
+            self.assertEqual(split.task_counts["syn_train"], {"Task_A_syn": 5})
+            self.assertEqual(
+                [record["pair_id"] for record in split.syn_train_records],
+                [f"pair_{idx:04d}" for idx in range(5)],
+            )
 
     def test_write_split_config_records_mixed_mode(self):
         with tempfile.TemporaryDirectory() as tmp_name:
