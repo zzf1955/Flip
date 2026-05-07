@@ -183,6 +183,88 @@ python scripts/migrate_task_layout.py --data-type blur_r2r --duration 1s --clean
 python scripts/migrate_task_layout.py --data-type identity_r2r --duration 1s --clean
 ```
 
+### r2h 模型自合成 Human Pair
+
+`src.pipeline.r2h_synthesize` 使用训练好的 r2h Mitty LoRA，从
+`training_data/segment/<task>/<episode>/seg*_video.mp4` 直接枚举 robot source，
+切成与 h2r 训练一致的 clip，然后生成 synthetic human，并落盘为新的 h2r `_syn`
+task。已有 Seedance/original h2r manifest 只用于排除已覆盖 robot source，不作为
+自合成的主要输入。
+
+默认互斥规则：
+
+- 默认排除 `ep000`、`ep001`、`ep002`、`ep003`，这些 episode 视作已由
+  Seedance 覆盖。
+- 如传入 `--seedance-covered-manifest`，脚本会读取其中的 `robot_source_key` 或从
+  `episode/seg/clip_start/clip_dur` 等字段派生覆盖 key，并校验 syn 输出与覆盖集
+  无交集。
+- syn pair 的 `manifest.jsonl` 会记录 `robot_source_key`、`source_segment_path`、
+  `source_clip_start`、`source_clip_dur`、`source_clip_index`、r2h run/checkpoint
+  和生成参数，供后续 mixed h2r 训练做来源互斥校验。
+
+先只检查可用 source：
+
+```bash
+python -m src.pipeline.r2h_synthesize \
+  --source-task Inspire_Collect_Clothes_MainCamOnly \
+  --duration 1s \
+  --list-only
+```
+
+生成 `_syn` pair：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m src.pipeline.r2h_synthesize \
+  --source-task Inspire_Collect_Clothes_MainCamOnly \
+  --duration 1s \
+  --run <r2h_run_name_or_path> \
+  --checkpoint latest \
+  --num-samples 200 \
+  --resume-existing
+```
+
+如果要从三个默认 task 中先生成固定总量，并按各 task 的可用 robot clip 数比例分配，
+使用 `--source-task all --allocate-by-task proportional`。例如先生成 4000 条：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m src.pipeline.r2h_synthesize \
+  --source-task all \
+  --duration 1s \
+  --run <r2h_run_name_or_path> \
+  --checkpoint latest \
+  --num-samples 4000 \
+  --allocate-by-task proportional \
+  --resume-existing
+```
+
+`global_head` 是默认选择模式，会按全局稳定顺序取前 N 条；`proportional` 只支持
+配合 `--num-samples` 使用，会按每个 task 过滤后的 eligible clip 数量做比例分配。
+
+默认输出：
+
+```text
+training_data/pair/h2r/1s/Inspire_Collect_Clothes_MainCamOnly_syn/
+├── video/pair_NNNN.mp4
+├── control_video/pair_NNNN.mp4
+├── metadata.csv
+├── manifest.jsonl
+└── pair_order.jsonl
+```
+
+随后按普通 h2r pair 运行 VAE/T5 cache：
+
+```bash
+CUDA_VISIBLE_DEVICES=2 python -m src.pipeline.mitty_cache \
+  --pair-dir training_data/pair/h2r/1s/Inspire_Collect_Clothes_MainCamOnly_syn \
+  --output training_data/cache/vae/h2r/1s/Inspire_Collect_Clothes_MainCamOnly_syn \
+  --t5-cache-dir training_data/cache/t5/h2r/1s \
+  --device cuda:0 \
+  --batch-size 4 \
+  --prefetch-workers 8 \
+  --prefetch-batches 2 \
+  --save-workers 1
+```
+
 ### Blur R2R 数据
 
 `blur_r2r` 通过 `make_pair.py` 生成，但不再从 `seedance_direct/1s`
