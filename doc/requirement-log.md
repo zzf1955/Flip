@@ -843,3 +843,16 @@
 - `src/pipeline/evaluate_mitty_models.py`：新增 `--metric-workers`、`--lpips-batch-size`、`--feature-batch-size`、`--fvd-batch-size`、`--no-progress`；generation、Local crop 和 metrics 阶段默认打印进度。
 - `src/core/eval_metrics.py`、`src/pipeline/train.py`、`src/pipeline/train_mitty.py`：训练时在线 eval metrics 也改为 frame/video batch，并在训练日志中打印指标阶段进度。
 - 已并行跑完 qkv 与 qkvo_ffn 的 `step-1000`、`80` 个 in-task 和 `42` 个 OOD 样本评估，summary 与 Local 视频均输出到 `training_data/log/eval_h2r_80in_42ood_local_0506`。
+
+## 2026-05-07 — 独立 mixed h2r 训练入口
+
+用户要求：
+> 看一下下一个 task，新写一个训练的入口和数据读取，跑混合数据的训练。
+
+落实：
+- 新增 `src/pipeline/runtime_mixed_h2r.py`，独立构建 original h2r + `_syn` h2r split；in-task/OOD eval 固定从 original `pair_order.jsonl` 尾部按数量选取，syn 只进入 train。
+- mixed h2r 训练样本按每个 task 内 `pair_id` 升序取前 k 条；original 训练先排除 stable eval 后再取，适配后续继续追加 pair 的数据扩充方式。
+- 新增 `src/pipeline/train_mitty_mixed_h2r.py`，先生成显式 split 和 run 目录内 `mixed_cache/` symlink cache，再复用 `train_mitty` 的 Mitty 训练循环。
+- `src/pipeline/train_mitty.py` 抽出 parser 与参数归一化 helper，默认 CLI 行为不变，供 mixed 入口复用训练参数。
+- `scripts/flip_run.sh` 增加 `train_mitty_mixed_h2r` 子命令，便于混合训练继续走统一 GPU/环境入口。
+- 文档更新 `doc/step_5_training_infra.md`、`doc/scripts_inventory.md`，说明 mixed h2r 命令、稳定 eval 规则、`data_split/` 输出和隔离边界。
