@@ -1073,14 +1073,18 @@ def train(args):
     cleanup_distributed()
 
 
-def main():
-    ap = argparse.ArgumentParser(description="Mitty LoRA training (Wan 2.2 TI2V-5B)")
+def build_arg_parser(
+    *,
+    description: str = "Mitty LoRA training (Wan 2.2 TI2V-5B)",
+    require_cache: bool = True,
+) -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(description=description)
 
     ap.add_argument("--task-name", required=True,
                     help="training task label for run name & W&B "
                          "(e.g. identity, directly_transfer, appearance)")
 
-    ap.add_argument("--cache-train", required=True)
+    ap.add_argument("--cache-train", required=require_cache)
     ap.add_argument("--cache-eval", default="")
     ap.add_argument("--cache-ood", default="")
     ap.add_argument("--t5-cache-dir", default=T5_CACHE_DIR,
@@ -1179,8 +1183,10 @@ def main():
                     default=True,
                     help="upload eval videos to W&B (--no-wandb-log-videos to skip)")
 
-    args = ap.parse_args()
+    return ap
 
+
+def normalize_train_args(ap: argparse.ArgumentParser, args) -> None:
     # Resolve relative paths
     for attr in ("cache_train", "cache_eval", "cache_ood", "t5_cache_dir",
                  "patch_dir", "output_dir", "init_lora", "continue_lora",
@@ -1226,6 +1232,11 @@ def main():
     except (FileNotFoundError, ValueError) as exc:
         ap.error(str(exc))
 
+
+def main():
+    ap = build_arg_parser()
+    args = ap.parse_args()
+    normalize_train_args(ap, args)
     train(args)
 
 

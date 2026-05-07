@@ -405,6 +405,56 @@ scripts/flip_run.sh train --cuda 2 -- \
   --lora-target-modules self_attn.q,cross_attn.q,ffn.0,ffn.2
 ```
 
+### Mixed h2r 训练入口
+
+`src.pipeline.train_mitty_mixed_h2r` 是独立实验入口，用于混合原始 h2r
+数据和 r2h 模型自合成的 `_syn` h2r 数据。它不改变
+`src.pipeline.runtime_data`、`src.pipeline.train` 或 `src.pipeline.train_mitty`
+的默认 split 语义；新入口先构建显式 mixed split，再把选中的 cache 文件以
+symlink 形式物化到当前 run 目录下的 `mixed_cache/`，最后复用 Mitty 训练循环。
+
+固定 eval 规则：
+
+- in-task eval 只从 `--original-train-tasks` 的原始 h2r `pair_order.jsonl`
+  尾部按 `--in-task-eval-size` 选取，默认 80 条。
+- OOD eval 只从 `--ood-eval-tasks` 的原始 h2r `pair_order.jsonl` 尾部按
+  `--ood-eval-size` 选取，默认 42 条。
+- `--syn-train-tasks` 只进入训练，不进入 in-task eval 或 OOD eval。
+- original/syn 训练样本不按 `pair_order.jsonl` 头部取，而是按每个 task 内
+  `pair_id` 升序取前 k 条；original 训练会先排除 stable eval 样本后再取。
+  这样后续继续追加 `pair_XXXX` 时，同一配置下已覆盖的前 N 条训练样本保持稳定。
+- 原始训练样本会排除稳定 eval 集；original/syn 训练样本的
+  `robot_source_key` 必须无交集。缺少显式 `robot_source_key` 时入口会从
+  `source_robot_task`、`episode`、`seg`、`clip_start`、`clip_dur`、
+  `source_segment_id`、`source_id` 等溯源字段构造；构造失败直接报错。
+
+示例：
+
+```bash
+scripts/flip_run.sh train_mitty_mixed_h2r --cuda 2,3 --nproc 2 -- \
+  --task-name mixed_h2r_400_400 \
+  --original-train-tasks Inspire_Collect_Clothes_MainCamOnly,Inspire_Put_Clothes_into_Washing_Machine \
+  --syn-train-tasks Inspire_Collect_Clothes_MainCamOnly_syn,Inspire_Put_Clothes_into_Washing_Machine_syn \
+  --ood-eval-tasks Inspire_Pickup_Pillow_MainCamOnly \
+  --original-train-size 400 \
+  --syn-train-size 400 \
+  --in-task-eval-size 80 \
+  --ood-eval-size 42 \
+  --max-steps 1000 \
+  --save-steps 100 \
+  --eval-steps 100
+```
+
+每个 run 会写出：
+
+- `data_split/train.jsonl`：original 与 syn 训练记录，字段 `mix_source`
+  标记为 `original` 或 `syn`。
+- `data_split/in_task_eval.jsonl`：只包含 original in-task eval。
+- `data_split/ood_eval.jsonl`：只包含 original OOD eval。
+- `data_split/config.json`：记录 `mode: mixed_h2r`、原始/syn/OOD task、
+  请求数量、实际数量、`pair_order` 路径、`train_selection_order`、
+  `eval_selection_order`、`data_seed` 和生成时间。
+
 ### LoRA layout/rank 网格搜索
 
 `scripts/train_lora_grid.py` 是维护中的 LoRA 搜索入口，用于把
