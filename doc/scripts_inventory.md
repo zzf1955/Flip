@@ -83,6 +83,7 @@ eval_metrics.py    ← torch, skimage, transformers (CLIP)
 |------|------|------|------|
 | `make_pair.py` | 匹配 robot+human 视频，重采样 16fps，4k+1 帧；正式训练时 `--task all` 只展开 `TRAINING_TASKS` 三任务集合 | segment + seedance/overlay | `training_data/pair/{1s,2s,4s}/` |
 | `make_robot_pair.py` | 生成 robot→robot identity pair；正式三阶段 LoRA identity 时 `--task all` 只展开 `TRAINING_TASKS` 三任务集合 | segment | `training_data/robot_pair/1s/` |
+| `r2h_synthesize.py` | 用训练好的 r2h Mitty LoRA 从 `training_data/segment` 枚举 robot clip，排除 Seedance 已覆盖来源后生成 h2r `_syn` pair；支持按 task 可用量比例分配固定生成总量 | segment + r2h checkpoint | `training_data/pair/h2r/<duration>/<task>_syn/` |
 | `robot_patch.py` | 全身降质数据（FK mesh 或 SAM2 mask → blur/noise/mean） | segment + parquet/sam2_mask | `training_data/pair/1s_patch/` |
 
 ### LoRA 训练
