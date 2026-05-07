@@ -17,9 +17,12 @@ from typing import Iterable
 from src.core.config import MAIN_ROOT
 from src.pipeline.runtime_data import (
     DATA_TYPES,
+    PAIR_ORDER_FILENAME,
     RuntimeSplit,
     _allocate_counts,
+    _load_cache_task_records,
     _load_ordered_task_records,
+    _load_pair_manifest_records,
     _task_counts,
     parse_task_list,
 )
@@ -49,6 +52,43 @@ def _load_tasks(
         )
         records_by_task[task] = records
         order_paths[f"{order_label}:{task}"] = str(order_path)
+    return records_by_task
+
+
+def _load_syn_train_tasks(
+    cache_task_root: Path,
+    pair_root: Path,
+    data_type: str,
+    duration: str,
+    tasks: Iterable[str],
+    order_paths: dict[str, str],
+) -> dict[str, list[dict]]:
+    records_by_task = {}
+    for task in tasks:
+        pair_dir, pair_records = _load_pair_manifest_records(
+            pair_root, data_type, duration, task,
+        )
+        cache_records = _load_cache_task_records(
+            cache_task_root, data_type, duration, task,
+        )
+        pair_by_id = {record["pair_id"]: record for record in pair_records}
+        cache_by_id = {record["pair_id"]: record for record in cache_records}
+        extra_cache = sorted(set(cache_by_id) - set(pair_by_id))
+        if extra_cache:
+            raise ValueError(
+                f"Syn cache manifest contains pair_id values missing from pair "
+                f"manifest for {task}: {extra_cache[:5]}"
+            )
+        records = []
+        for pair_id in sorted(cache_by_id):
+            record = dict(pair_by_id[pair_id])
+            record.update(cache_by_id[pair_id])
+            records.append(record)
+        if not records:
+            raise ValueError(f"No cached syn samples are available for {task}")
+        records_by_task[task] = records
+        order_path = pair_dir / PAIR_ORDER_FILENAME
+        order_paths[f"syn:{task}"] = str(order_path) if order_path.exists() else ""
     return records_by_task
 
 
@@ -173,9 +213,9 @@ def build_mixed_h2r_split(args) -> MixedH2RSplit:
         cache_task_root, pair_root_path, data_type, duration,
         original_tasks, args.data_seed, order_paths, "original",
     )
-    syn_by_task = _load_tasks(
+    syn_by_task = _load_syn_train_tasks(
         cache_task_root, pair_root_path, data_type, duration,
-        syn_tasks, args.data_seed, order_paths, "syn",
+        syn_tasks, order_paths,
     )
     ood_by_task = _load_tasks(
         cache_task_root, pair_root_path, data_type, duration,
