@@ -47,6 +47,7 @@ def compute_rows(
     run_specs: list[RunSpec],
     splits: list[str],
     output_dir: str,
+    output_exact_dir: str,
     device: torch.device,
     no_lpips: bool,
     no_fid: bool,
@@ -71,7 +72,7 @@ def compute_rows(
     )
     rows = []
     for run in run_specs:
-        base_dir = eval_base_dir(run, output_dir)
+        base_dir = eval_base_dir(run, output_dir, output_exact_dir)
         for split in splits:
             split_out = base_dir / split
             selected_records = records_for_split(split, runtime_split) if sam2_mask_root else None

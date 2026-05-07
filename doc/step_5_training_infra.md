@@ -413,6 +413,67 @@ summary 会额外记录 `foreground_patch_count`、`foreground_patch_size`、
 `foreground_patch_min_mask_pixels`、`foreground_patch_max_per_frame` 和
 `foreground_patch_max_per_video`。
 
+### 批量补跑 final step-1000 离线评估
+
+`scripts/eval_final_step1000_missing.py` 用于补跑已经训练到 1000 step、但还没有
+离线 `summary.csv` / `summary.json` 的正式 `final*` run。脚本默认跳过
+`data_type=r2h` 和 `final_ours_step1*` / `final_ours_step2*`，并对其余 run 显式开启
+`--mask-region-metrics on` 和 `--patch-fid`，使 summary 包含 `foreground_local_fid`、
+`foreground_local_fvd`、`foreground_patch_fid` 以及前景/背景 MSE/PSNR/SSIM。
+评估样本固定沿用旧正式口径：`--in-task-eval-size 80 --ood-eval-size 42`。
+脚本会扫描 `training_data/log/final*`，只选择同时满足以下条件的 run：
+
+- `train.log` 中出现 `step=1000/1000`；
+- 存在 `ckpt/step-1000.safetensors`；
+- `<run>/full_eval/summary.csv` 或 `summary.json` 缺失，或 summary 中缺少
+  当前训练配置应有的 split / 指标字段。
+
+脚本从每个 run 的 `train.log` 中解析原始训练参数，复用当时的 `task_name`、
+`train_tasks`、`ood_tasks`、cache/pair/T5 路径和模型路径，再覆盖为固定
+`80 in-task + 42 OOD`，通过 `scripts/flip_run.sh eval_mitty` 顺序补跑离线综合评估。
+对 mixed h2r 训练日志中的 `h2r_1s_d400_s400`，脚本会按 `data_type=h2r` 映射到
+离线评估入口支持的 `h2r_1s`，并使用 `original_train_tasks` /
+`ood_eval_tasks` 作为评估 split 来源。
+
+每个 run 的视频、`summary.csv` / `summary.json`、`data_split/` 和执行日志都会写到
+该 run 自己的 `full_eval/`，例如：
+`training_data/log/final_mitty_r128_0507-h2r_1s-400d_r128_self_qkv_1000s_0507_214548/full_eval/`。
+其中 wrapper 日志为 `full_eval/eval.log`。
+
+默认是 dry-run，只打印将要执行的命令：
+
+```bash
+/home/leadtek/miniconda3/envs/flip/bin/python scripts/eval_final_step1000_missing.py
+```
+
+确认 GPU 后执行完整补跑：
+
+```bash
+CUDA_ID=2 /home/leadtek/miniconda3/envs/flip/bin/python \
+  scripts/eval_final_step1000_missing.py --execute
+```
+
+如需把任务队列分发到多张卡，传逗号分隔的 CUDA id。脚本会为每张卡启动一个
+worker，每个 worker 同时只跑一个 eval，跑完后自动从队列取下一个 run：
+
+```bash
+/home/leadtek/miniconda3/envs/flip/bin/python \
+  scripts/eval_final_step1000_missing.py \
+  --runner flip_run_2 \
+  --cuda-list 0,2,3 \
+  --execute
+```
+
+可用 `--limit N` 先跑少量 run，`--cuda ID` 指定单卡评估，`--cuda-list IDS`
+指定多卡队列，`--runner flip_run_2` 可切换到 `scripts/flip_run_2.sh`，
+`--force` 强制重跑已有 summary 的 run，
+`--include-r2h` 可把默认跳过的 r2h run 纳入补跑，
+`--include-ours-step1-step2` 可把默认跳过的 `final_ours_step1*` /
+`final_ours_step2*` 纳入补跑，
+`--no-local-metrics` 可关闭脚本强制添加的 Local 指标，`--no-patch-fid` 可关闭
+脚本强制添加的 Patch FID。可用 `--in-task-eval-size`、`--ood-eval-size` 临时覆盖
+默认 `80/42`，用 `--output-subdir` 临时覆盖默认 `full_eval`。
+
 ### 冒烟训练
 
 ```bash

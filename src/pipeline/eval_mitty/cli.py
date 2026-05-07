@@ -67,6 +67,9 @@ def build_parser() -> argparse.ArgumentParser:
                          "when fixed eval sizes are not provided")
     ap.add_argument("--output-dir", default="",
                     help="optional output root; default writes to <run>/ckpt/<step>_eval")
+    ap.add_argument("--output-exact-dir", default="",
+                    help="exact output directory for a single run; bypasses "
+                         "--output-dir/<run>/<step> nesting")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--lora-rank", type=int, default=None,
                     help="LoRA rank; auto-detected from each checkpoint by default")
