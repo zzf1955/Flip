@@ -1083,6 +1083,9 @@ def build_arg_parser(
     ap.add_argument("--task-name", required=True,
                     help="training task label for run name & W&B "
                          "(e.g. identity, directly_transfer, appearance)")
+    ap.add_argument("--run-prefix", default="",
+                    help="override run-name backbone prefix "
+                         "(default: Mitty or wrapper-provided prefix)")
 
     ap.add_argument("--cache-train", required=require_cache)
     ap.add_argument("--cache-eval", default="")
