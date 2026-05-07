@@ -166,6 +166,15 @@ def write_selected_records(
         "local_video_margin": args.local_video_margin,
         "local_video_size": args.local_video_size,
         "local_video_bbox_mode": args.local_video_bbox_mode,
+        "patch_fid": args.patch_fid,
+        "patch_fid_only": args.patch_fid_only,
+        "write_patch_overlays": args.write_patch_overlays,
+        "patch_size": args.patch_size,
+        "patch_stride": args.patch_stride,
+        "patch_coverage_threshold": args.patch_coverage_threshold,
+        "patch_min_mask_pixels": args.patch_min_mask_pixels,
+        "patch_max_per_frame": args.patch_max_per_frame,
+        "patch_max_per_video": args.patch_max_per_video,
         "metric_workers": args.metric_workers,
         "lpips_batch_size": args.lpips_batch_size,
         "feature_batch_size": args.feature_batch_size,
@@ -179,4 +188,3 @@ def write_selected_records(
     (split_dir / "config.json").write_text(
         json.dumps(config, indent=2, sort_keys=True) + "\n"
     )
-

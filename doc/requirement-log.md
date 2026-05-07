@@ -1,5 +1,19 @@
 # 需求日志
 
+## 2026-05-07
+
+**用户原始需求：**
+> 先做 patch FID，评测的时候加一个开关只跑 patch FID，中间结果要输出 patch 位置的 overlay，能看出来视频的每一帧选的是哪些 patch；用 `training_data/log/eval_h2r_80in_42ood_local_0506/Mitty-h2r_1s-400d_r96_self_qkv_1000s_0503_154657/step-1000/in_task_eval` 这个数据做。
+
+**创建的任务：**
+- [044] 新增 mask patch FID 与 patch overlay
+
+**需求跟进：**
+- Patch 选择默认改为只要 patch 内有任意 mask 像素就选中，即
+  `--patch-coverage-threshold 0.0 --patch-max-per-frame 0`。
+- Patch 选择继续收紧为 patch 内 mask 像素数严格大于 5 才计入，即
+  `--patch-min-mask-pixels 5`。
+
 ## 2026-05-06
 
 **用户原始需求：**

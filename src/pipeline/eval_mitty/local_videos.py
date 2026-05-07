@@ -11,9 +11,11 @@ from PIL import Image, ImageDraw
 from src.core.train_utils import save_video
 from src.tools.eval_metrics import (
     load_clip_mask_stack,
+    mask_patch_dict,
     mask_bbox,
     read_video_frames,
     resolve_sam2_mask_path,
+    select_mask_patches,
 )
 
 
@@ -83,6 +85,36 @@ def _draw_metric_bbox(
             (x1 + inset, y1 + inset, x2 - 1 - inset, y2 - 1 - inset),
             outline=(255, 216, 0),
         )
+    return image
+
+
+def _draw_patch_overlay(
+    frame: np.ndarray,
+    mask: np.ndarray,
+    patches: list,
+) -> Image.Image:
+    image = Image.fromarray(frame).convert("RGB")
+    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    mask_alpha = (mask.astype(np.uint8) * 72)
+    mask_rgba = np.zeros((mask.shape[0], mask.shape[1], 4), dtype=np.uint8)
+    mask_rgba[..., 0] = 255
+    mask_rgba[..., 1] = 80
+    mask_rgba[..., 3] = mask_alpha
+    overlay.alpha_composite(Image.fromarray(mask_rgba, mode="RGBA"))
+    image = Image.alpha_composite(image.convert("RGBA"), overlay).convert("RGB")
+    draw = ImageDraw.Draw(image)
+    for patch in patches:
+        color = (0, 220, 255) if patch.coverage >= 0.5 else (0, 255, 120)
+        for inset in range(2):
+            draw.rectangle(
+                (
+                    patch.x1 + inset,
+                    patch.y1 + inset,
+                    patch.x2 - 1 - inset,
+                    patch.y2 - 1 - inset,
+                ),
+                outline=color,
+            )
     return image
 
 
@@ -240,3 +272,131 @@ def write_local_videos(
         for row in index_rows:
             fh.write(json.dumps(row, sort_keys=True) + "\n")
 
+
+def write_patch_overlays(
+    split_out: Path,
+    records: list[dict],
+    sam2_mask_root: str | Path,
+    *,
+    patch_size: int,
+    patch_stride: int,
+    coverage_threshold: float,
+    min_mask_pixels: int,
+    max_patches_per_frame: int,
+    max_patches_per_video: int,
+    show_progress: bool = True,
+) -> None:
+    """Write per-frame overlays showing the patches used by Patch FID."""
+    patch_dir = split_out / "patch_fid"
+    patch_dir.mkdir(parents=True, exist_ok=True)
+    index_rows = []
+
+    for idx, record in enumerate(records):
+        sample_id = f"{idx:05d}"
+        if show_progress:
+            print(
+                f"  Patch overlays {split_out.name}: {idx + 1}/{len(records)} "
+                f"sample={sample_id}",
+                flush=True,
+            )
+        paths = {
+            "gen": split_out / f"gen_{sample_id}.mp4",
+            "gt": split_out / f"gt_{sample_id}.mp4",
+            "ctrl": split_out / f"ctrl_{sample_id}.mp4",
+        }
+        for label, path in paths.items():
+            if not path.is_file():
+                raise FileNotFoundError(f"Missing {label} video for Patch overlay: {path}")
+
+        gen_frames = read_video_frames(str(paths["gen"]))
+        gt_frames = read_video_frames(str(paths["gt"]))
+        ctrl_frames = read_video_frames(str(paths["ctrl"]))
+        if not (len(gen_frames) == len(gt_frames) == len(ctrl_frames)):
+            raise ValueError(
+                f"Patch overlay frame count mismatch for sample {sample_id}: "
+                f"gen={len(gen_frames)} gt={len(gt_frames)} ctrl={len(ctrl_frames)}"
+            )
+        masks = load_clip_mask_stack(
+            record,
+            sam2_mask_root,
+            len(gen_frames),
+            gen_frames.shape[1:3],
+        )
+        patches = select_mask_patches(
+            masks,
+            patch_size=patch_size,
+            stride=patch_stride,
+            coverage_threshold=coverage_threshold,
+            min_mask_pixels=min_mask_pixels,
+            max_patches_per_frame=max_patches_per_frame,
+            max_patches_per_video=max_patches_per_video,
+        )
+        patches_by_frame: list[list] = [[] for _ in range(len(gen_frames))]
+        for patch in patches:
+            patches_by_frame[patch.frame].append(patch)
+
+        gen_overlay = [
+            _draw_patch_overlay(frame, mask, frame_patches)
+            for frame, mask, frame_patches in zip(gen_frames, masks, patches_by_frame)
+        ]
+        gt_overlay = [
+            _draw_patch_overlay(frame, mask, frame_patches)
+            for frame, mask, frame_patches in zip(gt_frames, masks, patches_by_frame)
+        ]
+        ctrl_overlay = [
+            _draw_patch_overlay(frame, mask, frame_patches)
+            for frame, mask, frame_patches in zip(ctrl_frames, masks, patches_by_frame)
+        ]
+
+        rel_paths = {
+            "patch_overlay_gen_video": f"patch_fid/gen_overlay_{sample_id}.mp4",
+            "patch_overlay_gt_video": f"patch_fid/gt_overlay_{sample_id}.mp4",
+            "patch_overlay_ctrl_video": f"patch_fid/ctrl_overlay_{sample_id}.mp4",
+            "patch_overlay_compare_video": f"patch_fid/compare_overlay_{sample_id}.mp4",
+        }
+        save_video(gen_overlay, str(split_out / rel_paths["patch_overlay_gen_video"]))
+        save_video(gt_overlay, str(split_out / rel_paths["patch_overlay_gt_video"]))
+        save_video(ctrl_overlay, str(split_out / rel_paths["patch_overlay_ctrl_video"]))
+        save_video(
+            _stack_frame_lists([gt_overlay, gen_overlay, ctrl_overlay]),
+            str(split_out / rel_paths["patch_overlay_compare_video"]),
+        )
+
+        mask_path = resolve_sam2_mask_path(record, sam2_mask_root)
+        frame_rows = [[] for _ in range(len(gen_frames))]
+        for patch in patches:
+            frame_rows[patch.frame].append(mask_patch_dict(patch))
+        index_row = {
+            "sample_id": sample_id,
+            "split_dir": str(split_out),
+            "gen_video": f"gen_{sample_id}.mp4",
+            "gt_video": f"gt_{sample_id}.mp4",
+            "ctrl_video": f"ctrl_{sample_id}.mp4",
+            **rel_paths,
+            "robot_task": record.get("robot_task", record.get("task", "")),
+            "pair_id": record.get("pair_id", ""),
+            "order_index": record.get("order_index"),
+            "pair_order_path": record.get("pair_order_path", ""),
+            "source_id": record.get("source_id", ""),
+            "source_segment_id": record.get("source_segment_id", ""),
+            "episode": record.get("episode", ""),
+            "seg": record.get("seg", ""),
+            "clip_idx": record.get("clip_idx"),
+            "clip_start": record.get("clip_start"),
+            "clip_dur": record.get("clip_dur"),
+            "augment": record.get("augment", "normal"),
+            "mask_path": str(mask_path),
+            "patch_size": patch_size,
+            "patch_stride": patch_stride,
+            "patch_coverage_threshold": coverage_threshold,
+            "patch_min_mask_pixels": min_mask_pixels,
+            "patch_max_per_frame": max_patches_per_frame,
+            "patch_max_per_video": max_patches_per_video,
+            "patch_count": len(patches),
+            "frame_patches": frame_rows,
+        }
+        index_rows.append(index_row)
+
+    with (patch_dir / "patch_index.jsonl").open("w") as fh:
+        for row in index_rows:
+            fh.write(json.dumps(row, sort_keys=True) + "\n")
