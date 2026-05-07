@@ -19,7 +19,7 @@ import torch
 from src.core.train_utils import load_t5_cache
 from src.pipeline.eval_mitty.cli import build_parser
 from src.pipeline.eval_mitty.generation import generate_split, load_model
-from src.pipeline.eval_mitty.local_videos import write_local_videos
+from src.pipeline.eval_mitty.local_videos import write_local_videos, write_patch_overlays
 from src.pipeline.eval_mitty.metrics import compute_rows, write_csv
 from src.pipeline.eval_mitty.run_specs import (
     build_eval_split,
@@ -48,16 +48,22 @@ def _resolve_mask_region(args, parser) -> str | None:
         parser.error("--no-generate and --generate-only are mutually exclusive")
     if args.mask_region_frechet_metrics is not None:
         args.mask_region_metrics = args.mask_region_frechet_metrics
+    if args.patch_fid_only:
+        args.patch_fid = True
     mask_region_enabled = (
         args.mask_region_metrics == "on"
         or (
             args.mask_region_metrics == "auto"
             and args.data_type == "blur_r2r"
         )
+        or args.patch_fid
+        or args.write_patch_overlays
     )
     sam2_mask_root = str(resolve_path(args.sam2_mask_root)) if mask_region_enabled else None
     if args.write_local_videos and sam2_mask_root is None:
         parser.error("--write-local-videos requires mask-region metrics to be enabled")
+    if args.write_patch_overlays and sam2_mask_root is None:
+        parser.error("--write-patch-overlays requires patch/mask metrics to be enabled")
     return sam2_mask_root
 
 
@@ -141,6 +147,31 @@ def _write_local_outputs(args, run_specs, runtime_split, sam2_mask_root: str) ->
             )
 
 
+def _write_patch_outputs(args, run_specs, runtime_split, sam2_mask_root: str) -> None:
+    for run in run_specs:
+        base_dir = eval_base_dir(run, args.output_dir)
+        for split in args.splits:
+            split_records = records_for_split(split, runtime_split)
+            split_out = base_dir / split
+            print(
+                f"[{run.name}] writing Patch FID overlays for {split} "
+                f"-> {split_out / 'patch_fid'}",
+                flush=True,
+            )
+            write_patch_overlays(
+                split_out,
+                split_records,
+                sam2_mask_root,
+                patch_size=args.patch_size,
+                patch_stride=args.patch_stride,
+                coverage_threshold=args.patch_coverage_threshold,
+                min_mask_pixels=args.patch_min_mask_pixels,
+                max_patches_per_frame=args.patch_max_per_frame,
+                max_patches_per_video=args.patch_max_per_video,
+                show_progress=not args.no_progress,
+            )
+
+
 def _write_summaries(args, run_specs, rows, runtime_split) -> None:
     for run in run_specs:
         base_dir = eval_base_dir(run, args.output_dir)
@@ -186,6 +217,9 @@ def main() -> None:
     if args.write_local_videos:
         _write_local_outputs(args, run_specs, runtime_split, sam2_mask_root)
 
+    if args.write_patch_overlays:
+        _write_patch_outputs(args, run_specs, runtime_split, sam2_mask_root)
+
     if args.generate_only:
         print("\nGeneration finished; metric computation skipped (--generate-only).")
         return
@@ -203,6 +237,14 @@ def main() -> None:
         lpips_batch_size=args.lpips_batch_size,
         feature_batch_size=args.feature_batch_size,
         fvd_batch_size=args.fvd_batch_size,
+        patch_fid=args.patch_fid,
+        patch_fid_only=args.patch_fid_only,
+        patch_size=args.patch_size,
+        patch_stride=args.patch_stride,
+        patch_coverage_threshold=args.patch_coverage_threshold,
+        patch_min_mask_pixels=args.patch_min_mask_pixels,
+        patch_max_per_frame=args.patch_max_per_frame,
+        patch_max_per_video=args.patch_max_per_video,
         show_progress=not args.no_progress,
     )
     _write_summaries(args, run_specs, rows, runtime_split)

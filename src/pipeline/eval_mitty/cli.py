@@ -21,6 +21,12 @@ from src.tools.eval_metrics import (
     DEFAULT_LPIPS_BATCH_SIZE,
     DEFAULT_METRIC_WORKERS,
     LOCAL_FID_MARGIN,
+    PATCH_FID_COVERAGE_THRESHOLD,
+    PATCH_FID_MAX_PATCHES_PER_FRAME,
+    PATCH_FID_MAX_PATCHES_PER_VIDEO,
+    PATCH_FID_MIN_MASK_PIXELS,
+    PATCH_FID_SIZE,
+    PATCH_FID_STRIDE,
 )
 
 
@@ -86,7 +92,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="generate videos only and skip metric computation")
     ap.add_argument("--no-lpips", action="store_true")
     ap.add_argument("--no-fid", action="store_true",
-                    help="skip FID, FVD, Local FID, and Local FVD")
+                    help="skip FID, FVD, Local FID, and Local FVD; "
+                         "--patch-fid/--patch-fid-only still load Inception")
     ap.add_argument("--mask-region-metrics",
                     choices=["auto", "on", "off"], default="auto",
                     help="compute mask-region local metrics, foreground Local FID, "
@@ -105,6 +112,28 @@ def build_parser() -> argparse.ArgumentParser:
                     help="square output size for Local crop videos")
     ap.add_argument("--local-video-bbox-mode", choices=["frame", "union"], default="frame",
                     help="frame uses per-frame mask bbox; union uses one clip-level bbox")
+    ap.add_argument("--patch-fid", action="store_true",
+                    help="compute foreground Patch FID from mask-selected frame patches")
+    ap.add_argument("--patch-fid-only", action="store_true",
+                    help="compute only foreground Patch FID from existing/generated videos")
+    ap.add_argument("--write-patch-overlays", action="store_true",
+                    help="write videos that overlay selected Patch FID patches per frame")
+    ap.add_argument("--patch-size", type=int, default=PATCH_FID_SIZE,
+                    help="square patch size in pixels for Patch FID")
+    ap.add_argument("--patch-stride", type=int, default=PATCH_FID_STRIDE,
+                    help="patch grid stride in pixels for Patch FID")
+    ap.add_argument("--patch-coverage-threshold", type=float,
+                    default=PATCH_FID_COVERAGE_THRESHOLD,
+                    help="minimum mask coverage ratio for selecting a patch")
+    ap.add_argument("--patch-min-mask-pixels", type=int,
+                    default=PATCH_FID_MIN_MASK_PIXELS,
+                    help="select patches with strictly more than this many mask pixels")
+    ap.add_argument("--patch-max-per-frame", type=int,
+                    default=PATCH_FID_MAX_PATCHES_PER_FRAME,
+                    help="maximum selected patches per frame; 0 keeps all selected patches")
+    ap.add_argument("--patch-max-per-video", type=int,
+                    default=PATCH_FID_MAX_PATCHES_PER_VIDEO,
+                    help="maximum selected patches per video; 0 keeps all per-frame selections")
     ap.add_argument("--metric-workers", type=int, default=DEFAULT_METRIC_WORKERS,
                     help="parallel workers for video decode and CPU pairwise metrics")
     ap.add_argument("--lpips-batch-size", type=int, default=DEFAULT_LPIPS_BATCH_SIZE,
@@ -116,4 +145,3 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--no-progress", action="store_true",
                     help="disable generation/local/metric progress printing")
     return ap
-

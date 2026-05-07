@@ -49,6 +49,12 @@ SEGMENT_FPS = 30.0
 TARGET_FPS = 16.0
 LOCAL_FID_MARGIN = 24
 LOCAL_FID_SIZE = 299
+PATCH_FID_SIZE = 64
+PATCH_FID_STRIDE = 32
+PATCH_FID_COVERAGE_THRESHOLD = 0.0
+PATCH_FID_MIN_MASK_PIXELS = 5
+PATCH_FID_MAX_PATCHES_PER_FRAME = 0
+PATCH_FID_MAX_PATCHES_PER_VIDEO = 0
 DEFAULT_METRIC_WORKERS = min(8, os.cpu_count() or 1)
 DEFAULT_LPIPS_BATCH_SIZE = 16
 DEFAULT_FEATURE_BATCH_SIZE = 32
@@ -63,6 +69,17 @@ class PairMetricData:
     gt_frames: np.ndarray
     masks: np.ndarray | None
     metrics: dict
+
+
+@dataclass(frozen=True)
+class MaskPatch:
+    frame: int
+    x1: int
+    y1: int
+    x2: int
+    y2: int
+    mask_pixels: int
+    coverage: float
 
 
 # ── Video IO ──────��──────────────────────────────���────────────────────
@@ -206,6 +223,93 @@ def crop_video_by_mask_bbox(
         )
         crops.append(np.asarray(resized, dtype=np.uint8))
     return np.stack(crops, axis=0)
+
+
+def _grid_starts(length: int, patch_size: int, stride: int) -> list[int]:
+    if patch_size <= 0:
+        raise ValueError(f"patch_size must be positive, got {patch_size}")
+    if stride <= 0:
+        raise ValueError(f"patch stride must be positive, got {stride}")
+    if patch_size > length:
+        raise ValueError(f"patch_size {patch_size} exceeds dimension {length}")
+    starts = list(range(0, length - patch_size + 1, stride))
+    last = length - patch_size
+    if starts[-1] != last:
+        starts.append(last)
+    return starts
+
+
+def select_mask_patches(
+    masks: np.ndarray,
+    *,
+    patch_size: int = PATCH_FID_SIZE,
+    stride: int = PATCH_FID_STRIDE,
+    coverage_threshold: float = PATCH_FID_COVERAGE_THRESHOLD,
+    min_mask_pixels: int = PATCH_FID_MIN_MASK_PIXELS,
+    max_patches_per_frame: int = PATCH_FID_MAX_PATCHES_PER_FRAME,
+    max_patches_per_video: int = PATCH_FID_MAX_PATCHES_PER_VIDEO,
+) -> list[MaskPatch]:
+    """Select fixed-size image patches with enough foreground mask pixels."""
+    if masks.ndim != 3:
+        raise ValueError(f"Expected mask stack (T,H,W), got {masks.shape}")
+    if not 0.0 <= coverage_threshold <= 1.0:
+        raise ValueError(
+            f"coverage_threshold must be in [0, 1], got {coverage_threshold}"
+        )
+    if min_mask_pixels < 0:
+        raise ValueError(f"min_mask_pixels must be non-negative, got {min_mask_pixels}")
+    if max_patches_per_frame < 0:
+        raise ValueError(
+            f"max_patches_per_frame must be non-negative, got {max_patches_per_frame}"
+        )
+    if max_patches_per_video < 0:
+        raise ValueError(
+            f"max_patches_per_video must be non-negative, got {max_patches_per_video}"
+        )
+
+    _, h, w = masks.shape
+    y_starts = _grid_starts(h, patch_size, stride)
+    x_starts = _grid_starts(w, patch_size, stride)
+    selected: list[MaskPatch] = []
+    denom = float(patch_size * patch_size)
+
+    for frame_idx, mask in enumerate(masks):
+        if not mask.any():
+            continue
+        candidates: list[MaskPatch] = []
+        for y1 in y_starts:
+            y2 = y1 + patch_size
+            for x1 in x_starts:
+                x2 = x1 + patch_size
+                mask_pixels = int(mask[y1:y2, x1:x2].sum())
+                coverage = float(mask_pixels / denom)
+                patch = MaskPatch(frame_idx, x1, y1, x2, y2, mask_pixels, coverage)
+                if mask_pixels > min_mask_pixels and coverage >= coverage_threshold:
+                    candidates.append(patch)
+        candidates.sort(key=lambda p: (-p.coverage, p.frame, p.y1, p.x1))
+        if max_patches_per_frame:
+            candidates = candidates[:max_patches_per_frame]
+        selected.extend(candidates)
+
+    if max_patches_per_video and len(selected) > max_patches_per_video:
+        selected = sorted(
+            selected,
+            key=lambda p: (-p.coverage, p.frame, p.y1, p.x1),
+        )[:max_patches_per_video]
+        selected.sort(key=lambda p: (p.frame, p.y1, p.x1))
+    return selected
+
+
+def mask_patch_dict(patch: MaskPatch) -> dict:
+    return {
+        "frame": patch.frame,
+        "x1": patch.x1,
+        "y1": patch.y1,
+        "x2": patch.x2,
+        "y2": patch.y2,
+        "mask_pixels": patch.mask_pixels,
+        "coverage": patch.coverage,
+    }
 
 
 def region_masks(masks: np.ndarray) -> dict[str, np.ndarray]:
@@ -526,6 +630,137 @@ def collect_local_inception_features(
     )
 
 
+def select_video_mask_patches(
+    mask_arrays: list[np.ndarray],
+    *,
+    patch_size: int = PATCH_FID_SIZE,
+    stride: int = PATCH_FID_STRIDE,
+    coverage_threshold: float = PATCH_FID_COVERAGE_THRESHOLD,
+    min_mask_pixels: int = PATCH_FID_MIN_MASK_PIXELS,
+    max_patches_per_frame: int = PATCH_FID_MAX_PATCHES_PER_FRAME,
+    max_patches_per_video: int = PATCH_FID_MAX_PATCHES_PER_VIDEO,
+) -> list[list[MaskPatch]]:
+    return [
+        select_mask_patches(
+            masks,
+            patch_size=patch_size,
+            stride=stride,
+            coverage_threshold=coverage_threshold,
+            min_mask_pixels=min_mask_pixels,
+            max_patches_per_frame=max_patches_per_frame,
+            max_patches_per_video=max_patches_per_video,
+        )
+        for masks in mask_arrays
+    ]
+
+
+def collect_patch_inception_features(
+    video_arrays: list[np.ndarray],
+    patches_by_video: list[list[MaskPatch]],
+    extractor: InceptionFeatureExtractor,
+    device: torch.device,
+    batch_size: int = DEFAULT_FEATURE_BATCH_SIZE,
+    progress_callback: ProgressCallback | None = None,
+    progress_phase: str = "patch_fid",
+) -> np.ndarray:
+    """Extract Inception features from mask-selected frame patches."""
+    if len(video_arrays) != len(patches_by_video):
+        raise ValueError(
+            f"Video/patch count mismatch: {len(video_arrays)} vs {len(patches_by_video)}"
+        )
+    if batch_size <= 0:
+        raise ValueError(f"Inception feature batch size must be positive, got {batch_size}")
+    total = sum(len(patches) for patches in patches_by_video)
+    if total == 0:
+        raise ValueError("No mask patches selected for patch FID")
+
+    feats = []
+    batch_patches: list[np.ndarray] = []
+    done = 0
+
+    def flush_batch() -> None:
+        nonlocal done
+        if not batch_patches:
+            return
+        batch = (
+            torch.from_numpy(np.stack(batch_patches, axis=0))
+            .permute(0, 3, 1, 2)
+            .float()
+            / 255.0
+        )
+        feats.append(extractor(batch.to(device)).cpu().numpy())
+        done += len(batch_patches)
+        if progress_callback is not None:
+            progress_callback(progress_phase, done, total)
+        batch_patches.clear()
+
+    for video, patches in zip(video_arrays, patches_by_video):
+        if video.ndim != 4 or video.shape[-1] != 3:
+            raise ValueError(f"Expected video frames shape (T,H,W,3), got {video.shape}")
+        for patch in patches:
+            crop = video[patch.frame, patch.y1:patch.y2, patch.x1:patch.x2]
+            batch_patches.append(crop)
+            if len(batch_patches) == batch_size:
+                flush_batch()
+    flush_batch()
+    return np.concatenate(feats, axis=0)
+
+
+def compute_patch_fid(
+    gen_videos: list[np.ndarray],
+    gt_videos: list[np.ndarray],
+    masks: list[np.ndarray],
+    extractor: InceptionFeatureExtractor,
+    device: torch.device,
+    *,
+    patch_size: int = PATCH_FID_SIZE,
+    stride: int = PATCH_FID_STRIDE,
+    coverage_threshold: float = PATCH_FID_COVERAGE_THRESHOLD,
+    min_mask_pixels: int = PATCH_FID_MIN_MASK_PIXELS,
+    max_patches_per_frame: int = PATCH_FID_MAX_PATCHES_PER_FRAME,
+    max_patches_per_video: int = PATCH_FID_MAX_PATCHES_PER_VIDEO,
+    batch_size: int = DEFAULT_FEATURE_BATCH_SIZE,
+    progress_callback: ProgressCallback | None = None,
+) -> tuple[float | None, int]:
+    """Compute FID over the distribution of mask-selected frame patches."""
+    if not (len(gen_videos) == len(gt_videos) == len(masks)):
+        raise ValueError(
+            "Patch FID count mismatch: "
+            f"gen={len(gen_videos)} gt={len(gt_videos)} masks={len(masks)}"
+        )
+    patches_by_video = select_video_mask_patches(
+        masks,
+        patch_size=patch_size,
+        stride=stride,
+        coverage_threshold=coverage_threshold,
+        min_mask_pixels=min_mask_pixels,
+        max_patches_per_frame=max_patches_per_frame,
+        max_patches_per_video=max_patches_per_video,
+    )
+    n_patches = sum(len(patches) for patches in patches_by_video)
+    if n_patches < 2:
+        return None, n_patches
+    feats_gen = collect_patch_inception_features(
+        gen_videos,
+        patches_by_video,
+        extractor,
+        device,
+        batch_size=batch_size,
+        progress_callback=progress_callback,
+        progress_phase="patch_fid/gen",
+    )
+    feats_gt = collect_patch_inception_features(
+        gt_videos,
+        patches_by_video,
+        extractor,
+        device,
+        batch_size=batch_size,
+        progress_callback=progress_callback,
+        progress_phase="patch_fid/gt",
+    )
+    return compute_fid(feats_gen, feats_gt), n_patches
+
+
 def compute_fid(feats_gen: np.ndarray, feats_gt: np.ndarray) -> float:
     mu_gen, sigma_gen = feats_gen.mean(0), np.cov(feats_gen, rowvar=False)
     mu_gt, sigma_gt = feats_gt.mean(0), np.cov(feats_gt, rowvar=False)
@@ -726,6 +961,7 @@ def _load_pair_metric_data(
     pair: tuple[str, str, int],
     records_by_index: dict[int, dict],
     sam2_mask_root: str | Path | None,
+    compute_pairwise: bool = True,
 ) -> PairMetricData:
     gen_path, gt_path, idx = pair
     gen_frames = read_video_frames(gen_path)
@@ -745,13 +981,15 @@ def _load_pair_metric_data(
             len(gen_frames),
             gen_frames.shape[1:3],
         )
-    metrics = compute_pairwise_metrics(
-        gen_frames,
-        gt_frames,
-        lpips_model=None,
-        device=torch.device("cpu"),
-        masks=masks,
-    )
+    metrics = {}
+    if compute_pairwise:
+        metrics = compute_pairwise_metrics(
+            gen_frames,
+            gt_frames,
+            lpips_model=None,
+            device=torch.device("cpu"),
+            masks=masks,
+        )
     metrics["sample"] = idx
     return PairMetricData(
         idx=idx,
@@ -774,6 +1012,14 @@ def process_step(
     lpips_batch_size: int = DEFAULT_LPIPS_BATCH_SIZE,
     feature_batch_size: int = DEFAULT_FEATURE_BATCH_SIZE,
     fvd_batch_size: int = DEFAULT_FVD_BATCH_SIZE,
+    patch_fid: bool = False,
+    patch_fid_only: bool = False,
+    patch_size: int = PATCH_FID_SIZE,
+    patch_stride: int = PATCH_FID_STRIDE,
+    patch_coverage_threshold: float = PATCH_FID_COVERAGE_THRESHOLD,
+    patch_min_mask_pixels: int = PATCH_FID_MIN_MASK_PIXELS,
+    patch_max_per_frame: int = PATCH_FID_MAX_PATCHES_PER_FRAME,
+    patch_max_per_video: int = PATCH_FID_MAX_PATCHES_PER_VIDEO,
     progress_callback: ProgressCallback | None = None,
 ) -> dict:
     """Compute all metrics for one eval step directory."""
@@ -812,18 +1058,25 @@ def process_step(
 
     with ThreadPoolExecutor(max_workers=metric_workers) as executor:
         futures = [
-            executor.submit(_load_pair_metric_data, pair, records_by_index, sam2_mask_root)
+            executor.submit(
+                _load_pair_metric_data,
+                pair,
+                records_by_index,
+                sam2_mask_root,
+                not patch_fid_only,
+            )
             for pair in pairs
         ]
         for done, future in enumerate(as_completed(futures), 1):
             pair_data.append(future.result())
             if progress_callback is not None:
-                progress_callback("pairwise", done, len(pairs))
+                phase = "decode" if patch_fid_only else "pairwise"
+                progress_callback(phase, done, len(pairs))
 
     pair_data.sort(key=lambda item: item.idx)
     per_sample = [item.metrics for item in pair_data]
 
-    if lpips_model is not None:
+    if lpips_model is not None and not patch_fid_only:
         lpips_scores = compute_lpips_per_video(
             [(item.gen_frames, item.gt_frames) for item in pair_data],
             lpips_model,
@@ -857,7 +1110,10 @@ def process_step(
         if values:
             result[key] = float(np.mean(values))
 
-    if inception is not None:
+    if patch_fid and selected_records is None:
+        raise ValueError("patch_fid requires selected_records and sam2_mask_root")
+
+    if inception is not None and not patch_fid_only:
         total_gen_frames = sum(len(v) for v in gen_videos)
         if total_gen_frames >= 2:
             feats_gen = collect_inception_features(
@@ -900,7 +1156,33 @@ def process_step(
                 )
                 result["foreground_local_fid"] = compute_fid(feats_gen, feats_gt)
 
-    if video_extractor is not None:
+    if patch_fid and inception is not None:
+        value, n_patches = compute_patch_fid(
+            gen_videos,
+            gt_videos,
+            local_fid_masks,
+            inception,
+            device,
+            patch_size=patch_size,
+            stride=patch_stride,
+            coverage_threshold=patch_coverage_threshold,
+            min_mask_pixels=patch_min_mask_pixels,
+            max_patches_per_frame=patch_max_per_frame,
+            max_patches_per_video=patch_max_per_video,
+            batch_size=feature_batch_size,
+            progress_callback=progress_callback,
+        )
+        result["foreground_patch_count"] = n_patches
+        result["foreground_patch_size"] = patch_size
+        result["foreground_patch_stride"] = patch_stride
+        result["foreground_patch_coverage_threshold"] = patch_coverage_threshold
+        result["foreground_patch_min_mask_pixels"] = patch_min_mask_pixels
+        result["foreground_patch_max_per_frame"] = patch_max_per_frame
+        result["foreground_patch_max_per_video"] = patch_max_per_video
+        if value is not None:
+            result["foreground_patch_fid"] = value
+
+    if video_extractor is not None and not patch_fid_only:
         fvd = compute_fvd(
             gen_videos,
             gt_videos,
