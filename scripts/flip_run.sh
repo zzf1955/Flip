@@ -17,6 +17,8 @@ Subcommands:
   mitty_cache      Run python -m src.pipeline.mitty_cache.
   sam2_precompute  Run python -m src.pipeline.sam2_precompute.
   train            Run python -m torch.distributed.run -m src.pipeline.train.
+  train_mitty_mixed_h2r
+                   Run python -m torch.distributed.run -m src.pipeline.train_mitty_mixed_h2r.
   eval_mitty       Run python -m src.pipeline.evaluate_mitty_models.
 
 Launcher options:
@@ -29,6 +31,7 @@ Examples:
   scripts/flip_run.sh mitty_cache --cuda 0 -- --pair-dir training_data/pair/1s/train --output training_data/cache/1s/train --device cuda:0 --no-frames
   scripts/flip_run.sh sam2_precompute --cuda 0 -- --task all --device cuda:0 --resume
   scripts/flip_run.sh train --cuda 2,3 --nproc 2 -- --task-name pair_1s --max-steps 1000
+  scripts/flip_run.sh train_mitty_mixed_h2r --cuda 2,3 --nproc 2 -- --task-name mixed_h2r --original-train-tasks Task_A --syn-train-tasks Task_A_syn --ood-eval-tasks Task_C --original-train-size 400 --syn-train-size 400 --max-steps 1000
   scripts/flip_run.sh eval_mitty --cuda 2 -- --device cuda:0 --eval-tail-percent 10
 USAGE
 }
@@ -63,7 +66,7 @@ case "$subcommand" in
   nvidia-smi)
     exec nvidia-smi "$@"
     ;;
-  mitty_cache|sam2_precompute|train|eval_mitty)
+  mitty_cache|sam2_precompute|train|train_mitty_mixed_h2r|eval_mitty)
     ;;
   *)
     usage >&2
@@ -136,6 +139,20 @@ case "$subcommand" in
       --standalone \
       --nproc_per_node="$nproc" \
       -m src.pipeline.train \
+      "${script_args[@]}"
+    ;;
+  train_mitty_mixed_h2r)
+    if [[ -z "$nproc" ]]; then
+      if [[ -n "$cuda_devices" ]]; then
+        nproc="$(count_cuda_devices "$cuda_devices")"
+      else
+        nproc="1"
+      fi
+    fi
+    exec "$PYTHON_BIN" -m torch.distributed.run \
+      --standalone \
+      --nproc_per_node="$nproc" \
+      -m src.pipeline.train_mitty_mixed_h2r \
       "${script_args[@]}"
     ;;
   eval_mitty)
