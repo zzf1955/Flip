@@ -7,12 +7,14 @@ import torch
 
 from src.tools.eval_metrics import (
     clip_mask_indices,
+    collect_patch_inception_features,
     collect_local_video_features,
     compute_pairwise_metrics,
     crop_video_by_mask_bbox,
     load_clip_mask_stack,
     mse_to_psnr,
     resolve_sam2_mask_path,
+    select_mask_patches,
 )
 
 
@@ -95,6 +97,89 @@ class EvalMaskRegionTest(unittest.TestCase):
         self.assertEqual(features.shape, (1, 3))
         self.assertTrue(np.allclose(features, 1.0))
         self.assertEqual(extractor.last_shape, (1, 3, 2, 224, 224))
+
+    def test_select_mask_patches_keeps_only_mask_overlapping_grid_cells(self):
+        masks = np.zeros((2, 8, 8), dtype=bool)
+        masks[0, 1:5, 1:5] = True
+        masks[1, 4:8, 4:8] = True
+
+        patches = select_mask_patches(
+            masks,
+            patch_size=4,
+            stride=4,
+            coverage_threshold=0.25,
+            max_patches_per_frame=2,
+        )
+
+        self.assertEqual([p.frame for p in patches], [0, 1])
+        self.assertEqual((patches[0].x1, patches[0].y1, patches[0].x2, patches[0].y2), (0, 0, 4, 4))
+        self.assertEqual((patches[1].x1, patches[1].y1, patches[1].x2, patches[1].y2), (4, 4, 8, 8))
+        self.assertGreaterEqual(patches[0].coverage, 0.25)
+
+    def test_select_mask_patches_keeps_only_boxes_above_min_mask_pixels(self):
+        masks = np.zeros((1, 8, 8), dtype=bool)
+        masks[0, 1:5, 1:5] = True
+
+        patches = select_mask_patches(
+            masks,
+            patch_size=4,
+            stride=4,
+            coverage_threshold=0.0,
+            min_mask_pixels=5,
+            max_patches_per_frame=0,
+        )
+
+        self.assertEqual(
+            {(p.x1, p.y1, p.x2, p.y2) for p in patches},
+            {(0, 0, 4, 4)},
+        )
+        self.assertTrue(all(p.mask_pixels > 5 for p in patches))
+
+    def test_select_mask_patches_min_zero_keeps_all_mask_overlaps(self):
+        masks = np.zeros((1, 8, 8), dtype=bool)
+        masks[0, 1:5, 1:5] = True
+
+        patches = select_mask_patches(
+            masks,
+            patch_size=4,
+            stride=4,
+            coverage_threshold=0.0,
+            min_mask_pixels=0,
+            max_patches_per_frame=0,
+        )
+
+        self.assertEqual(len(patches), 4)
+        self.assertTrue(all(p.mask_pixels > 0 for p in patches))
+
+    def test_collect_patch_inception_features_uses_selected_patch_pixels(self):
+        class DummyInception(torch.nn.Module):
+            def forward(self, x):
+                self.last_shape = tuple(x.shape)
+                return x.mean(dim=(2, 3))
+
+        video = np.zeros((1, 8, 8, 3), dtype=np.uint8)
+        video[:, 4:8, 4:8, :] = 255
+        patches = select_mask_patches(
+            np.ones((1, 8, 8), dtype=bool),
+            patch_size=4,
+            stride=4,
+            coverage_threshold=1.0,
+            max_patches_per_frame=0,
+        )
+        selected = [p for p in patches if p.x1 == 4 and p.y1 == 4]
+        extractor = DummyInception()
+
+        features = collect_patch_inception_features(
+            [video],
+            [selected],
+            extractor,
+            torch.device("cpu"),
+            batch_size=1,
+        )
+
+        self.assertEqual(features.shape, (1, 3))
+        self.assertTrue(np.allclose(features, 1.0))
+        self.assertEqual(extractor.last_shape, (1, 3, 4, 4))
 
     def test_pairwise_metrics_include_global_and_masked_regions(self):
         gt = np.zeros((1, 16, 16, 3), dtype=np.uint8)

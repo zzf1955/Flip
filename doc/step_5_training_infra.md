@@ -302,6 +302,35 @@ Local FID 指标内部仍使用 InceptionV3 的 299 输入尺寸；视频默认�
 H.264 `yuv420p` 输出要求宽高为偶数。
 如果只为人工观看、希望减少 bbox 抖动，可改用 `--local-video-bbox-mode union`。
 
+如需避免 bbox 引入大面积背景，可启用 mask-selected Patch FID。Patch FID
+在每帧按固定网格选择 mask 像素数严格大于阈值的 patch，并把同一组 patch 坐标同时
+应用到 gen/GT，提取 InceptionV3 特征后计算 Frechet 距离，字段为
+`foreground_patch_fid`。常用只复算已有视频的命令：
+
+```bash
+scripts/flip_run.sh eval_mitty --cuda 2 -- \
+  --no-generate \
+  --patch-fid-only \
+  --write-patch-overlays \
+  --patch-size 64 \
+  --patch-stride 32 \
+  --patch-min-mask-pixels 5
+```
+
+`--patch-fid-only` 会跳过 LPIPS、全局 FID/FVD 和 bbox Local FID/FVD，只加载
+InceptionV3 计算 `foreground_patch_fid`。`--write-patch-overlays` 会在每个
+split 下写出 `patch_fid/`，包含 `gen_overlay_*.mp4`、`gt_overlay_*.mp4`、
+`ctrl_overlay_*.mp4`、`compare_overlay_*.mp4` 和 `patch_index.jsonl`；overlay
+中半透明红色表示 robot mask，青/绿色矩形表示该帧参与 Patch FID 的 patch。
+默认 `--patch-min-mask-pixels 5 --patch-coverage-threshold 0.0
+--patch-max-per-frame 0`，表示 patch 内 mask 像素数必须严格大于 5，且不限制
+每帧 patch 数量；如需更稀疏的人工检查或更快的 smoke，可显式调高像素/coverage
+阈值或设置每帧上限。
+summary 会额外记录 `foreground_patch_count`、`foreground_patch_size`、
+`foreground_patch_stride`、`foreground_patch_coverage_threshold`、
+`foreground_patch_min_mask_pixels`、`foreground_patch_max_per_frame` 和
+`foreground_patch_max_per_video`。
+
 ### 冒烟训练
 
 ```bash

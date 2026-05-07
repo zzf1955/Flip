@@ -17,16 +17,29 @@ from src.pipeline.runtime_data import RuntimeSplit
 from src.tools.eval_metrics import (
     InceptionFeatureExtractor,
     LPIPS,
+    PATCH_FID_COVERAGE_THRESHOLD,
+    PATCH_FID_MAX_PATCHES_PER_FRAME,
+    PATCH_FID_MAX_PATCHES_PER_VIDEO,
+    PATCH_FID_MIN_MASK_PIXELS,
+    PATCH_FID_SIZE,
+    PATCH_FID_STRIDE,
     VideoFeatureExtractor,
     make_print_progress,
     process_step,
 )
 
 
-def metric_models(device: torch.device, no_lpips: bool, no_fid: bool):
-    lpips_model = None if no_lpips else LPIPS().to(device).eval()
-    inception = None if no_fid else InceptionFeatureExtractor().to(device).eval()
-    video_extractor = None if no_fid else VideoFeatureExtractor().to(device).eval()
+def metric_models(
+    device: torch.device,
+    no_lpips: bool,
+    no_fid: bool,
+    patch_fid: bool,
+    patch_fid_only: bool,
+):
+    lpips_model = None if no_lpips or patch_fid_only else LPIPS().to(device).eval()
+    needs_inception = not no_fid or patch_fid or patch_fid_only
+    inception = InceptionFeatureExtractor().to(device).eval() if needs_inception else None
+    video_extractor = None if no_fid or patch_fid_only else VideoFeatureExtractor().to(device).eval()
     return lpips_model, inception, video_extractor
 
 
@@ -44,8 +57,18 @@ def compute_rows(
     feature_batch_size: int,
     fvd_batch_size: int,
     show_progress: bool,
+    patch_fid: bool = False,
+    patch_fid_only: bool = False,
+    patch_size: int = PATCH_FID_SIZE,
+    patch_stride: int = PATCH_FID_STRIDE,
+    patch_coverage_threshold: float = PATCH_FID_COVERAGE_THRESHOLD,
+    patch_min_mask_pixels: int = PATCH_FID_MIN_MASK_PIXELS,
+    patch_max_per_frame: int = PATCH_FID_MAX_PATCHES_PER_FRAME,
+    patch_max_per_video: int = PATCH_FID_MAX_PATCHES_PER_VIDEO,
 ) -> list[dict]:
-    lpips_model, inception, video_extractor = metric_models(device, no_lpips, no_fid)
+    lpips_model, inception, video_extractor = metric_models(
+        device, no_lpips, no_fid, patch_fid, patch_fid_only,
+    )
     rows = []
     for run in run_specs:
         base_dir = eval_base_dir(run, output_dir)
@@ -65,6 +88,14 @@ def compute_rows(
                 lpips_batch_size=lpips_batch_size,
                 feature_batch_size=feature_batch_size,
                 fvd_batch_size=fvd_batch_size,
+                patch_fid=patch_fid or patch_fid_only,
+                patch_fid_only=patch_fid_only,
+                patch_size=patch_size,
+                patch_stride=patch_stride,
+                patch_coverage_threshold=patch_coverage_threshold,
+                patch_min_mask_pixels=patch_min_mask_pixels,
+                patch_max_per_frame=patch_max_per_frame,
+                patch_max_per_video=patch_max_per_video,
                 progress_callback=(
                     make_print_progress(f"[{run.name}] {split}")
                     if show_progress else None
@@ -92,6 +123,11 @@ def write_csv(rows: list[dict], path: Path):
         "foreground_mse", "foreground_psnr", "foreground_ssim",
         "background_mse", "background_psnr", "background_ssim",
         "foreground_local_fid", "foreground_local_fvd",
+        "foreground_patch_fid", "foreground_patch_count",
+        "foreground_patch_size", "foreground_patch_stride",
+        "foreground_patch_coverage_threshold",
+        "foreground_patch_min_mask_pixels",
+        "foreground_patch_max_per_frame", "foreground_patch_max_per_video",
         "out_dir", "summary_dir",
     ]
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -100,4 +136,3 @@ def write_csv(rows: list[dict], path: Path):
         writer.writeheader()
         for row in rows:
             writer.writerow(row)
-
