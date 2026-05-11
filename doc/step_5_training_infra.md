@@ -223,8 +223,9 @@ CUDA_VISIBLE_DEVICES=0 python -m src.pipeline.r2h_synthesize \
   --resume-existing
 ```
 
-如果要从三个默认 task 中先生成固定总量，并按各 task 的可用 robot clip 数比例分配，
-使用 `--source-task all --allocate-by-task proportional`。例如先生成 4000 条：
+如果要从多个 task 中生成到固定总上限，并按各 task 的可用 robot clip 数比例分配，
+使用 `--source-task ... --allocate-by-task proportional`。例如把三个默认 task 的
+`_syn` 数据集生成到总上限 4000 条：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m src.pipeline.r2h_synthesize \
@@ -239,6 +240,77 @@ CUDA_VISIBLE_DEVICES=0 python -m src.pipeline.r2h_synthesize \
 
 `global_head` 是默认选择模式，会按全局稳定顺序取前 N 条；`proportional` 只支持
 配合 `--num-samples` 使用，会按每个 task 过滤后的 eligible clip 数量做比例分配。
+`--num-samples` 表示目标数据集总上限，不表示本次新增数量。配合
+`--resume-existing` 时，入口会先读取目标 `_syn` task 目录下已有的
+`manifest.jsonl`，保留已有 `pair_NNNN`、`metadata.csv` 和 `pair_order.jsonl`
+记录，然后从已有数量之后继续生成；已有数量已经达到或超过本次目标上限时直接
+保持原数据集不变。继续扩充数据时应把 `--num-samples` 设为期望的最终总量，例如
+已有 800 条、希望再追加约 200 条时传 `--num-samples 1000`。
+不要通过降低 `--num-samples` 来“重建” `_syn`，该入口的续跑语义是不覆盖旧数据。
+续跑同一个 `_syn` 目录时必须沿用同一套 source task、exclude/covered manifest 和
+allocation 设置；如果已有 manifest 前缀与当前选择规则不一致，入口会直接报错。
+
+多卡扩充 `_syn` 数据时使用 `scripts/run_r2h_synthesize_queue.py`。该 launcher
+先按一个全局 `--num-samples` 上限计算每个 source task 的目标数量，再生成单 task
+`r2h_synthesize` 命令队列；运行时每张指定 CUDA 卡一次只跑一个 task，某张卡空闲后
+取队列下一项继续跑。子进程仍通过 `scripts/flip_run.sh r2h_synthesize` 设置环境，
+因此子进程内部设备固定传 `--device cuda:0`。默认只打印并写出队列；确认后加
+`--execute` 启动。
+
+```bash
+/home/leadtek/miniconda3/envs/flip/bin/python scripts/run_r2h_synthesize_queue.py \
+  --cuda 0,1,2 \
+  --source-task in_task \
+  --duration 1s \
+  --run <r2h_run_name_or_path> \
+  --checkpoint latest \
+  --num-samples 1000
+```
+
+确认队列后执行：
+
+```bash
+/home/leadtek/miniconda3/envs/flip/bin/python scripts/run_r2h_synthesize_queue.py \
+  --cuda 0,1,2 \
+  --source-task in_task \
+  --duration 1s \
+  --run <r2h_run_name_or_path> \
+  --checkpoint latest \
+  --num-samples 1000 \
+  --execute
+```
+
+队列文件、每个 task 的执行日志和配置会写到
+`training_data/log/r2h_synthesize_queue/<timestamp>/`。如果只传两个 source task，
+即使提供三张卡也只会启动两个并发任务；多于 CUDA 数量的 task 会自动排队。
+
+### ep000-ep003 syn 误差分析生成
+
+如果只想在 Seedance 覆盖的 episode 上检查自合成效果，不要写入正式
+`training_data/pair`，使用独立脚本 `scripts/run_syn_error_analysis.py`。默认
+source task 为两个 in-task 加一个 OOD，默认 episode 为 `ep000`、`ep001`、
+`ep002`、`ep003`，默认从每个 4s segment 切成 1s 非重叠 robot clip（start 为
+0s、1s、2s、3s），再用指定 r2h checkpoint 生成 syn human。输出固定在
+`output/syn_error_analysis/` 下，包含 `robot/`、`syn/`，可选 `compare/`，以及
+根目录 `manifest.jsonl` 和 `metadata.csv`。
+
+先检查将要处理的 clip：
+
+```bash
+python scripts/run_syn_error_analysis.py --list-only
+```
+
+指定 CUDA 跑完整生成：
+
+```bash
+scripts/flip_run.sh syn_error_analysis --cuda 0 -- \
+  --run final_data_r2h_all_in_task-r2h_1s-529d_r96_self_qkvo_ffn_1000s_0507_124705 \
+  --checkpoint latest \
+  --device cuda:0
+```
+
+`scripts/flip_run_2.sh` 也支持同名子命令。默认不会覆盖已有完整视频；如需重建
+目标目录中的同名 clip，显式加 `--overwrite`。
 
 默认输出：
 
@@ -413,6 +485,24 @@ summary 会额外记录 `foreground_patch_count`、`foreground_patch_size`、
 `foreground_patch_min_mask_pixels`、`foreground_patch_max_per_frame` 和
 `foreground_patch_max_per_video`。
 
+如需在已有 `full_eval/` 视频上同时查看前景 patch 与前景 patch 之外的背景
+patch 分布差异，可使用独立脚本：
+
+```bash
+python scripts/eval_background_patch_fid.py \
+  final_mitty_r128_0507-h2r_1s-400d_r128_self_qkv_1000s_0507_203146 \
+  --device cuda:0
+```
+
+脚本默认读取 `training_data/log/<log>/full_eval/{in_task_eval,ood_eval}` 和
+同目录 `data_split/*.jsonl`，从 `data_split/config.json` 继承 SAM2 mask root
+与 patch 参数，并把结果写到 `output/background_fid/<log>/summary.csv` 与
+`summary.json`。输出字段包括 `foreground_patch_fid`、`background_patch_fid`、
+`foreground_patch_count` 和 `background_patch_count`。背景 patch 定义为同一
+固定网格下未被前景 Patch FID 规则选中的 patch，因此和前景 patch 集合互补；
+可用 `--max-samples` 做 GPU smoke，或用 `--patch-max-per-frame` 控制背景
+patch 数量。
+
 ### 批量补跑 final step-1000 离线评估
 
 `scripts/eval_final_step1000_missing.py` 用于补跑已经训练到 1000 step、但还没有
@@ -453,19 +543,24 @@ CUDA_ID=2 /home/leadtek/miniconda3/envs/flip/bin/python \
   scripts/eval_final_step1000_missing.py --execute
 ```
 
-如需把任务队列分发到多张卡，传逗号分隔的 CUDA id。脚本会为每张卡启动一个
-worker，每个 worker 同时只跑一个 eval，跑完后自动从队列取下一个 run：
+如需把任务队列分发到多张卡，传逗号分隔的 CUDA id。执行模式下脚本会按
+`--poll-interval` 周期轮询这些卡的 `nvidia-smi` compute 进程；某张卡没有
+compute 进程且当前脚本没有在该卡运行 eval 时，才会把队列里的下一个 run 投到
+该卡。每张卡同时最多运行一个由本脚本启动的 eval，任务结束后继续等待下一次
+空闲再取下一个 run：
 
 ```bash
 /home/leadtek/miniconda3/envs/flip/bin/python \
   scripts/eval_final_step1000_missing.py \
   --runner flip_run_2 \
   --cuda-list 0,2,3 \
+  --poll-interval 30 \
   --execute
 ```
 
 可用 `--limit N` 先跑少量 run，`--cuda ID` 指定单卡评估，`--cuda-list IDS`
-指定多卡队列，`--runner flip_run_2` 可切换到 `scripts/flip_run_2.sh`，
+指定多卡轮询队列，`--poll-interval SEC` 调整空闲检查间隔，
+`--runner flip_run_2` 可切换到 `scripts/flip_run_2.sh`，
 `--force` 强制重跑已有 summary 的 run，
 `--include-r2h` 可把默认跳过的 r2h run 纳入补跑，
 `--include-ours-step1-step2` 可把默认跳过的 `final_ours_step1*` /

@@ -19,6 +19,7 @@ import shlex
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -107,8 +108,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", default=DEFAULT_CHECKPOINT)
     parser.add_argument("--cuda", default=os.environ.get("CUDA_ID", DEFAULT_CUDA))
     parser.add_argument("--cuda-list", default="",
-                        help="comma-separated CUDA ids for queue execution, "
+                        help="comma-separated CUDA ids to poll for idle eval slots, "
                              "e.g. 0,2,3; defaults to the single --cuda value")
+    parser.add_argument("--poll-interval", type=float, default=30.0,
+                        help="seconds between CUDA idle checks when --execute is used")
     parser.add_argument("--runner", choices=sorted(RUNNER_SCRIPTS), default="flip_run",
                         help="GPU launcher script to use")
     parser.add_argument("--device", default="cuda:0")
@@ -151,6 +154,60 @@ def parse_cuda_values(args: argparse.Namespace) -> list[str]:
     if len(set(values)) != len(values):
         raise ValueError(f"Duplicate CUDA ids are not allowed: {values}")
     return values
+
+
+def cuda_uuid_map(cuda_values: list[str]) -> dict[str, str]:
+    proc = subprocess.run(
+        [
+            "nvidia-smi",
+            "--query-gpu=index,uuid",
+            "--format=csv,noheader,nounits",
+        ],
+        cwd=REPO_ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    )
+    by_index = {}
+    for line in proc.stdout.splitlines():
+        if not line.strip():
+            continue
+        index, uuid = [part.strip() for part in line.split(",", 1)]
+        by_index[index] = uuid
+    missing = [cuda for cuda in cuda_values if cuda not in by_index]
+    if missing:
+        raise ValueError(
+            f"CUDA ids not found by nvidia-smi: {missing}; available={sorted(by_index)}"
+        )
+    return {cuda: by_index[cuda] for cuda in cuda_values}
+
+
+def busy_compute_cuda_values(cuda_to_uuid: dict[str, str]) -> set[str]:
+    proc = subprocess.run(
+        [
+            "nvidia-smi",
+            "--query-compute-apps=gpu_uuid,pid",
+            "--format=csv,noheader,nounits",
+        ],
+        cwd=REPO_ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    )
+    busy_uuids = set()
+    for line in proc.stdout.splitlines():
+        if not line.strip() or "No running processes found" in line:
+            continue
+        uuid = line.split(",", 1)[0].strip()
+        if uuid:
+            busy_uuids.add(uuid)
+    return {
+        cuda
+        for cuda, uuid in cuda_to_uuid.items()
+        if uuid in busy_uuids
+    }
 
 
 def read_train_args(run_dir: Path) -> dict:
@@ -449,51 +506,88 @@ def execute_queue(
     args: argparse.Namespace,
     cuda_values: list[str],
 ) -> None:
-    work_queue: queue.Queue[tuple[int, EvalTarget]] = queue.Queue()
-    for index, target in enumerate(targets, start=1):
-        work_queue.put((index, target))
-
+    pending: list[tuple[int, EvalTarget]] = list(enumerate(targets, start=1))
+    cuda_to_uuid = cuda_uuid_map(cuda_values)
+    active: dict[str, tuple[int, EvalTarget, threading.Thread]] = {}
+    done_queue: queue.Queue[tuple[str, str, int, EvalTarget, BaseException | None]] = queue.Queue()
     failures: list[tuple[int, EvalTarget, BaseException]] = []
-    failure_lock = threading.Lock()
 
-    def worker(cuda_value: str) -> None:
+    def worker(cuda_value: str, index: int, target: EvalTarget) -> None:
         worker_name = f"cuda:{cuda_value}"
+        try:
+            run_with_log(target, args, cuda_value, worker_name)
+            done_queue.put(("done", cuda_value, index, target, None))
+        except BaseException as exc:
+            done_queue.put(("failed", cuda_value, index, target, exc))
+
+    while pending or active:
         while True:
             try:
-                index, target = work_queue.get_nowait()
+                status, cuda_value, index, target, exc = done_queue.get_nowait()
             except queue.Empty:
-                return
-            print(
-                f"\n[{worker_name}] START [{index}/{len(targets)}] "
-                f"{target.run_dir.name}",
-                flush=True,
-            )
-            try:
-                run_with_log(target, args, cuda_value, worker_name)
+                break
+            active.pop(cuda_value, None)
+            if status == "done":
                 print(
-                    f"\n[{worker_name}] DONE [{index}/{len(targets)}] "
+                    f"\n[cuda:{cuda_value}] DONE [{index}/{len(targets)}] "
                     f"{target.run_dir.name}",
                     flush=True,
                 )
-            except BaseException as exc:
-                with failure_lock:
-                    failures.append((index, target, exc))
+            else:
+                assert exc is not None
+                failures.append((index, target, exc))
                 print(
-                    f"\n[{worker_name}] FAILED [{index}/{len(targets)}] "
+                    f"\n[cuda:{cuda_value}] FAILED [{index}/{len(targets)}] "
                     f"{target.run_dir.name}: {exc}",
                     flush=True,
                 )
-            finally:
-                work_queue.task_done()
 
-    threads = [
-        threading.Thread(target=worker, args=(cuda_value,), daemon=False)
-        for cuda_value in cuda_values
-    ]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
+        if pending:
+            busy = busy_compute_cuda_values(cuda_to_uuid)
+            idle = [
+                cuda
+                for cuda in cuda_values
+                if cuda not in active and cuda not in busy
+            ]
+            for cuda_value in idle:
+                if not pending:
+                    break
+                index, target = pending.pop(0)
+                print(
+                    f"\n[cuda:{cuda_value}] START [{index}/{len(targets)}] "
+                    f"{target.run_dir.name}",
+                    flush=True,
+                )
+                thread = threading.Thread(
+                    target=worker,
+                    args=(cuda_value, index, target),
+                    daemon=False,
+                )
+                active[cuda_value] = (index, target, thread)
+                thread.start()
+            if pending:
+                active_desc = ", ".join(
+                    f"cuda:{cuda}={target.run_dir.name}"
+                    for cuda, (_, target, _) in sorted(active.items())
+                ) or "none"
+                busy_desc = ", ".join(f"cuda:{cuda}" for cuda in sorted(busy)) or "none"
+                print(
+                    f"Waiting for idle CUDA slot; pending={len(pending)} "
+                    f"active={active_desc} busy_compute={busy_desc}",
+                    flush=True,
+                )
+
+        if pending or active:
+            time.sleep(args.poll_interval)
+
+    while True:
+        try:
+            status, cuda_value, index, target, exc = done_queue.get_nowait()
+        except queue.Empty:
+            break
+        if status == "failed":
+            assert exc is not None
+            failures.append((index, target, exc))
 
     if failures:
         details = "\n".join(
@@ -528,12 +622,12 @@ def main() -> None:
 
     action = "EXECUTE" if args.execute else "DRY-RUN"
     print(f"{action}: {len(targets)} target(s)")
-    print("CUDA queue: " + ", ".join(cuda_values))
+    print("CUDA poll list: " + ", ".join(cuda_values))
     for index, target in enumerate(targets, start=1):
         preview_cuda = cuda_values[(index - 1) % len(cuda_values)]
         command = command_for_target(target, args, preview_cuda)
         print(f"\n[{index}/{len(targets)}] {target.run_dir.name}")
-        print(f"  initial cuda: {preview_cuda}")
+        print(f"  preview cuda: {preview_cuda}")
         print(f"  splits: {', '.join(target.splits)}")
         print(f"  output: {target.output_dir}")
         print(f"  log: {target.log_path}")

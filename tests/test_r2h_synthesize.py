@@ -6,6 +6,7 @@ from pathlib import Path
 
 from src.pipeline.r2h_synthesize import (
     DEFAULT_EXCLUDE_EPISODES,
+    _process_task_group,
     build_manifest_record,
     collect_segment_clips,
     filter_excluded_clips,
@@ -129,6 +130,62 @@ class R2HSynthesizeTest(unittest.TestCase):
             self.assertEqual(record["source_robot_task"], "Task_A")
             self.assertEqual(record["robot_source_key"], clip.robot_source_key)
             self.assertTrue(record["seedance_exclusion_checked"])
+
+    def test_resume_existing_keeps_dataset_when_target_is_lower_than_existing(self):
+        with tempfile.TemporaryDirectory() as tmp_name:
+            root = Path(tmp_name)
+            pair_root = root / "pair"
+            task_dir = pair_root / "h2r" / "1s" / "Task_A_syn"
+            (task_dir / "video").mkdir(parents=True)
+            (task_dir / "control_video").mkdir()
+            rows = []
+            for index in range(2):
+                pair_id = f"pair_{index:04d}"
+                (task_dir / "video" / f"{pair_id}.mp4").write_bytes(b"robot")
+                (task_dir / "control_video" / f"{pair_id}.mp4").write_bytes(b"human")
+                rows.append({
+                    "control_video": f"control_video/{pair_id}.mp4",
+                    "data_type": "h2r",
+                    "duration": "1s",
+                    "pair_id": pair_id,
+                    "prompt": "prompt",
+                    "robot_source_key": f"Task_A/ep004/seg00_start{index}.000_dur1.000",
+                    "robot_task": "Task_A_syn",
+                    "source_id": f"source_{index}",
+                    "source_order_index": index,
+                    "source_robot_task": "Task_A",
+                    "source_segment_id": "Task_A/ep004/seg00",
+                    "video": f"video/{pair_id}.mp4",
+                })
+            (task_dir / "manifest.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in rows)
+            )
+            original_manifest = (task_dir / "manifest.jsonl").read_text()
+
+            _touch_segment(root / "segment", "Task_A", "ep004")
+            clips = collect_segment_clips(
+                root / "segment", ["Task_A"], "1s", validate_videos=False)[:1]
+            args = Namespace(
+                duration="1s",
+                output_pair_root=pair_root,
+                output_task_suffix="{task}_syn",
+                prompt="prompt",
+                resume_existing=True,
+                covered_sources=set(),
+            )
+
+            _process_task_group(
+                "Task_A",
+                clips,
+                args,
+                run=Namespace(name="Run", checkpoint=Path("ckpt.safetensors")),
+                model=None,
+                spec=None,
+                t5_pos={},
+                t5_neg=None,
+            )
+
+            self.assertEqual((task_dir / "manifest.jsonl").read_text(), original_manifest)
 
 
 if __name__ == "__main__":

@@ -481,6 +481,10 @@ def main():
             name = Path(row["video"]).stem  # pair_NNNN
             out_path = output_dir / f"{name}.pth"
             if args.resume and out_path.exists():
+                source_record = _source_record_for(
+                    row, source_map, manifest_by_video, split_name)
+                cache_manifest_rows.append(
+                    _cache_manifest_record(row, out_path, source_record, pair_dir))
                 skipped += 1
                 continue
 
@@ -529,6 +533,10 @@ def main():
             name = Path(row["video"]).stem  # pair_NNNN
             out_path = output_dir / f"{name}.pth"
             if args.resume and out_path.exists():
+                source_record = _source_record_for(
+                    row, source_map, manifest_by_video, split_name)
+                cache_manifest_rows.append(
+                    _cache_manifest_record(row, out_path, source_record, pair_dir))
                 skipped += 1
                 continue
             pending.append((idx, row, out_path, name))

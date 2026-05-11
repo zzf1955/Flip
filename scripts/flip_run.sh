@@ -16,6 +16,9 @@ Subcommands:
   nvidia-smi       Run NVIDIA-SMI on the host GPU device.
   mitty_cache      Run python -m src.pipeline.mitty_cache.
   sam2_precompute  Run python -m src.pipeline.sam2_precompute.
+  r2h_synthesize   Run python -m src.pipeline.r2h_synthesize.
+  syn_error_analysis
+                   Run scripts/run_syn_error_analysis.py.
   train            Run python -m torch.distributed.run -m src.pipeline.train.
   train_mitty_mixed_h2r
                    Run python -m torch.distributed.run -m src.pipeline.train_mitty_mixed_h2r.
@@ -30,6 +33,8 @@ Examples:
   scripts/flip_run.sh nvidia-smi
   scripts/flip_run.sh mitty_cache --cuda 0 -- --pair-dir training_data/pair/1s/train --output training_data/cache/1s/train --device cuda:0 --no-frames
   scripts/flip_run.sh sam2_precompute --cuda 0 -- --task all --device cuda:0 --resume
+  scripts/flip_run.sh r2h_synthesize --cuda 0 -- --source-task Inspire_Collect_Clothes_MainCamOnly --duration 1s --run RUN --checkpoint latest --num-samples 1000 --resume-existing
+  scripts/flip_run.sh syn_error_analysis --cuda 0 -- --run RUN --checkpoint latest
   scripts/flip_run.sh train --cuda 2,3 --nproc 2 -- --task-name pair_1s --max-steps 1000
   scripts/flip_run.sh train_mitty_mixed_h2r --cuda 2,3 --nproc 2 -- --task-name mixed_h2r --original-train-tasks Task_A --syn-train-tasks Task_A_syn --ood-eval-tasks Task_C --original-train-size 400 --syn-train-size 400 --max-steps 1000
   scripts/flip_run.sh eval_mitty --cuda 2 -- --device cuda:0 --eval-tail-percent 10
@@ -66,7 +71,7 @@ case "$subcommand" in
   nvidia-smi)
     exec nvidia-smi "$@"
     ;;
-  mitty_cache|sam2_precompute|train|train_mitty_mixed_h2r|eval_mitty)
+  mitty_cache|sam2_precompute|r2h_synthesize|syn_error_analysis|train|train_mitty_mixed_h2r|eval_mitty)
     ;;
   *)
     usage >&2
@@ -126,6 +131,12 @@ case "$subcommand" in
     ;;
   sam2_precompute)
     exec "$PYTHON_BIN" -m src.pipeline.sam2_precompute "${script_args[@]}"
+    ;;
+  r2h_synthesize)
+    exec "$PYTHON_BIN" -m src.pipeline.r2h_synthesize "${script_args[@]}"
+    ;;
+  syn_error_analysis)
+    exec "$PYTHON_BIN" scripts/run_syn_error_analysis.py "${script_args[@]}"
     ;;
   train)
     if [[ -z "$nproc" ]]; then
