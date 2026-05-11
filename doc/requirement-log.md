@@ -964,3 +964,14 @@
 - `src/tools/eval_metrics.py`：新增背景 patch 选择与 `compute_background_patch_fid()`，背景 patch 定义为同一固定网格下未被前景 Patch FID 规则选中的 patch。
 - 新增 `scripts/eval_background_patch_fid.py`：输入 log 名称，自动读取 `full_eval` 视频、`data_split/*.jsonl` 和 `config.json`，计算 `foreground_patch_fid` / `background_patch_fid`，结果写到 `output/background_fid/<log>/summary.csv` 和 `summary.json`。
 - `doc/step_5_training_infra.md`、`doc/scripts_inventory.md`：补充脚本用法、输出位置和指标口径。
+
+## 2026-05-11 — 忽略本地输出与草稿文件
+
+**用户原始需求：**
+> 把 eval 写到 git ignore 中；logs 也写进去；加上 cmd,draft
+
+**直接修改：**
+- `.gitignore`：在项目生成物目录列表中加入 `eval/`，避免评估结果和视频索引产物被误提交。
+- `.gitignore`：加入 `logs/`，避免本地日志目录被误提交。
+- `.gitignore`：加入 `cmd.sh` 与 `draft.md`，并从 Git 索引移除这两个已跟踪的本地草稿文件，保留工作区文件。
+- `.gitignore`：加入 `.env` / `.env.*`，避免本地 token 配置被误提交，同时保留 `.env.example` 可被跟踪。

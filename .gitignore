@@ -53,6 +53,7 @@ Thumbs.db
 # === 项目 ===
 .worktrees/
 test_results/
+eval/
 output/
 weights/
 ProPainter/
@@ -60,9 +61,15 @@ ref-cosmos-transfer1/
 models/
 training_data/
 wandb/
+logs/
+cmd.sh
+draft.md
 *.log
 
 # === 含敏感 token 的本地配置 ===
+.env
+.env.*
+!.env.example
 notion_mcp_config.json
 
 tmp/
