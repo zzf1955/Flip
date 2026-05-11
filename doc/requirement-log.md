@@ -1,5 +1,49 @@
 # 需求日志
 
+## 2026-05-11
+
+**用户原始需求：**
+> draft.md：改画图指标，只保留 FID、FVD、Patch FID、MSE/PSNR/SSIM/LPIPS；图输出到 `result/figure/xxx`；mixed 实验只跑 syn 为 0、400、800 的实验。
+
+**完成改动：**
+- 更新 `scripts/plot_data_mix_analysis.py` 与 `scripts/plot_ablation_analysis.py`：默认只绘制 FID、FVD、Patch FID、MSE、PSNR、SSIM、LPIPS，并把输出目录切到 `result/figure/ours_data_mix_analysis/` 与 `result/figure/ours_ablation_analysis/`。
+- 更新 `scripts/plot_data_mix_analysis.py`：mixed 曲线只保留 fixed-origin=400，且只纳入 syn=1200/1600/2000；移除 fixed-total=400 输出。
+- 更新 `src/tools/plot_mitty_transfer_results.py`：从 `result/res/{ours_r96,mitty_r96}/summary.csv` 读取指标，绘制同一套 7 个指标，默认输出到 `result/figure/mitty_transfer_results/`。
+- 更新画图缩放：Ours/Mitty 与 ablation 图使用原始指标数值作坐标，y 轴固定从 0 开始；data mix 图使用原始指标值作 y 轴。
+- 更新 Ours/Mitty 对比图输出：In-Task 与 OOD 不再合成一张图，分别输出为 `in_task_eval_metrics.*` 与 `ood_eval_metrics.*`。
+- 更新 data mix 输出结构：直接在 `result/figure/ours_data_mix_analysis/` 下输出 7 个单指标图，不再嵌套子目录；移除 OOD 的 FID/FVD/Patch FID 共轴汇总图。
+- 整理画图脚本：移除 data mix 和 ablation 的中间长表 CSV 输出，默认只写最终图文件。
+- 更新 `doc/scripts_inventory.md`：记录新的画图指标、输出路径和 mixed syn 过滤口径。
+- 更新 data mix 单指标图版式：整张图改为正方形输出，In-Task/OOD 子图左右排列，单个子图约为 2:1 窄图。
+- 更新 data mix 可视化：新增 `trend_scorecard.*`，用方向归一化百分比展示相对 1200 syn 的质量变化；7 个单指标图改为同一坐标系叠加 In-Task/OOD 原始指标曲线。
+- 重新设计 data mix 可视化：移除 scorecard 与 In-Task/OOD 合并曲线，改为 4 张 small-multiple 原始值趋势图；split 分开、Distribution/Pixel 分组，每个指标独立 y 轴并标出最佳 syn 档位。
+
+**追加需求：**
+> `result/figure/mitty_transfer_results` 这部分改成 4 张，分布指标一张，像素指标一张。
+
+**完成改动：**
+- 更新 `src/tools/plot_mitty_transfer_results.py`：每个 split 拆成分布指标（FID/FVD/Patch FID）与像素指标（MSE/PSNR/SSIM/LPIPS）两张图，默认输出 `in_task_eval_distribution_metrics.*`、`in_task_eval_pixel_metrics.*`、`ood_eval_distribution_metrics.*`、`ood_eval_pixel_metrics.*`。
+- 更新 `doc/scripts_inventory.md`：记录 Mitty transfer 对比图的新 4 图输出口径。
+
+**追加需求：**
+> 参考 result/figure/mitty_transfer_results 的格式,改一下 ablation 的图, in task 和 OOD 分开,按照像素和分布分 subfig
+
+**完成改动：**
+- 更新 `scripts/plot_ablation_analysis.py`：按 split 输出 In-Task / OOD 两组结果，并按 Distribution（FID/FVD/Patch FID）与 Pixel（MSE/PSNR/SSIM/LPIPS）拆成 grouped bar 图。
+- 输出命名对齐 Mitty transfer 图：`result/figure/ours_ablation_analysis/{in_task_eval,ood_eval}_{distribution,pixel}_metrics.{png,pdf}`。
+- 更新 `doc/scripts_inventory.md`：记录 ablation 图的新 4 图输出口径。
+
+**追加需求：**
+> 画图脚本挪到 `scripts_plot/` 下，输出目录到 `figures/res/` 下，数据放到 `data/` 中；`data/`、`figures/`、`ppt/`、`scripts_plot/` 全部 ignore。
+
+**完成改动：**
+- 移动 4 个结果画图脚本到 `scripts_plot/`：`plot_rank_sensitivity_analysis.py`、`plot_mitty_transfer_results.py`、`plot_data_mix_analysis.py`、`plot_ablation_analysis.py`。
+- 画图脚本默认输入从 `result/res/` 改为 `data/`，默认输出从 `result/figure/...` 改为 `figures/res/...`。
+- 更新 `.gitignore`：忽略 `data/`、`figures/`、`ppt/`、`scripts_plot/`。
+- 更新 `doc/scripts_inventory.md`：记录新的画图脚本位置、输入目录和输出目录。
+
+---
+
 ## 2026-05-07
 
 **用户原始需求：**

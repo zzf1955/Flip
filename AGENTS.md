@@ -31,7 +31,7 @@ FLIP 是第一人称人形机器人视频生成研究项目：在真实 G1 机�
 
 ## 常用环境
 
-- Conda 环境：`flip`。
+- Conda 环境：`paper`。
 - Python：3.10。
 - CUDA：12.8。
 - HuggingFace cache：`/disk_n/zzf/.cache/huggingface`。

@@ -6,10 +6,10 @@
 src/
 ├── core/          9 个基础库模块（不可直接运行）
 ├── pipeline/     18 个可执行 pipeline 入口
-└── tools/        17 个实验/调试/可视化工具
+└── tools/        18 个实验/调试/可视化工具
 ```
 
-旧代码保留在 `scripts/`（已归档）。
+旧代码保留在 `scripts/`（已归档）；结果图脚本统一放在本地忽略目录 `scripts_plot/`，默认读取 `data/` 下各实验 `summary.csv`，输出到 `figures/res/`。
 
 ---
 
@@ -171,10 +171,20 @@ scripts/flip_run.sh nvidia-smi
 |------|------|
 | `svg2gif.py` | SVG→GIF 转换（独立） |
 
+### 结果画图（scripts_plot/ 本地入口）
+
+| 脚本 | 功能 | 输出路径 |
+|------|------|----------|
+| `scripts_plot/plot_rank_sensitivity_analysis.py` | 从 `data/{ours,mitty}_r{32,64,96,128}/summary.csv` 绘制 Ours/Mitty LoRA rank 敏感性曲线，并导出紧凑汇总表 | `figures/res/rank_sensitivity_analysis/*.{png,pdf,csv}` |
+| `scripts_plot/plot_mitty_transfer_results.py` | 从 `data/{ours_r96,mitty_r96}/summary.csv` 分别绘制 In-Task 与 OOD 的 Ours/Mitty 指标柱状图；每个 split 拆成分布指标（FID/FVD/Patch FID）和像素指标（MSE/PSNR/SSIM/LPIPS）两张，y 轴从 0 开始 | `figures/res/mitty_transfer_results/{in_task_eval,ood_eval}_{distribution,pixel}_metrics.*` |
+| `scripts_plot/plot_data_mix_analysis.py` | 从 `data/ours_mixed_400orig_{1200,1600,2000}syn/summary.csv` 绘制 Ours fixed-origin=400 mixed 数据配比趋势；In-Task/OOD 分开输出，Distribution 与 Pixel 分组；每个指标独立 y 轴并标出最佳 syn 档位 | `figures/res/ours_data_mix_analysis/{in_task_eval,ood_eval}_{distribution,pixel}_metrics.*` |
+| `scripts_plot/plot_ablation_analysis.py` | 从 `data/{ours_ablation_only_step1_h2r_r96,ours_ablation_only_step2_h2r_r96,ours_mixed_400orig_0syn}/summary.csv` 绘制 Ours Step1/Step2/Full 消融柱状图；split 分开，并按 Distribution 与 Pixel 拆图 | `figures/res/ours_ablation_analysis/{in_task_eval,ood_eval}_{distribution,pixel}_metrics.*` |
+
 ### 运行方式
 
 ```bash
 python -m src.tools.<script_name> [args]
+python scripts_plot/<plot_script>.py [args]
 ```
 
 ---
