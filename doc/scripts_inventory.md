@@ -84,6 +84,8 @@ eval_metrics.py    ← torch, skimage, transformers (CLIP)
 | `make_pair.py` | 匹配 robot+human 视频，重采样 16fps，4k+1 帧；正式训练时 `--task all` 只展开 `TRAINING_TASKS` 三任务集合 | segment + seedance/overlay | `training_data/pair/{1s,2s,4s}/` |
 | `make_robot_pair.py` | 生成 robot→robot identity pair；正式三阶段 LoRA identity 时 `--task all` 只展开 `TRAINING_TASKS` 三任务集合 | segment | `training_data/robot_pair/1s/` |
 | `r2h_synthesize.py` | 用训练好的 r2h Mitty LoRA 从 `training_data/segment` 枚举 robot clip，排除 Seedance 已覆盖来源后生成 h2r `_syn` pair；支持按 task 可用量比例分配固定生成总量 | segment + r2h checkpoint | `training_data/pair/h2r/<duration>/<task>_syn/` |
+| `run_r2h_synthesize_queue.py` | 按全局 `_syn` 目标总量计算每个 source task 的目标数，生成单 task `r2h_synthesize` 命令队列，并按用户提供的 CUDA 列表调度；每张卡一次跑一个任务，结束后取队列下一项 | segment + r2h checkpoint + CUDA 列表 | `training_data/pair/h2r/<duration>/<task>_syn/`、`training_data/log/r2h_synthesize_queue/<timestamp>/` |
+| `run_syn_error_analysis.py` | 独立分析脚本：默认取 in-task + OOD 的 `ep000`-`ep003`，从 4s segment 切成 1s 非重叠 robot clip，再用 r2h checkpoint 生成 syn human，结果不写入训练 pair | segment + r2h checkpoint | `output/syn_error_analysis/{robot,syn,compare}/1s/<task>/<episode>/`、`manifest.jsonl` |
 | `robot_patch.py` | 全身降质数据（FK mesh 或 SAM2 mask → blur/noise/mean） | segment + parquet/sam2_mask | `training_data/pair/1s_patch/` |
 
 ### LoRA 训练
@@ -94,6 +96,12 @@ eval_metrics.py    ← torch, skimage, transformers (CLIP)
 | `train_mitty_mixed_h2r.py` | 独立 mixed h2r Mitty 训练入口；构建 original + `_syn` 显式 split，稳定 eval 固定来自 original pair_order 尾部 | `training_data/pair/h2r/<duration>/{task}` + `training_data/cache/vae/h2r/<duration>/{task}` | `training_data/log/<run>/mixed_cache/`、`data_split/`、ckpt/eval/log |
 | `train_lora_grid.py` | LoRA layout × rank 网格搜索启动器；支持 merge LoRA、数据量、layout/rank、CUDA 轮转与 dry-run | LoRA checkpoint + `train.py` 数据 preset | 多个 `training_data/log/*_{layout}_r{rank}_{timestamp}/` run |
 | `train_three_stage_single_lora.py` | staged LoRA launcher；每阶段可显式选择 merge LoRA 和 train LoRA，默认 identity → blur → h2r 串联上一阶段 checkpoint | `train.py` 数据 preset + 可选 merge/train LoRA checkpoint | 多个连续 `training_data/log/single_lora3_s*` run，后一阶段可继承前一阶段 ckpt |
+
+### 评估与分析脚本
+
+| 脚本 | 功能 | 输入 | 输出 |
+|------|------|------|------|
+| `scripts/eval_background_patch_fid.py` | 复用已有 `full_eval` 视频计算前景/背景 Patch FID | `training_data/log/<log>/full_eval/` + `data_split/*.jsonl` + SAM2 mask | `output/background_fid/<log>/summary.*` |
 
 ### 人体重绘（Step 4 本地方案）
 

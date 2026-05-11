@@ -12,6 +12,7 @@ Metrics:
   - FVD    (Frechet Video Distance via S3D video features, lower is better)
   - foreground/background MSE/PSNR/SSIM plus foreground Local FID/FVD when
     SAM2 masks are available and selected
+  - foreground Patch FID and background Patch FID helpers for mask-grid regions
 
 Usage:
   python -m src.tools.eval_metrics --run 2026-04-18_163933
@@ -295,6 +296,70 @@ def select_mask_patches(
         selected = sorted(
             selected,
             key=lambda p: (-p.coverage, p.frame, p.y1, p.x1),
+        )[:max_patches_per_video]
+        selected.sort(key=lambda p: (p.frame, p.y1, p.x1))
+    return selected
+
+
+def select_background_mask_patches(
+    masks: np.ndarray,
+    *,
+    patch_size: int = PATCH_FID_SIZE,
+    stride: int = PATCH_FID_STRIDE,
+    coverage_threshold: float = PATCH_FID_COVERAGE_THRESHOLD,
+    min_mask_pixels: int = PATCH_FID_MIN_MASK_PIXELS,
+    max_patches_per_frame: int = PATCH_FID_MAX_PATCHES_PER_FRAME,
+    max_patches_per_video: int = PATCH_FID_MAX_PATCHES_PER_VIDEO,
+) -> list[MaskPatch]:
+    """Select fixed-size image patches outside the foreground Patch FID set."""
+    if masks.ndim != 3:
+        raise ValueError(f"Expected mask stack (T,H,W), got {masks.shape}")
+    if not 0.0 <= coverage_threshold <= 1.0:
+        raise ValueError(
+            f"coverage_threshold must be in [0, 1], got {coverage_threshold}"
+        )
+    if min_mask_pixels < 0:
+        raise ValueError(f"min_mask_pixels must be non-negative, got {min_mask_pixels}")
+    if max_patches_per_frame < 0:
+        raise ValueError(
+            f"max_patches_per_frame must be non-negative, got {max_patches_per_frame}"
+        )
+    if max_patches_per_video < 0:
+        raise ValueError(
+            f"max_patches_per_video must be non-negative, got {max_patches_per_video}"
+        )
+
+    _, h, w = masks.shape
+    y_starts = _grid_starts(h, patch_size, stride)
+    x_starts = _grid_starts(w, patch_size, stride)
+    selected: list[MaskPatch] = []
+    denom = float(patch_size * patch_size)
+
+    for frame_idx, mask in enumerate(masks):
+        candidates: list[MaskPatch] = []
+        for y1 in y_starts:
+            y2 = y1 + patch_size
+            for x1 in x_starts:
+                x2 = x1 + patch_size
+                mask_pixels = int(mask[y1:y2, x1:x2].sum())
+                coverage = float(mask_pixels / denom)
+                is_foreground_patch = (
+                    mask_pixels > min_mask_pixels
+                    and coverage >= coverage_threshold
+                )
+                if not is_foreground_patch:
+                    candidates.append(
+                        MaskPatch(frame_idx, x1, y1, x2, y2, mask_pixels, coverage)
+                    )
+        candidates.sort(key=lambda p: (p.coverage, p.frame, p.y1, p.x1))
+        if max_patches_per_frame:
+            candidates = candidates[:max_patches_per_frame]
+        selected.extend(candidates)
+
+    if max_patches_per_video and len(selected) > max_patches_per_video:
+        selected = sorted(
+            selected,
+            key=lambda p: (p.coverage, p.frame, p.y1, p.x1),
         )[:max_patches_per_video]
         selected.sort(key=lambda p: (p.frame, p.y1, p.x1))
     return selected
@@ -654,6 +719,30 @@ def select_video_mask_patches(
     ]
 
 
+def select_video_background_mask_patches(
+    mask_arrays: list[np.ndarray],
+    *,
+    patch_size: int = PATCH_FID_SIZE,
+    stride: int = PATCH_FID_STRIDE,
+    coverage_threshold: float = PATCH_FID_COVERAGE_THRESHOLD,
+    min_mask_pixels: int = PATCH_FID_MIN_MASK_PIXELS,
+    max_patches_per_frame: int = PATCH_FID_MAX_PATCHES_PER_FRAME,
+    max_patches_per_video: int = PATCH_FID_MAX_PATCHES_PER_VIDEO,
+) -> list[list[MaskPatch]]:
+    return [
+        select_background_mask_patches(
+            masks,
+            patch_size=patch_size,
+            stride=stride,
+            coverage_threshold=coverage_threshold,
+            min_mask_pixels=min_mask_pixels,
+            max_patches_per_frame=max_patches_per_frame,
+            max_patches_per_video=max_patches_per_video,
+        )
+        for masks in mask_arrays
+    ]
+
+
 def collect_patch_inception_features(
     video_arrays: list[np.ndarray],
     patches_by_video: list[list[MaskPatch]],
@@ -757,6 +846,61 @@ def compute_patch_fid(
         batch_size=batch_size,
         progress_callback=progress_callback,
         progress_phase="patch_fid/gt",
+    )
+    return compute_fid(feats_gen, feats_gt), n_patches
+
+
+def compute_background_patch_fid(
+    gen_videos: list[np.ndarray],
+    gt_videos: list[np.ndarray],
+    masks: list[np.ndarray],
+    extractor: InceptionFeatureExtractor,
+    device: torch.device,
+    *,
+    patch_size: int = PATCH_FID_SIZE,
+    stride: int = PATCH_FID_STRIDE,
+    coverage_threshold: float = PATCH_FID_COVERAGE_THRESHOLD,
+    min_mask_pixels: int = PATCH_FID_MIN_MASK_PIXELS,
+    max_patches_per_frame: int = PATCH_FID_MAX_PATCHES_PER_FRAME,
+    max_patches_per_video: int = PATCH_FID_MAX_PATCHES_PER_VIDEO,
+    batch_size: int = DEFAULT_FEATURE_BATCH_SIZE,
+    progress_callback: ProgressCallback | None = None,
+) -> tuple[float | None, int]:
+    """Compute FID over grid patches outside the foreground Patch FID set."""
+    if not (len(gen_videos) == len(gt_videos) == len(masks)):
+        raise ValueError(
+            "Background Patch FID count mismatch: "
+            f"gen={len(gen_videos)} gt={len(gt_videos)} masks={len(masks)}"
+        )
+    patches_by_video = select_video_background_mask_patches(
+        masks,
+        patch_size=patch_size,
+        stride=stride,
+        coverage_threshold=coverage_threshold,
+        min_mask_pixels=min_mask_pixels,
+        max_patches_per_frame=max_patches_per_frame,
+        max_patches_per_video=max_patches_per_video,
+    )
+    n_patches = sum(len(patches) for patches in patches_by_video)
+    if n_patches < 2:
+        return None, n_patches
+    feats_gen = collect_patch_inception_features(
+        gen_videos,
+        patches_by_video,
+        extractor,
+        device,
+        batch_size=batch_size,
+        progress_callback=progress_callback,
+        progress_phase="background_patch_fid/gen",
+    )
+    feats_gt = collect_patch_inception_features(
+        gt_videos,
+        patches_by_video,
+        extractor,
+        device,
+        batch_size=batch_size,
+        progress_callback=progress_callback,
+        progress_phase="background_patch_fid/gt",
     )
     return compute_fid(feats_gen, feats_gt), n_patches
 

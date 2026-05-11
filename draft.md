@@ -3,89 +3,53 @@
 - LoRA 搜索
   - 维度/位置/三阶段
   - 得到 LoRA 最优位置
+  - 结论：qkvo + ffn 是最优的
+
+- LoRA 策略
+  - step 1 + 2 合并 + step 3 单独训练：和三段式差不多
+  - step 1、2、3 训练同一个 LoRA：效果更差
+
+- LoRA Rank
+  - 总体上 rank 越大效果越好
+  - step3 是 rank 越小效果越好，因为 Mitty 仅靠 step3 的 LoRA 来记住信息，rank32 能看出明显效果，虽然 FID/FVD 比较起来提神很大，但是看起来效果都一般
+
+- Mitty 的表现与性能
+  - Mitty 在 LoRA Rank = 96 的情况下表现比较好，但是机械臂细节效果很差。
+  - 机械臂在画面中的占比很低，导致计算全集的 FID/FVD 无法指示机械臂生成质量
+
+- Local FID 与 Local FVD
+  - 选取 bbox 之后进行计算
+  - 但是 bbox 本身不准，而且是方形，依然会引入很多背景，所以效果依然不好
 
 - WAN2.2 数据合成 LoRA 搜索
+  - todo
 
 - 加上WAN 2.2 之后测试
   - 测试加了数据之后会不会变好
+  - todo
 
-- identity：FFN
-- 
-- h2r：无明显差异
-
-
-现在整理一下训练的搜索脚本。 需要支持以下参数：
-1. 合并哪些 LoRA（自动检测位置和 rank）
-2. 使用哪些数据（train size，Task 分配按照默认即可，主要是数据量，数据路径按照训练类型来找就行）
-3. 在那些层加 LoRA，维度是多少
-4. 使用哪些 cuda
-
-然后 LoRA layout x LoRA rank 展开后，在指定的 GPU 上顺序分配。
-实验的 Log 名称和 WAN db 的 log 名称要加时间/日期
-然后 log 目录的名称中，要写 rank layout，命名为 self_qkvo_cross_qkvo_ffn 这样的格式，不要全部展开写
-然后 LoRA layout，支持仅在 qkv 加 LoRA。不在 o 上加 LoRA。
-
-
-
-
-
-1. 整理训练脚本
-2. 低 rank 测试
-3. Mitty 去掉 o 的 LoRA
-4. 找其他 Baseline
-5. 增加数据，测试数据 scale
-6. 整理实验计划
-  1. main result
-  2. LoRA layout
-  3. 数据量
-
-- identity
-  - ffn + qkvo
-  - qkvo
-
-- blur_r2r
-  - ffn + qkvo
-
-- h2r
-  - ffn + qkvo
-
-- Baseline Mitty
-  - LoRA rank 96
-  - layout：QKV (self attention)
-  - task：h2r
-  - training size 400
+## next step
 
 - ours
-  - step1
-    - LoRA rank 96
-    - layout QKVO
-    - task identity_r2r
-    - training size 10000
-  - step2
-    - LoRA rank 96
-    - layout QKVO+FFN
-    - task blur_r2r
-    - training size 10000
-    - merge LoRA: flip/training_data/log/archive.5.2 high rank search/Mitty-identity_r2r_1s-10000d_r32_qkvoffn0ffn2_1000s_0428_195227
-  - step3
-    - LoRA rank 96
-    - layout QKVO+FFN
-    - task h2r
-    - training size 400
-    - merge LoRA: 
-      - flip/training_data/log/archive.5.2 high rank search/Mitty-identity_r2r_1s-10000d_r32_qkvoffn0ffn2_1000s_0428_195227
-      - flip/training_data/log/Mitty-h2r_1s-400d_r96_self_qkv_cross_qkv_1000s_0503_154803
+  - step 1:identity
+    - rank 32
+    - layout qkvo+ffn
+    - prefix final_ours_step1_xxxx
+  - step 2:r2r
+    - lora merge: step1
+    - rank 256
+    - layout qkvo+ffn
+    - prefix final_ours_step2_xxxx
+  - step3:h2r
+    - lora merge: step1 + step2
+    - rank 96
+    - layout qkvo+ffn
+    - prefix final_ours_step3_xxxx
 
-scripts/train_lora_grid.py \
-  --cuda 1 \
-  --task-name h2r_1s \
-  --train-size 400 \
-  --layouts self_qkv_cross_qkv \
-  --ranks 96 \
-  --name-prefix baseline_mitty_h2r
+- mitty
+  - h2r
+    - rank 96
+    - layout qkv
 
-
-cuda 0
-cuda 1
-cuda 2
-cuda 3
+- wan2.2 数据合成
+  - 当前能不能做到，不设置 ood task，全设置为 in task，训练数据用全部，然后按比例做 9:1 的划分，然后训练 WAN2.2？

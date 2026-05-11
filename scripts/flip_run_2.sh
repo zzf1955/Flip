@@ -28,6 +28,9 @@ Subcommands:
   nvidia-smi       Run NVIDIA-SMI on the host GPU device.
   mitty_cache      Run python -m src.pipeline.mitty_cache.
   sam2_precompute  Run python -m src.pipeline.sam2_precompute.
+  r2h_synthesize   Run python -m src.pipeline.r2h_synthesize.
+  syn_error_analysis
+                   Run scripts/run_syn_error_analysis.py.
   train            Run python -m torch.distributed.run -m src.pipeline.train.
   train_mitty_mixed_h2r
                    Run python -m torch.distributed.run -m src.pipeline.train_mitty_mixed_h2r.
@@ -47,6 +50,7 @@ Environment overrides:
 
 Examples:
   scripts/flip_run_2.sh nvidia-smi
+  scripts/flip_run_2.sh syn_error_analysis --cuda 0 -- --run RUN --checkpoint latest
   scripts/flip_run_2.sh train --cuda 0,2 --nproc 2 -- --task-name R2H --loss uniform --cache-train training_data/cache/vae/pair_1s_r2h/train --cache-eval training_data/cache/vae/pair_1s_r2h/eval
   FLIP_WORKDIR=/disk_n/zzf/flip scripts/flip_run_2.sh train --cuda 0,2 --nproc 2 -- --task-name transfer --loss uniform --cache-train training_data/cache/vae/pair_1s_train3/train
 USAGE
@@ -93,7 +97,7 @@ case "$subcommand" in
   nvidia-smi)
     exec nvidia-smi "$@"
     ;;
-  mitty_cache|sam2_precompute|train|train_mitty_mixed_h2r|eval_mitty)
+  mitty_cache|sam2_precompute|r2h_synthesize|syn_error_analysis|train|train_mitty_mixed_h2r|eval_mitty)
     ;;
   *)
     usage >&2
@@ -181,6 +185,12 @@ case "$subcommand" in
     ;;
   sam2_precompute)
     cmd=("$PYTHON_BIN" -m src.pipeline.sam2_precompute "${script_args[@]}")
+    ;;
+  r2h_synthesize)
+    cmd=("$PYTHON_BIN" -m src.pipeline.r2h_synthesize "${script_args[@]}")
+    ;;
+  syn_error_analysis)
+    cmd=("$PYTHON_BIN" scripts/run_syn_error_analysis.py "${script_args[@]}")
     ;;
   train)
     if [[ -z "$nproc" ]]; then

@@ -887,3 +887,80 @@
 - `src/pipeline/train_mitty.py` 抽出 parser 与参数归一化 helper，默认 CLI 行为不变，供 mixed 入口复用训练参数。
 - `scripts/flip_run.sh` 增加 `train_mitty_mixed_h2r` 子命令，便于混合训练继续走统一 GPU/环境入口。
 - 文档更新 `doc/step_5_training_infra.md`、`doc/scripts_inventory.md`，说明 mixed h2r 命令、稳定 eval 规则、`data_split/` 输出和隔离边界。
+
+## 2026-05-07 — Final ours 与 Mitty 训练启动脚本
+
+用户要求：
+> 写两个脚本：一个串起来跑 final ours 三阶段训练，一个单独跑 Mitty；分别用 CUDA 0 和 CUDA 2，三阶段训练要自动接力 checkpoint 文件名。
+
+直接修改：
+- 新增 `scripts/run_final_ours_three_stage.sh`：默认 CUDA 0 单卡串行运行 identity → blur_r2r → h2r，自动读取每阶段实际生成的最新 checkpoint 并作为下一阶段 `--merge-lora` 输入。
+- 新增 `scripts/run_final_mitty.sh`：默认 CUDA 2 单卡运行 Mitty h2r qkv baseline。
+- 两个脚本保留 batch size、train size、eval/video size、runner、run id 等环境变量覆盖入口。
+
+## 2026-05-07 — r2h 生成 syn pair 与独立 mixed h2r 训练入口
+
+**用户原始需求：**
+> 当前 r2h 模型训练完之后，需要用这个模型合成 Human 视频，替代 Seedance 的视频合成；在 `training_data/pair` 下生成类似 `Inspire_Collect_Clothes_MainCamOnly_syn` 的数据；训练时需要指定原始数据和 syn 数据的比例，统一训练；希望新增一部分代码，避免影响当前稳定流程。进一步明确拆成两个 task：一个做 syn pair，一个做新的数据混合 h2r 训练；混合训练单独写入口，不影响当前代码；eval 集固定沿用当前训练已使用的 80 + 42 配置，从 pair_order 尾部倒着选，syn 数据只进 training 不进 eval。再明确 robot 数据来源：已经被 Seedance 合成过的 robot 来源和自合成来源不能重叠；自合成的主要 robot 输入应从 `training_data/segment` 枚举，默认排除 Seedance 覆盖的 `ep000`-`ep003`。
+
+**创建的任务：**
+- [045] r2h 微调模型生成 syn pair 数据集
+- [046] 独立混合 h2r 训练入口与稳定 eval 集
+
+## 2026-05-08 — 明确 r2h `_syn` 续跑语义
+
+**用户原始需求：**
+> 文档里写明白，生成 h2r 数据或者使用 r2h 模型生成，指的是默认生成 `_syn` 的功能；不能覆盖以前的，每次生成是接着生成，设置上限并用 resume 跳过已有数据。
+
+**直接修改：**
+- `src/pipeline/r2h_synthesize.py`：`--resume-existing` 改为读取已有 `_syn` manifest，并把 `--num-samples` 作为目标总上限；已有数量达到上限时不改旧数据，未达到时从下一个 `pair_NNNN` 继续生成。
+- `tests/test_r2h_synthesize.py`：增加覆盖已有数量超过目标上限时 manifest 保持不变的测试。
+- `doc/step_5_training_infra.md`、`doc/tasks/done/045.md`：明确 `_syn` 续跑/扩充方式，不把降低 `--num-samples` 解释为覆盖重建。
+
+## 2026-05-08 — 修复 `mitty_cache --resume` manifest 覆盖问题
+
+**用户原始需求：**
+> mixed h2r 训练请求 syn 800 时只识别到 142 条；既然 syn 数据依赖 pair，能不能不走严格校验？
+
+**直接修改：**
+- `src/pipeline/mitty_cache.py`：`--resume` 跳过已有 `pair_*.pth` 时也写入对应 cache manifest 记录，避免 manifest 只包含本次新增样本。
+- 直接重建当前两个 in-task `_syn` VAE manifest：Collect 106 条、Washing 694 条；mixed h2r split 已能识别 syn 800 条。
+
+## 2026-05-08 — final eval 多卡空闲轮询调度
+
+**用户原始需求：**
+> 把 `scripts/eval_final_step1000_missing.py --runner flip_run_2 --cuda-list 0,1,2 --execute` 换一种写法；轮询给出的卡，如果有空闲，就把下一个 eval 放上去跑。
+
+**直接修改：**
+- `scripts/eval_final_step1000_missing.py`：执行模式改为轮询 `--cuda-list` 中的 GPU，只有目标卡没有 `nvidia-smi` compute 进程且本脚本未在该卡运行 eval 时，才启动下一个 eval。
+- 新增 `--poll-interval` 控制空闲检查间隔；文档同步更新多卡补跑说明。
+
+## 2026-05-08 — r2h `_syn` 多卡队列 launcher
+
+**用户原始需求：**
+> 改一下这个脚本，生成一个指令队列，然后我指定卡，把任务依次放到这三张卡上跑。排队跑，我给出可用 cuda。
+
+**直接修改：**
+- `scripts/flip_run.sh`、`scripts/flip_run_2.sh`：新增 `r2h_synthesize` 子命令，统一设置项目环境后运行 `src.pipeline.r2h_synthesize`。
+- 新增 `scripts/run_r2h_synthesize_queue.py`：按全局 `_syn` 目标上限计算每个 source task 的目标数量，生成 `queue.jsonl` / `commands.sh`，并可按 `--cuda` 列表并发调度；每张卡一次跑一个 task，结束后取队列下一项。
+- `doc/step_5_training_infra.md`、`doc/scripts_inventory.md`：记录多卡队列 launcher 的 dry-run / execute 用法和日志输出位置。
+
+## 2026-05-08 — ep000-ep003 syn 误差分析脚本
+
+**用户原始需求：**
+> 写个别的脚本，依旧合成数据，把 in task 和 ood task 的 ep0123 跑一下，我要对比这个 syn 和 Seedance 的效果，先切片，在生成，结果放到 output/syn_error_analysis/ 下；不用和 Seedance 对齐，也不用滑动窗口。
+
+**直接修改：**
+- 新增 `scripts/run_syn_error_analysis.py`：默认选择两个 in-task 和一个 OOD task 的 `ep000`-`ep003`，把 4s segment 切成 1s 非重叠 robot clip，再用 r2h checkpoint 生成 syn human 到 `output/syn_error_analysis/`。
+- `scripts/flip_run.sh`、`scripts/flip_run_2.sh`：新增 `syn_error_analysis` 子命令，支持通过 `--cuda` 指定可见 GPU。
+- `doc/step_5_training_infra.md`、`doc/scripts_inventory.md`：记录脚本用途、输出布局和运行命令。
+
+## 2026-05-09 — 前景/背景 Patch FID 独立评测脚本
+
+**用户原始需求：**
+> 你参考自动评测,写一个新功能, 其中有一个 FID 是patch FID,你加一个计算 patch 之外的 FID,就是分为前景和背景两种 FID. 写一个新脚本评测, 结果输出到 output 中即可,单独脚本, 传入 log 的名称, 然后自动读取+评测,在 output/background_fid 下写结果
+
+**直接修改：**
+- `src/tools/eval_metrics.py`：新增背景 patch 选择与 `compute_background_patch_fid()`，背景 patch 定义为同一固定网格下未被前景 Patch FID 规则选中的 patch。
+- 新增 `scripts/eval_background_patch_fid.py`：输入 log 名称，自动读取 `full_eval` 视频、`data_split/*.jsonl` 和 `config.json`，计算 `foreground_patch_fid` / `background_patch_fid`，结果写到 `output/background_fid/<log>/summary.csv` 和 `summary.json`。
+- `doc/step_5_training_infra.md`、`doc/scripts_inventory.md`：补充脚本用法、输出位置和指标口径。

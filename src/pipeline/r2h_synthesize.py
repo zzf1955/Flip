@@ -448,6 +448,86 @@ def _write_metadata(path: Path, rows: list[dict]) -> None:
         writer.writerows(rows)
 
 
+def _pair_index(pair_id: str, task_dir: Path) -> int:
+    match = re.match(r"^pair_(\d+)$", pair_id)
+    if not match:
+        raise ValueError(f"Invalid pair_id in {task_dir}: {pair_id!r}")
+    return int(match.group(1))
+
+
+def _read_existing_syn_manifest(task_dir: Path) -> list[dict]:
+    manifest_path = task_dir / "manifest.jsonl"
+    if not manifest_path.exists():
+        existing_files = [
+            path
+            for subdir in ("video", "control_video")
+            for path in (task_dir / subdir).glob("pair_*.mp4")
+        ]
+        if any(existing_files):
+            raise ValueError(
+                f"Existing pair videos found without manifest; cannot safely "
+                f"resume append generation: {task_dir}"
+            )
+        return []
+
+    rows = _read_jsonl(manifest_path)
+    rows = sorted(rows, key=lambda row: _pair_index(str(row.get("pair_id", "")), task_dir))
+    seen: set[str] = set()
+    for index, row in enumerate(rows):
+        pair_id = str(row.get("pair_id", ""))
+        expected_pair_id = f"pair_{index:04d}"
+        if pair_id != expected_pair_id:
+            raise ValueError(
+                f"Existing manifest must be contiguous for append resume in {task_dir}: "
+                f"expected {expected_pair_id}, got {pair_id}"
+            )
+        if pair_id in seen:
+            raise ValueError(f"Duplicate pair_id in existing manifest {task_dir}: {pair_id}")
+        seen.add(pair_id)
+        for key in ("video", "control_video"):
+            rel_path = row.get(key)
+            if not rel_path:
+                raise ValueError(f"Existing manifest row missing {key}: {task_dir}/{pair_id}")
+            path = task_dir / str(rel_path)
+            if not path.is_file():
+                raise FileNotFoundError(
+                    f"Existing manifest references missing {key}: {path}"
+                )
+    return rows
+
+
+def _metadata_row_from_manifest(record: dict, default_prompt: str) -> dict:
+    return {
+        "video": record["video"],
+        "prompt": record.get("prompt", default_prompt),
+        "control_video": record["control_video"],
+    }
+
+
+def _validate_existing_prefix(
+    existing_rows: list[dict],
+    clips: list[RobotClip],
+    task_dir: Path,
+) -> None:
+    for index, record in enumerate(existing_rows):
+        expected = clips[index]
+        actual_key = record.get("robot_source_key")
+        if actual_key and actual_key != expected.robot_source_key:
+            raise ValueError(
+                f"Existing manifest source order does not match current selection "
+                f"for append resume in {task_dir}: pair_{index:04d} has "
+                f"{actual_key}, expected {expected.robot_source_key}. Use the "
+                "same source/filter/allocation settings when continuing a _syn dataset."
+            )
+        actual_clip_id = record.get("source_robot_clip_id")
+        if actual_clip_id and actual_clip_id != expected.source_robot_clip_id:
+            raise ValueError(
+                f"Existing manifest source clip id does not match current selection "
+                f"for append resume in {task_dir}: pair_{index:04d} has "
+                f"{actual_clip_id}, expected {expected.source_robot_clip_id}."
+            )
+
+
 def build_manifest_record(
     clip: RobotClip,
     pair_id: str,
@@ -666,10 +746,24 @@ def _process_task_group(
     control_dir = task_dir / "control_video"
     compare_dir = task_dir / "compare"
     expected_frames = FRAMES_4K1[args.duration]
-    metadata_rows: list[dict] = []
-    manifest_rows: list[dict] = []
+    existing_rows = _read_existing_syn_manifest(task_dir) if args.resume_existing else []
+    existing_count = len(existing_rows)
+    if existing_count > len(clips):
+        print(
+            f"[{syn_task}] existing {existing_count} pairs already exceed "
+            f"target {len(clips)}; keeping existing dataset unchanged",
+            flush=True,
+        )
+        return
+    _validate_existing_prefix(existing_rows, clips, task_dir)
 
-    for pair_index, clip in enumerate(clips):
+    metadata_rows = [
+        _metadata_row_from_manifest(record, args.prompt)
+        for record in existing_rows
+    ]
+    manifest_rows: list[dict] = list(existing_rows)
+
+    for pair_index, clip in enumerate(clips[existing_count:], start=existing_count):
         pair_id = f"pair_{pair_index:04d}"
         rel_video = f"video/{pair_id}.mp4"
         rel_control = f"control_video/{pair_id}.mp4"
@@ -747,7 +841,12 @@ def _process_task_group(
         for order_index, record in enumerate(manifest_rows)
     ]
     _write_jsonl(task_dir / "pair_order.jsonl", order_rows)
-    print(f"[{syn_task}] wrote {len(manifest_rows)} pairs -> {task_dir}", flush=True)
+    print(
+        f"[{syn_task}] wrote {len(manifest_rows)} pairs "
+        f"({existing_count} existing, {len(manifest_rows) - existing_count} new) "
+        f"-> {task_dir}",
+        flush=True,
+    )
 
 
 def _group_by_task(clips: list[RobotClip]) -> dict[str, list[RobotClip]]:
@@ -771,6 +870,25 @@ def validate_selected_segments(clips: list[RobotClip]) -> None:
             continue
         _validate_segment_video(clip.segment_path)
         seen.add(clip.segment_path)
+
+
+def _all_resume_targets_complete(args, grouped: dict[str, list[RobotClip]]) -> bool:
+    if not args.resume_existing:
+        return False
+    complete = True
+    for task, task_clips in grouped.items():
+        syn_task = args.output_task_suffix.format(task=task)
+        task_dir = args.output_pair_root / "h2r" / args.duration / syn_task
+        existing_count = len(_read_existing_syn_manifest(task_dir))
+        if existing_count < len(task_clips):
+            complete = False
+        else:
+            print(
+                f"[{syn_task}] existing {existing_count} pairs already meet "
+                f"target {len(task_clips)}",
+                flush=True,
+            )
+    return complete
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -881,13 +999,17 @@ def main() -> None:
         return
     if not args.run:
         parser.error("--run is required unless --list-only is used")
+    grouped = _group_by_task(selected)
+    if _all_resume_targets_complete(args, grouped):
+        print("All resume targets already complete; exiting before model load.", flush=True)
+        return
     validate_selected_segments(selected)
 
     from src.core.train_utils import load_t5_cache
 
     t5_pos, t5_neg = load_t5_cache(args.t5_cache_dir, device="cpu")
     run, model, spec = _load_generator(args)
-    for task, task_clips in _group_by_task(selected).items():
+    for task, task_clips in grouped.items():
         _process_task_group(
             task,
             task_clips,
