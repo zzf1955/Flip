@@ -485,6 +485,82 @@ summary 会额外记录 `foreground_patch_count`、`foreground_patch_size`、
 `foreground_patch_min_mask_pixels`、`foreground_patch_max_per_frame` 和
 `foreground_patch_max_per_video`。
 
+### Wan VAE arm-hand IDM 动作一致性
+
+`src.pipeline.wan_vae_idm` 训练一个 Video2Action IDM，用冻结的 Wan 2.2 VAE
+latent 作为视频特征，再接 3D conv + MLP action head。默认使用较小的
+`small` head：`conv_channels=128`、`hidden_dim=256`、`mlp_layers=2`，
+约 71 万可训练参数；`residual` head 仍可通过参数显式启用，但当前
+Collect Clothes episode held-out 验证显示大 residual head 更容易保守化输出。
+当前版本只支持
+`G1_WBT_Inspire_Collect_Clothes_MainCamOnly` 单任务，用于先验证 action-aware
+离线指标是否可行；跨任务和跨手型不做隐式 fallback。
+
+训练标签直接从原始 LeRobot parquet 读取：
+
+- `action.ee_action`：12 维双臂末端执行器 action。
+- `action.hand_cmd`：12 维双手命令。
+
+训练样本从 `training_data/segment/Inspire_Collect_Clothes_MainCamOnly/` 的 30fps
+segment 视频切 1s clip，默认采样 17 帧 @ 16fps，并把同一窗口内的
+`ee_action + hand_cmd` 平均成 24 维 clip-level target。target 会按训练集
+mean/std 标准化后训练，checkpoint 中保存反标准化参数。缺少原始 action 字段、
+segment 对齐字段或非 Collect Clothes 任务记录时会直接报错。
+
+小规模训练 smoke：
+
+```bash
+scripts/flip_run.sh wan_vae_idm --cuda 2 -- train \
+  --device cuda:0 \
+  --output-dir tmp/wan_vae_idm_collect_smoke \
+  --max-samples 32 \
+  --steps 40 \
+  --batch-size 1 \
+  --eval-every 10 \
+  --resize 256x256
+```
+
+训练过程会写出 `train_loss.csv`、`eval_loss.csv`、`val_predictions.csv`、
+`best_val_predictions.csv`、`checkpoint.pt`、`best_checkpoint.pt` 和
+`loss_curve.png`。`eval_loss.csv` 默认每 `--eval-every` step 在 held-out
+episode split 上评估，`loss_curve.png` 同时画训练 loss 滑动均值和 eval
+loss 曲线。`val_predictions.csv` 对应 final step，`best_val_predictions.csv`
+对应验证集 total MSE 最低的 checkpoint；正式复算 action consistency 时优先使用
+`best_checkpoint.pt`。`--val-max-samples 0` 表示验证时使用全部 held-out samples。
+如果训练更长，可用 `--lr-scheduler cosine --min-lr-ratio 0.05` 做学习率衰减。
+
+已训练 checkpoint 可用同一 held-out split 复算验证集预测，不重训：
+
+```bash
+scripts/flip_run.sh wan_vae_idm --cuda 2 -- validate \
+  --device cuda:0 \
+  --checkpoint tmp/wan_vae_idm_collect_smoke/best_checkpoint.pt \
+  --output-dir tmp/wan_vae_idm_collect_smoke/validate_all \
+  --max-samples 0 \
+  --clip-stride 0.5 \
+  --val-max-samples 0 \
+  --resize 256x256
+```
+
+已有 eval 视频复算 action consistency：
+
+```bash
+scripts/flip_run.sh wan_vae_idm --cuda 2 -- eval \
+  --device cuda:0 \
+  --checkpoint tmp/wan_vae_idm_collect_smoke/best_checkpoint.pt \
+  --eval-dir training_data/log/<run>/full_eval/in_task_eval \
+  --records-jsonl training_data/log/<run>/full_eval/data_split/in_task_eval.jsonl \
+  --output-csv tmp/wan_vae_idm_collect_eval/action_metrics.csv \
+  --max-samples 8 \
+  --resize 256x256
+```
+
+输出 CSV/JSON 字段包括 `gt_idm_arm_mse`、`gt_idm_hand_mse`、
+`gt_idm_arm_hand_mse`、`gen_idm_arm_mse`、`gen_idm_hand_mse`、
+`gen_idm_arm_hand_mse`，以及对应的 `idm_*_gap` / `idm_*_ratio`。其中 GT
+视频上的 IDM error 作为该监督模型在真实视频上的误差下限，生成视频指标越接近
+GT 下限，说明 arm-hand action cue 越一致。
+
 如需在已有 `full_eval/` 视频上同时查看前景 patch 与前景 patch 之外的背景
 patch 分布差异，可使用独立脚本：
 
