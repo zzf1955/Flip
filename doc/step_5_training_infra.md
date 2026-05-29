@@ -492,26 +492,27 @@ latent 作为视频特征，再接 3D conv + MLP action head。默认使用较�
 `small` head：`conv_channels=128`、`hidden_dim=256`、`mlp_layers=2`，
 约 71 万可训练参数；`residual` head 仍可通过参数显式启用，但当前
 Collect Clothes episode held-out 验证显示大 residual head 更容易保守化输出。
-当前版本只支持
-`G1_WBT_Inspire_Collect_Clothes_MainCamOnly` 单任务，用于先验证 action-aware
-离线指标是否可行；跨任务和跨手型不做隐式 fallback。
+默认任务仍是 `G1_WBT_Inspire_Collect_Clothes_MainCamOnly`，也可以用
+`--task-short` / `--task-full` 显式切到其他 MainCamOnly 任务；脚本不会在任务名
+不匹配时隐式 fallback。
 
 训练标签直接从原始 LeRobot parquet 读取：
 
 - `action.ee_action`：12 维双臂末端执行器 action。
 - `action.hand_cmd`：12 维双手命令。
 
-训练样本从 `training_data/segment/Inspire_Collect_Clothes_MainCamOnly/` 的 30fps
-segment 视频切 1s clip，默认采样 17 帧 @ 16fps，并把同一窗口内的
+训练样本从 `training_data/segment/<task-short>/` 的 30fps segment 视频切 1s
+clip，默认采样 17 帧 @ 16fps，并把同一窗口内的
 `ee_action + hand_cmd` 平均成 24 维 clip-level target。target 会按训练集
 mean/std 标准化后训练，checkpoint 中保存反标准化参数。缺少原始 action 字段、
-segment 对齐字段或非 Collect Clothes 任务记录时会直接报错。
+segment 对齐字段或 eval 记录任务名不匹配时会直接报错。
 
 小规模训练 smoke：
 
 ```bash
 scripts/flip_run.sh wan_vae_idm --cuda 2 -- train \
   --device cuda:0 \
+  --task-short Inspire_Collect_Clothes_MainCamOnly \
   --output-dir tmp/wan_vae_idm_collect_smoke \
   --max-samples 32 \
   --steps 40 \
@@ -534,6 +535,7 @@ loss 曲线。`val_predictions.csv` 对应 final step，`best_val_predictions.cs
 ```bash
 scripts/flip_run.sh wan_vae_idm --cuda 2 -- validate \
   --device cuda:0 \
+  --task-short Inspire_Collect_Clothes_MainCamOnly \
   --checkpoint tmp/wan_vae_idm_collect_smoke/best_checkpoint.pt \
   --output-dir tmp/wan_vae_idm_collect_smoke/validate_all \
   --max-samples 0 \
@@ -547,6 +549,7 @@ scripts/flip_run.sh wan_vae_idm --cuda 2 -- validate \
 ```bash
 scripts/flip_run.sh wan_vae_idm --cuda 2 -- eval \
   --device cuda:0 \
+  --task-short Inspire_Collect_Clothes_MainCamOnly \
   --checkpoint tmp/wan_vae_idm_collect_smoke/best_checkpoint.pt \
   --eval-dir training_data/log/<run>/full_eval/in_task_eval \
   --records-jsonl training_data/log/<run>/full_eval/data_split/in_task_eval.jsonl \

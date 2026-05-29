@@ -1,8 +1,7 @@
 """Wan VAE based inverse dynamics model for arm-hand action consistency.
 
 This module trains a lightweight Video2Action head on top of frozen Wan 2.2
-VAE latents.  The first supported scope is the single Inspire Collect Clothes
-task.  The model predicts clip-level mean action:
+VAE latents.  The model predicts clip-level mean action:
 
   - ``action.ee_action``: 12-dim dual-arm end-effector action
   - ``action.hand_cmd``: 12-dim dual-hand command
@@ -35,8 +34,7 @@ from src.core.wan_loader import load_vae
 from src.pipeline.mitty_cache import encode_video_array_batch
 from src.pipeline.train_mitty import DEFAULT_VAE
 
-TASK_SHORT = "Inspire_Collect_Clothes_MainCamOnly"
-TASK_FULL = f"G1_WBT_{TASK_SHORT}"
+DEFAULT_TASK_SHORT = "Inspire_Collect_Clothes_MainCamOnly"
 SEGMENT_FPS = 30.0
 DEFAULT_TARGET_FPS = 16.0
 DEFAULT_NUM_FRAMES = 17
@@ -72,12 +70,30 @@ def parse_resize(value: str) -> tuple[int, int] | None:
     return width, height
 
 
-def task_data_root() -> Path:
-    return Path(DATASET_ROOT) / TASK_FULL
+def default_task_full(task_short: str) -> str:
+    return f"G1_WBT_{task_short}"
 
 
-def task_segment_root() -> Path:
-    return Path(MAIN_ROOT) / "training_data" / "segment" / TASK_SHORT
+def default_task_data_root(task_short: str, task_full: str | None = None) -> Path:
+    return Path(DATASET_ROOT) / (task_full or default_task_full(task_short))
+
+
+def default_task_segment_root(task_short: str) -> Path:
+    return Path(MAIN_ROOT) / "training_data" / "segment" / task_short
+
+
+def resolve_task_args(args: argparse.Namespace) -> None:
+    task_short = str(args.task_short)
+    if task_short.startswith("G1_WBT_"):
+        raise ValueError(
+            f"--task-short must be the segment task name without G1_WBT_ prefix, got {task_short!r}"
+        )
+    task_full = str(args.task_full) if args.task_full else default_task_full(task_short)
+    args.task_full = task_full
+    if args.data_root is None:
+        args.data_root = str(default_task_data_root(task_short, task_full))
+    if args.segment_root is None:
+        args.segment_root = str(default_task_segment_root(task_short))
 
 
 def load_action_frame_table(data_root: Path) -> pd.DataFrame:
@@ -100,8 +116,8 @@ def load_action_frame_table(data_root: Path) -> pd.DataFrame:
 class ActionResolver:
     """Resolve clip-level arm-hand action labels from raw LeRobot parquet."""
 
-    def __init__(self, data_root: Path | None = None):
-        self.data_root = data_root or task_data_root()
+    def __init__(self, data_root: Path):
+        self.data_root = data_root
         self.df = load_action_frame_table(self.data_root)
         self._episode_rows = {
             int(ep): group.set_index("frame_index", drop=False)
@@ -487,6 +503,7 @@ def count_trainable_parameters(model: nn.Module) -> int:
 
 
 def train(args: argparse.Namespace) -> None:
+    resolve_task_args(args)
     seed = int(args.seed)
     random.seed(seed)
     np.random.seed(seed)
@@ -507,7 +524,10 @@ def train(args: argparse.Namespace) -> None:
         samples, args.train_ratio, args.split_by, seed,
     )
     mean, std = target_stats(train_samples)
-    out_dir = Path(args.output_dir)
+    output_dir = args.output_dir
+    if output_dir is None:
+        output_dir = str(Path(MAIN_ROOT) / "output" / "wan_vae_idm" / args.task_short)
+    out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "samples.json").write_text(
         json.dumps([asdict(sample) for sample in samples], ensure_ascii=False, indent=2)
@@ -880,7 +900,10 @@ def save_checkpoint(
             "hand_dim": HAND_DIM,
         },
         "config": {
-            "task": TASK_FULL,
+            "task": args.task_full,
+            "task_short": args.task_short,
+            "data_root": args.data_root,
+            "segment_root": args.segment_root,
             "resize": args.resize,
             "num_frames": args.num_frames,
             "target_fps": args.target_fps,
@@ -924,10 +947,13 @@ def record_action_target(
     num_frames: int,
     target_fps: float,
     segment_root: Path,
+    task_short: str,
+    task_full: str,
 ) -> np.ndarray:
     task = record.get("robot_task") or record.get("task")
-    if task != TASK_SHORT:
-        raise ValueError(f"Only {TASK_SHORT} is supported for this IDM, got {task!r}")
+    expected_tasks = {task_short, task_full}
+    if task not in expected_tasks:
+        raise ValueError(f"Expected eval task in {sorted(expected_tasks)}, got {task!r}")
     episode_raw = record.get("episode")
     seg = record.get("seg")
     if not episode_raw or not seg:
@@ -965,6 +991,7 @@ def predict_video_action(
 
 
 def eval_existing(args: argparse.Namespace) -> None:
+    resolve_task_args(args)
     resize = parse_resize(args.resize)
     eval_dir = Path(args.eval_dir)
     records_path = Path(args.records_jsonl)
@@ -991,7 +1018,15 @@ def eval_existing(args: argparse.Namespace) -> None:
     rows = []
     for idx, record in enumerate(records):
         sample_id = f"{idx:05d}"
-        target = record_action_target(record, resolver, args.num_frames, args.target_fps, segment_root)
+        target = record_action_target(
+            record,
+            resolver,
+            args.num_frames,
+            args.target_fps,
+            segment_root,
+            args.task_short,
+            args.task_full,
+        )
         gt_pred = predict_video_action(
             eval_dir / f"gt_{sample_id}.mp4", model, vae, mean, std,
             num_frames=args.num_frames, resize=resize, device=device,
@@ -1017,6 +1052,7 @@ def eval_existing(args: argparse.Namespace) -> None:
 
 @torch.no_grad()
 def validate_checkpoint(args: argparse.Namespace) -> None:
+    resolve_task_args(args)
     seed = int(args.seed)
     random.seed(seed)
     np.random.seed(seed)
@@ -1106,9 +1142,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Wan VAE Video2Action IDM")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    train_p = sub.add_parser("train", help="train IDM on the single Collect Clothes task")
+    train_p = sub.add_parser("train", help="train IDM on one MainCamOnly task")
     add_common_data_args(train_p)
-    train_p.add_argument("--output-dir", default=str(Path(MAIN_ROOT) / "output" / "wan_vae_idm" / TASK_SHORT))
+    train_p.add_argument(
+        "--output-dir",
+        default=None,
+        help="output directory; defaults to output/wan_vae_idm/<task-short>",
+    )
     train_p.add_argument("--max-samples", type=int, default=64,
                          help="maximum discovered clip samples; 0 keeps all")
     train_p.add_argument("--train-ratio", type=float, default=0.8)
@@ -1172,8 +1212,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def add_common_data_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--data-root", default=str(task_data_root()))
-    parser.add_argument("--segment-root", default=str(task_segment_root()))
+    parser.add_argument("--task-short", default=DEFAULT_TASK_SHORT,
+                        help="segment task name, for example Inspire_Collect_Clothes_MainCamOnly")
+    parser.add_argument("--task-full", default=None,
+                        help="raw dataset task dir; defaults to G1_WBT_<task-short>")
+    parser.add_argument("--data-root", default=None,
+                        help="raw LeRobot task root; defaults from --task-full")
+    parser.add_argument("--segment-root", default=None,
+                        help="segmented task root; defaults from --task-short")
     parser.add_argument("--vae-path", default=DEFAULT_VAE)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--resize", default="256x256",
