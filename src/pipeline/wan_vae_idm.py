@@ -42,6 +42,64 @@ ARM_DIM = 12
 HAND_DIM = 12
 ACTION_DIM = ARM_DIM + HAND_DIM
 
+COLLECT_TASK = "Inspire_Collect_Clothes_MainCamOnly"
+WASH_TASK = "Inspire_Put_Clothes_into_Washing_Machine"
+WASH_MAINCAM_TASK = "Inspire_Put_Clothes_into_Washing_Machine_MainCamOnly"
+PILLOW_TASK = "Inspire_Pickup_Pillow_MainCamOnly"
+
+
+@dataclass(frozen=True)
+class H2RTaskConfig:
+    record_task: str
+    canonical_task: str
+    checkpoint_key: str
+    target_task_short: str
+    model_task_short: str
+
+
+@dataclass
+class H2RTaskBundle:
+    config: H2RTaskConfig
+    checkpoint: Path
+    model: "WanVaeActionHead"
+    mean: torch.Tensor
+    std: torch.Tensor
+    ckpt: dict
+    resolver: "ActionResolver"
+    segment_root: Path
+
+
+H2R_TASK_CONFIGS = {
+    COLLECT_TASK: H2RTaskConfig(
+        record_task=COLLECT_TASK,
+        canonical_task=COLLECT_TASK,
+        checkpoint_key="collect",
+        target_task_short=COLLECT_TASK,
+        model_task_short=COLLECT_TASK,
+    ),
+    WASH_TASK: H2RTaskConfig(
+        record_task=WASH_TASK,
+        canonical_task=WASH_MAINCAM_TASK,
+        checkpoint_key="wash",
+        target_task_short=WASH_TASK,
+        model_task_short=WASH_MAINCAM_TASK,
+    ),
+    WASH_MAINCAM_TASK: H2RTaskConfig(
+        record_task=WASH_MAINCAM_TASK,
+        canonical_task=WASH_MAINCAM_TASK,
+        checkpoint_key="wash",
+        target_task_short=WASH_MAINCAM_TASK,
+        model_task_short=WASH_MAINCAM_TASK,
+    ),
+    PILLOW_TASK: H2RTaskConfig(
+        record_task=PILLOW_TASK,
+        canonical_task=PILLOW_TASK,
+        checkpoint_key="pillow",
+        target_task_short=PILLOW_TASK,
+        model_task_short=PILLOW_TASK,
+    ),
+}
+
 
 @dataclass(frozen=True)
 class ClipSample:
@@ -97,10 +155,11 @@ def resolve_task_args(args: argparse.Namespace) -> None:
 
 
 def load_action_frame_table(data_root: Path) -> pd.DataFrame:
-    data_path = data_root / "data" / "chunk-000" / "file-000.parquet"
-    if not data_path.is_file():
-        raise FileNotFoundError(f"Action parquet not found: {data_path}")
-    df = pd.read_parquet(data_path)
+    data_dir = data_root / "data"
+    parquet_paths = sorted(data_dir.glob("chunk-*/*.parquet"))
+    if not parquet_paths:
+        raise FileNotFoundError(f"Action parquet files not found under: {data_dir}")
+    df = pd.concat([pd.read_parquet(path) for path in parquet_paths], ignore_index=True)
     required = {
         "episode_index",
         "frame_index",
@@ -109,7 +168,7 @@ def load_action_frame_table(data_root: Path) -> pd.DataFrame:
     }
     missing = sorted(required - set(df.columns))
     if missing:
-        raise ValueError(f"Action parquet missing required columns {missing}: {data_path}")
+        raise ValueError(f"Action parquet missing required columns {missing}: {data_root}")
     return df
 
 
@@ -950,8 +1009,25 @@ def record_action_target(
     task_short: str,
     task_full: str,
 ) -> np.ndarray:
+    return record_action_target_for_expected_tasks(
+        record,
+        resolver,
+        num_frames,
+        target_fps,
+        segment_root,
+        {task_short, task_full},
+    )
+
+
+def record_action_target_for_expected_tasks(
+    record: dict,
+    resolver: ActionResolver,
+    num_frames: int,
+    target_fps: float,
+    segment_root: Path,
+    expected_tasks: set[str],
+) -> np.ndarray:
     task = record.get("robot_task") or record.get("task")
-    expected_tasks = {task_short, task_full}
     if task not in expected_tasks:
         raise ValueError(f"Expected eval task in {sorted(expected_tasks)}, got {task!r}")
     episode_raw = record.get("episode")
@@ -1048,6 +1124,400 @@ def eval_existing(args: argparse.Namespace) -> None:
     output_json.write_text(json.dumps(summary, ensure_ascii=False, indent=2))
     print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
     _ = ckpt
+
+
+def resolve_project_path(value: str | Path) -> Path:
+    path = Path(value)
+    if path.is_absolute():
+        return path
+    return Path(MAIN_ROOT) / path
+
+
+def parse_labeled_path(value: str) -> tuple[str, Path]:
+    if "=" in value:
+        label, raw_path = value.split("=", 1)
+        label = label.strip()
+        if not label:
+            raise ValueError(f"Run label must not be empty in {value!r}")
+        if not raw_path:
+            raise ValueError(f"Run path must not be empty in {value!r}")
+        return label, resolve_project_path(raw_path)
+    path = resolve_project_path(value)
+    return path.name, path
+
+
+def load_h2r_task_bundles(
+    checkpoint_paths: dict[str, Path],
+    device: str,
+) -> dict[str, H2RTaskBundle]:
+    model_cache: dict[str, tuple[WanVaeActionHead, torch.Tensor, torch.Tensor, dict]] = {}
+    resolver_cache: dict[str, ActionResolver] = {}
+    bundles: dict[str, H2RTaskBundle] = {}
+    for record_task, config in H2R_TASK_CONFIGS.items():
+        checkpoint = checkpoint_paths[config.checkpoint_key]
+        if not checkpoint.is_file():
+            raise FileNotFoundError(
+                f"{config.checkpoint_key} IDM checkpoint not found: {checkpoint}"
+            )
+        if config.checkpoint_key not in model_cache:
+            model_cache[config.checkpoint_key] = load_action_model(checkpoint, device)
+        if config.target_task_short not in resolver_cache:
+            resolver_cache[config.target_task_short] = ActionResolver(
+                default_task_data_root(config.target_task_short)
+            )
+        model, mean, std, ckpt = model_cache[config.checkpoint_key]
+        bundles[record_task] = H2RTaskBundle(
+            config=config,
+            checkpoint=checkpoint,
+            model=model,
+            mean=mean,
+            std=std,
+            ckpt=ckpt,
+            resolver=resolver_cache[config.target_task_short],
+            segment_root=default_task_segment_root(config.target_task_short),
+        )
+    return bundles
+
+
+def read_jsonl(path: Path) -> list[dict]:
+    if not path.is_file():
+        raise FileNotFoundError(f"JSONL file not found: {path}")
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+def action_part_mse(a: np.ndarray, b: np.ndarray, part: str) -> float:
+    if part == "arm":
+        return float(np.mean((a[:ARM_DIM] - b[:ARM_DIM]) ** 2))
+    if part == "hand":
+        return float(np.mean((a[ARM_DIM:] - b[ARM_DIM:]) ** 2))
+    if part == "arm_hand":
+        return float(np.mean((a - b) ** 2))
+    raise ValueError(f"Unknown action part: {part}")
+
+
+def h2r_action_metric_row(
+    *,
+    run_label: str,
+    run_name: str,
+    split: str,
+    sample_id: str,
+    record: dict,
+    canonical_task: str,
+    target: np.ndarray,
+    gt_pred: np.ndarray,
+    gen_pred: np.ndarray,
+) -> dict[str, float | int | str]:
+    row: dict[str, float | int | str] = {
+        "run_label": run_label,
+        "run_name": run_name,
+        "split": split,
+        "sample_id": sample_id,
+        "sample_index": int(sample_id),
+        "robot_task": str(record.get("robot_task") or record.get("task")),
+        "canonical_task": canonical_task,
+        "episode": str(record.get("episode", "")),
+        "seg": str(record.get("seg", "")),
+        "clip_start": float(record["clip_start"]),
+        "clip_dur": float(record["clip_dur"]),
+        "augment": str(record.get("augment", "")),
+        "source_id": str(record.get("source_id", "")),
+    }
+    for part in ("arm", "hand", "arm_hand"):
+        gt_to_target = action_part_mse(gt_pred, target, part)
+        gen_to_target = action_part_mse(gen_pred, target, part)
+        gen_to_gt = action_part_mse(gen_pred, gt_pred, part)
+        row[f"gt_video_to_target_{part}_mse"] = gt_to_target
+        row[f"gen_video_to_target_{part}_mse"] = gen_to_target
+        row[f"gen_video_to_gt_video_{part}_mse"] = gen_to_gt
+        row[f"gt_idm_{part}_mse"] = gt_to_target
+        row[f"gen_idm_{part}_mse"] = gen_to_target
+        row[f"gen_to_gt_idm_{part}_mse"] = gen_to_gt
+        row[f"idm_{part}_gap"] = gen_to_target - gt_to_target
+        row[f"idm_{part}_ratio"] = gen_to_target / max(gt_to_target, 1e-12)
+    return row
+
+
+def h2r_action_vector_row(
+    *,
+    metric_row: dict[str, float | int | str],
+    target: np.ndarray,
+    gt_pred: np.ndarray,
+    gen_pred: np.ndarray,
+) -> dict:
+    return {
+        "run_label": metric_row["run_label"],
+        "run_name": metric_row["run_name"],
+        "split": metric_row["split"],
+        "sample_id": metric_row["sample_id"],
+        "robot_task": metric_row["robot_task"],
+        "canonical_task": metric_row["canonical_task"],
+        "episode": metric_row["episode"],
+        "seg": metric_row["seg"],
+        "clip_start": metric_row["clip_start"],
+        "clip_dur": metric_row["clip_dur"],
+        "augment": metric_row["augment"],
+        "source_id": metric_row["source_id"],
+        "target_action": [float(v) for v in target.tolist()],
+        "gt_video_pred_action": [float(v) for v in gt_pred.tolist()],
+        "gen_video_pred_action": [float(v) for v in gen_pred.tolist()],
+    }
+
+
+def write_jsonl(rows: list[dict], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w") as fh:
+        for row in rows:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def summarize_h2r_metric_rows(rows: list[dict[str, float | int | str]]) -> list[dict]:
+    if not rows:
+        raise ValueError("No H2R metric rows to summarize")
+    df = pd.DataFrame(rows)
+    group_cols = ["run_label", "run_name", "split", "canonical_task"]
+    metric_cols = [
+        col for col in df.columns
+        if col.endswith("_mse") or col.endswith("_gap") or col.endswith("_ratio")
+    ]
+    summary_rows = []
+    for keys, group in df.groupby(group_cols, sort=True):
+        row = dict(zip(group_cols, keys))
+        row["n_samples"] = int(len(group))
+        row["robot_tasks"] = ",".join(sorted(str(v) for v in group["robot_task"].unique()))
+        for col in metric_cols:
+            values = group[col].astype(float)
+            row[f"{col}_mean"] = float(values.mean())
+            row[f"{col}_median"] = float(values.median())
+        summary_rows.append(row)
+    return summary_rows
+
+
+def compare_h2r_summary_rows(
+    summary_rows: list[dict],
+    baseline_label: str,
+    ours_label: str,
+) -> list[dict]:
+    by_key = {
+        (row["run_label"], row["split"], row["canonical_task"]): row
+        for row in summary_rows
+    }
+    groups = sorted({(row["split"], row["canonical_task"]) for row in summary_rows})
+    compare_rows = []
+    for split, canonical_task in groups:
+        base_key = (baseline_label, split, canonical_task)
+        ours_key = (ours_label, split, canonical_task)
+        if base_key not in by_key or ours_key not in by_key:
+            continue
+        base = by_key[base_key]
+        ours = by_key[ours_key]
+        row = {
+            "baseline_label": baseline_label,
+            "ours_label": ours_label,
+            "split": split,
+            "canonical_task": canonical_task,
+            "baseline_n_samples": int(base["n_samples"]),
+            "ours_n_samples": int(ours["n_samples"]),
+        }
+        metric_cols = sorted(
+            col for col in base
+            if col.endswith("_mean") and isinstance(base[col], (float, int))
+        )
+        for col in metric_cols:
+            base_value = float(base[col])
+            ours_value = float(ours[col])
+            row[f"baseline_{col}"] = base_value
+            row[f"ours_{col}"] = ours_value
+            row[f"delta_{col}"] = ours_value - base_value
+        compare_rows.append(row)
+    return compare_rows
+
+
+def write_dict_csv(rows: list[dict], path: Path) -> None:
+    if not rows:
+        return
+    fieldnames = []
+    for row in rows:
+        for key in row:
+            if key not in fieldnames:
+                fieldnames.append(key)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+@torch.no_grad()
+def eval_h2r_runs(args: argparse.Namespace) -> None:
+    if not args.run:
+        raise ValueError("eval-h2r requires at least one --run LABEL=PATH")
+    run_specs = [parse_labeled_path(value) for value in args.run]
+    duplicate_labels = {
+        label for label in [label for label, _ in run_specs]
+        if [item[0] for item in run_specs].count(label) > 1
+    }
+    if duplicate_labels:
+        raise ValueError(f"Duplicate run labels: {sorted(duplicate_labels)}")
+
+    checkpoint_paths = {
+        "collect": resolve_project_path(args.collect_checkpoint),
+        "wash": resolve_project_path(args.wash_checkpoint),
+        "pillow": resolve_project_path(args.pillow_checkpoint),
+    }
+    output_dir = resolve_project_path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    resize = parse_resize(args.resize)
+    device = args.device
+    bundles = load_h2r_task_bundles(checkpoint_paths, device)
+    vae = load_vae(args.vae_path, torch.bfloat16, home_device=device)
+
+    all_metric_rows: list[dict[str, float | int | str]] = []
+    config = {
+        "runs": [
+            {"label": label, "path": str(path), "name": path.name}
+            for label, path in run_specs
+        ],
+        "splits": args.splits,
+        "augment_filter": "normal",
+        "max_samples_per_split": args.max_samples_per_split,
+        "checkpoints": {key: str(path) for key, path in checkpoint_paths.items()},
+        "task_configs": {key: asdict(value) for key, value in H2R_TASK_CONFIGS.items()},
+        "resize": args.resize,
+        "num_frames": args.num_frames,
+        "target_fps": args.target_fps,
+        "vae_path": args.vae_path,
+    }
+    (output_dir / "config.json").write_text(json.dumps(config, ensure_ascii=False, indent=2))
+
+    for run_label, run_path in run_specs:
+        full_eval_dir = run_path / "full_eval"
+        if not full_eval_dir.is_dir():
+            raise FileNotFoundError(f"full_eval dir not found: {full_eval_dir}")
+        run_dir = output_dir / run_path.name
+        run_dir.mkdir(parents=True, exist_ok=True)
+        run_metric_rows: list[dict[str, float | int | str]] = []
+        run_vector_rows: list[dict] = []
+        for split in args.splits:
+            eval_dir = full_eval_dir / split
+            records_path = full_eval_dir / "data_split" / f"{split}.jsonl"
+            if not eval_dir.is_dir():
+                raise FileNotFoundError(f"Eval split dir not found: {eval_dir}")
+            raw_records = read_jsonl(records_path)
+            records = [
+                (idx, record)
+                for idx, record in enumerate(raw_records)
+                if str(record.get("augment", "normal")) == "normal"
+            ]
+            skipped = len(raw_records) - len(records)
+            if not records:
+                raise ValueError(
+                    f"No normal-augment records loaded from {records_path}; skipped {skipped}"
+                )
+            if args.max_samples_per_split > 0:
+                records = records[: args.max_samples_per_split]
+            if not records:
+                raise ValueError(f"No records loaded from {records_path}")
+            if skipped > 0:
+                print(
+                    f"{run_label}/{split} skipped_non_normal={skipped} "
+                    f"used={len(records)}",
+                    flush=True,
+                )
+
+            for idx, record in records:
+                record_task = str(record.get("robot_task") or record.get("task"))
+                if record_task not in bundles:
+                    raise ValueError(
+                        f"Unexpected eval task {record_task!r} in {records_path}; "
+                        f"allowed tasks are {sorted(bundles)}"
+                    )
+                bundle = bundles[record_task]
+                sample_id = f"{idx:05d}"
+                target = record_action_target_for_expected_tasks(
+                    record,
+                    bundle.resolver,
+                    args.num_frames,
+                    args.target_fps,
+                    bundle.segment_root,
+                    {record_task},
+                )
+                gt_path = eval_dir / f"gt_{sample_id}.mp4"
+                gen_path = eval_dir / f"gen_{sample_id}.mp4"
+                if not gt_path.is_file():
+                    raise FileNotFoundError(f"GT eval video not found: {gt_path}")
+                if not gen_path.is_file():
+                    raise FileNotFoundError(f"Generated eval video not found: {gen_path}")
+                gt_pred = predict_video_action(
+                    gt_path, bundle.model, vae, bundle.mean, bundle.std,
+                    num_frames=args.num_frames, resize=resize, device=device,
+                )
+                gen_pred = predict_video_action(
+                    gen_path, bundle.model, vae, bundle.mean, bundle.std,
+                    num_frames=args.num_frames, resize=resize, device=device,
+                )
+                metric_row = h2r_action_metric_row(
+                    run_label=run_label,
+                    run_name=run_path.name,
+                    split=split,
+                    sample_id=sample_id,
+                    record=record,
+                    canonical_task=bundle.config.canonical_task,
+                    target=target,
+                    gt_pred=gt_pred,
+                    gen_pred=gen_pred,
+                )
+                run_metric_rows.append(metric_row)
+                run_vector_rows.append(
+                    h2r_action_vector_row(
+                        metric_row=metric_row,
+                        target=target,
+                        gt_pred=gt_pred,
+                        gen_pred=gen_pred,
+                    )
+                )
+                n_done = idx + 1
+                if (
+                    (len(records) > 0 and idx == records[0][0])
+                    or n_done % args.log_every == 0
+                    or idx == records[-1][0]
+                ):
+                    print(
+                        f"{run_label}/{split} {n_done}/{len(raw_records)} "
+                        f"task={record_task} sample={sample_id}",
+                        flush=True,
+                    )
+        write_dict_csv(run_metric_rows, run_dir / "per_sample_metrics.csv")
+        write_jsonl(run_vector_rows, run_dir / "per_sample_actions.jsonl")
+        run_summary = summarize_h2r_metric_rows(run_metric_rows)
+        write_dict_csv(run_summary, run_dir / "summary_by_task.csv")
+        (run_dir / "config.json").write_text(
+            json.dumps({**config, "run_label": run_label, "run_path": str(run_path)},
+                       ensure_ascii=False, indent=2)
+        )
+        all_metric_rows.extend(run_metric_rows)
+
+    write_dict_csv(all_metric_rows, output_dir / "per_sample_metrics.csv")
+    summary_rows = summarize_h2r_metric_rows(all_metric_rows)
+    write_dict_csv(summary_rows, output_dir / "summary_by_task.csv")
+    compare_rows = compare_h2r_summary_rows(
+        summary_rows,
+        args.baseline_label,
+        args.ours_label,
+    )
+    write_dict_csv(compare_rows, output_dir / "summary_compare_baseline_ours.csv")
+    print(
+        json.dumps(
+            {
+                "output_dir": str(output_dir),
+                "n_samples": len(all_metric_rows),
+                "n_summary_rows": len(summary_rows),
+                "n_compare_rows": len(compare_rows),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        flush=True,
+    )
 
 
 @torch.no_grad()
@@ -1208,6 +1678,42 @@ def build_parser() -> argparse.ArgumentParser:
     eval_p.add_argument("--max-samples", type=int, default=0)
     eval_p.add_argument("--log-every", type=int, default=8)
     eval_p.set_defaults(func=eval_existing)
+
+    h2r_p = sub.add_parser(
+        "eval-h2r",
+        help="evaluate Baseline/Ours H2R full_eval videos with task-specific IDM checkpoints",
+    )
+    h2r_p.add_argument(
+        "--run",
+        action="append",
+        default=[],
+        help="run label and path as LABEL=training_data/log/<run>; repeat for Baseline and Ours",
+    )
+    h2r_p.add_argument("--baseline-label", default="Baseline")
+    h2r_p.add_argument("--ours-label", default="Ours")
+    h2r_p.add_argument("--collect-checkpoint", required=True)
+    h2r_p.add_argument("--wash-checkpoint", required=True)
+    h2r_p.add_argument("--pillow-checkpoint", required=True)
+    h2r_p.add_argument(
+        "--output-dir",
+        default="output/idm_h2r_action_eval",
+        help="root output directory for per-run metrics and Baseline/Ours summary",
+    )
+    h2r_p.add_argument(
+        "--splits",
+        nargs="+",
+        default=["in_task_eval", "ood_eval"],
+        help="full_eval split names to process",
+    )
+    h2r_p.add_argument("--max-samples-per-split", type=int, default=0)
+    h2r_p.add_argument("--vae-path", default=DEFAULT_VAE)
+    h2r_p.add_argument("--device", default="cuda:0")
+    h2r_p.add_argument("--resize", default="256x256",
+                       help="WIDTHxHEIGHT for Wan VAE input, or 'native'")
+    h2r_p.add_argument("--num-frames", type=int, default=DEFAULT_NUM_FRAMES)
+    h2r_p.add_argument("--target-fps", type=float, default=DEFAULT_TARGET_FPS)
+    h2r_p.add_argument("--log-every", type=int, default=8)
+    h2r_p.set_defaults(func=eval_h2r_runs)
     return parser
 
 

@@ -975,3 +975,15 @@
 - `.gitignore`：加入 `logs/`，避免本地日志目录被误提交。
 - `.gitignore`：加入 `cmd.sh` 与 `draft.md`，并从 Git 索引移除这两个已跟踪的本地草稿文件，保留工作区文件。
 - `.gitignore`：加入 `.env` / `.env.*`，避免本地 token 配置被误提交，同时保留 `.env.example` 可被跟踪。
+
+## 2026-05-30 — 三任务 H2R 生成视频 IDM action 复算
+
+**用户原始需求：**
+> 用 IDM 模型判断 H2R 外观编辑 Baseline/Ours 是否真的学到了 action；比较真实视频提取 action、生成视频提取 action 和 GT 的差距。只在 pick up pillow、wash machine、pick up cloth 三个任务上跑，不做其它任务。
+
+**直接修改：**
+- `src/pipeline/wan_vae_idm.py`：新增 `eval-h2r` 子命令，支持用 Collect Clothes、Washing Machine、Pickup Pillow 三个 task-specific IDM checkpoint 评估两个 H2R `full_eval` run。
+- `eval-h2r` 输出逐样本 action 向量、逐样本指标、按任务汇总和 Baseline/Ours delta；指标同时覆盖真实视频预测 action vs GT action、生成视频预测 action vs GT action、生成视频预测 action vs 真实视频预测 action。
+- `eval-h2r` 当前只统计 `augment=normal` 的 eval records，跳过 hflip 增强样本，避免翻转视频和未翻转 action label 不一致。
+- `src/pipeline/wan_vae_idm.py`：action parquet 读取扩展为 `data/chunk-*/*.parquet`，用于 Washing Machine 等多 parquet 原始数据。
+- 文档更新 `doc/step_5_training_infra.md` 和 `doc/scripts_inventory.md`，记录命令、输出目录和三任务限制。
