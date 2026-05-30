@@ -17,6 +17,19 @@
 - `scripts/flip_run.sh` 新增 `wan_pair_idm` 子命令；文档记录 smoke、正式训练和
   held-out validate 命令。
 
+**追加改动：**
+- 新增独立 `src.pipeline.humanoid_pair_idm`：Humanoid Everyday H1 LeRobot 训练
+  不再挂在 `wan_pair_idm` 里，而是通过 `train` / `validate` / `eval` 子命令直接读
+  `data/chunk-*/*.parquet` 与 `videos/chunk-*/egocentric/*.mp4`。
+- H1 路径保持 `(frame_t, frame_{t+1}) -> action_t` 对齐口径，使用单个小 CNN
+  输出完整 26 维 `action`；`wan_pair_idm` 只保留旧 WBT 的 `ee_action` /
+  `hand_cmd` 双头训练。
+- `scripts/flip_run.sh` 新增 `humanoid_pair_idm` 子命令，方便直接启动 Humanoid
+  Everyday H1 的 700 训练 / 100 eval / 1000 step 实验。
+- 已完成 Humanoid Everyday H1 全量实验：`700 train + 100 eval + 1000 step`
+  的训练跑通，best checkpoint 的 held-out `action_mse=0.143645`，
+  `mean_baseline_action_mse=0.154795`，并通过独立 `validate` 复算。
+
 ---
 
 ## 2026-05-07

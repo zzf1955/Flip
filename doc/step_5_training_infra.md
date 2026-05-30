@@ -682,6 +682,51 @@ episode 中 `frame_index=t` 的 action。该脚本固定使用
 `loss_curve.png`。checkpoint 中分别保存 `arm_model_state` 与
 `hand_model_state`，并保存两类 action 各自的 mean/std。
 
+Humanoid Everyday H1 子集使用独立 `src.pipeline.humanoid_pair_idm` 入口。该路径直接读取 LeRobot 目录：
+`data/chunk-*/*.parquet` 提供 `action[t]`，`videos/chunk-*/egocentric/*.mp4` 提供
+相邻 RGB 帧。H1 版本不再拆成旧 WBT 的 `ee_action` / `hand_cmd` 两个 12 维头，而是
+训练一个单独小 CNN 输出完整 26 维 `action`：
+
+- 输入：`frame_t` 与 `frame_{t+1}` resize 后拼成 6 通道 RGB。
+- 输出：同一 episode/parquet 中 `frame_index=t` 的 `action`，默认 26 维。
+- 对齐口径仍为 `(s_t, s_{t+1}) -> a_t`；最后一帧不构成 pair。
+
+H1 smoke 示例：
+
+```bash
+scripts/flip_run.sh humanoid_pair_idm --cuda 2 -- train \
+  --device cuda:0 \
+  --data-root /disk_n/zzf/flip/data/humanoid-everyday-h1-chunks0-6-8-200 \
+  --output-dir tmp/humanoid_pair_idm_h1_smoke \
+  --max-samples 128 \
+  --max-pairs-per-episode 1 \
+  --frame-stride 8 \
+  --steps 10 \
+  --batch-size 8 \
+  --eval-every 5 \
+  --val-max-samples 32 \
+  --resize 256x256 \
+  --split-by sample
+```
+
+H1 700 训练 / 100 eval / 1000 step 示例：
+
+```bash
+scripts/flip_run.sh humanoid_pair_idm --cuda 2 -- train \
+  --device cuda:0 \
+  --data-root /disk_n/zzf/flip/data/humanoid-everyday-h1-chunks0-6-8-200 \
+  --output-dir tmp/humanoid_pair_idm_h1_700train_100eval_s1000 \
+  --max-samples 0 \
+  --frame-stride 4 \
+  --split-by sample \
+  --train-samples 700 \
+  --eval-samples 100 \
+  --steps 1000 \
+  --batch-size 16 \
+  --eval-every 100 \
+  --resize 256x256
+```
+
 小规模 smoke 示例：
 
 ```bash
