@@ -485,13 +485,14 @@ summary 会额外记录 `foreground_patch_count`、`foreground_patch_size`、
 `foreground_patch_min_mask_pixels`、`foreground_patch_max_per_frame` 和
 `foreground_patch_max_per_video`。
 
-### Wan VAE arm-hand IDM 动作一致性
+### Wan VAE IDM 动作一致性
 
 `src.pipeline.wan_vae_idm` 训练一个 Video2Action IDM，用冻结的 Wan 2.2 VAE
-latent 作为视频特征，再接 3D conv + MLP action head。默认使用较小的
-`small` head：`conv_channels=128`、`hidden_dim=256`、`mlp_layers=2`，
-约 71 万可训练参数；`residual` head 仍可通过参数显式启用，但当前
-Collect Clothes episode held-out 验证显示大 residual head 更容易保守化输出。
+latent 作为视频特征，再接纯 3D CNN + MLP action head。256x256、17 帧输入经
+Wan VAE 后实际 latent 为 `[B, 48, 5, 16, 16]`；默认 `cnn_mlp` head 使用
+`conv_channels=256`、`conv_blocks=4`、`readout_dim=1024`、`hidden_dim=1024`、
+`mlp_layers=3`，3D CNN 输出 `[B, 256, 5, 8, 8]`，空间平均池化得到
+`[B, 5, 256]`，flatten 后经 1024 维 readout 和 MLP 输出 action。
 默认任务仍是 `G1_WBT_Inspire_Collect_Clothes_MainCamOnly`，也可以用
 `--task-short` / `--task-full` 显式切到其他 MainCamOnly 任务；脚本不会在任务名
 不匹配时隐式 fallback。
@@ -501,12 +502,86 @@ Collect Clothes episode held-out 验证显示大 residual head 更容易保守�
 
 - `action.ee_action`：12 维双臂末端执行器 action。
 - `action.hand_cmd`：12 维双手命令。
+- `action.robot_q_desired`：36 维全身期望关节 / base action，可用于 full-body
+  IDM。
 
 训练样本从 `training_data/segment/<task-short>/` 的 30fps segment 视频切 1s
-clip，默认采样 17 帧 @ 16fps，并把同一窗口内的
-`ee_action + hand_cmd` 平均成 24 维 clip-level target。target 会按训练集
+clip，默认采样 17 帧 @ 16fps，并只取 17 帧窗口中间帧对应的 action 作为
+target。target 会按训练集
 mean/std 标准化后训练，checkpoint 中保存反标准化参数。缺少原始 action 字段、
 segment 对齐字段或 eval 记录任务名不匹配时会直接报错。
+默认 `--target-mode arm_hand` 保持 task47/task48 的 24 维口径；显式传
+`--target-mode full_body` 时，target 改为
+`action.robot_q_desired(36) + action.hand_cmd(12)` 共 48 维，模型输出头也随之变为
+48 维。
+
+可选的可见 action mask 由 `src.pipeline.action_mask_precompute` 生成，默认写到
+`training_data/action_mask/<task>/<episode>/<seg>.npz`，并在根目录写
+`index.jsonl`。precompute 复用 G1 FK + mesh 投影。默认 `--target-mode arm_hand`
+逐帧渲染 `left_arm`、`right_arm`、`left_hand`、`right_hand` 四个 action 相关
+body part；`--target-mode full_body` 会改为
+`torso`、`left_leg`、`right_leg`、`left_arm`、`right_arm`、`left_hand`、
+`right_hand` 七个 body part。
+只有 mesh 像素数达到 `--min-part-pixels`，且至少一个对应 link origin 投影在图像
+范围内时，该 part 才算可见。artifact 包含 `part_visibility`、
+`part_pixel_counts`、`part_origin_in_frame_counts`、`action_mask`、`part_names`、
+`action_dim_names`、`action_dim_parts` 和 `metadata_json`。metadata 记录 task、
+episode、segment、fps、图像尺寸、阈值、相机参数和 schema version；task /
+episode / segment / version 不匹配时训练和评估会直接报错。
+由于当前 IDM 只监督 17 帧 clip 的中间帧，precompute 可用
+`--clip-middle-only` 只渲染训练 clip 会访问到的中间帧，并用 `--workers N`
+按 segment 并行。训练端读取这类 artifact 时会检查 clip 中间帧是否已渲染；
+如果 clip 参数和 precompute 参数不匹配，会直接报错，不会把未渲染帧静默当成
+不可见。
+
+当前 IDM action mask 映射显式固定为：
+
+- `action.ee_action[0:6]`：左臂末端 action，对应 `left_arm OR left_hand` 可见。
+- `action.ee_action[6:12]`：右臂末端 action，对应 `right_arm OR right_hand` 可见。
+- `action.hand_cmd[0:6]`：左手命令，对应 `left_hand` 可见。
+- `action.hand_cmd[6:12]`：右手命令，对应 `right_hand` 可见。
+
+full-body 模式的 48 维 mask 映射为：
+
+- `action.robot_q_desired[0:7]`：root / base，对应 `torso` 可见。
+- `action.robot_q_desired[7:13]`：左腿，对应 `left_leg` 可见。
+- `action.robot_q_desired[13:19]`：右腿，对应 `right_leg` 可见。
+- `action.robot_q_desired[19:22]`：腰部，对应 `torso` 可见。
+- `action.robot_q_desired[22:29]`：左臂，对应 `left_arm OR left_hand` 可见。
+- `action.robot_q_desired[29:36]`：右臂，对应 `right_arm OR right_hand` 可见。
+- `action.hand_cmd[0:6]`：左手，对应 `left_hand` 可见。
+- `action.hand_cmd[6:12]`：右手，对应 `right_hand` 可见。
+
+只生成当前 H2R 三个任务的 mask 时可逐任务运行，例如：
+
+```bash
+/home/leadtek/miniconda3/envs/flip/bin/python -m src.pipeline.action_mask_precompute \
+  --task Inspire_Collect_Clothes_MainCamOnly \
+  --target-mode full_body \
+  --output training_data/action_mask \
+  --resume
+
+/home/leadtek/miniconda3/envs/flip/bin/python -m src.pipeline.action_mask_precompute \
+  --task Inspire_Put_Clothes_into_Washing_Machine_MainCamOnly \
+  --target-mode full_body \
+  --output training_data/action_mask \
+  --resume
+
+/home/leadtek/miniconda3/envs/flip/bin/python -m src.pipeline.action_mask_precompute \
+  --task Inspire_Pickup_Pillow_MainCamOnly \
+  --target-mode full_body \
+  --output training_data/action_mask \
+  --clip-middle-only \
+  --clip-stride 0.5 \
+  --workers 16 \
+  --resume
+```
+
+训练、验证和 eval 可通过 `--action-mask-root default` 启用 mask。clip-level mask
+与 action label 对齐到同一 clip 的中间采样帧；`--action-mask-min-frame-ratio`
+保留为阈值参数，但中间帧 mask 的 ratio 只会是 0 或 1。若某个 clip
+没有任何可见 action 维度，默认 `--empty-action-mask-policy error` 直接失败；
+需要显式过滤时使用 `--empty-action-mask-policy drop`。
 
 小规模训练 smoke：
 
@@ -522,13 +597,33 @@ scripts/flip_run.sh wan_vae_idm --cuda 2 -- train \
   --resize 256x256
 ```
 
+启用 mask 的训练 smoke 示例：
+
+```bash
+scripts/flip_run.sh wan_vae_idm --cuda 2 -- train \
+  --device cuda:0 \
+  --task-short Inspire_Collect_Clothes_MainCamOnly \
+  --target-mode full_body \
+  --action-mask-root default \
+  --empty-action-mask-policy drop \
+  --output-dir tmp/wan_vae_idm_collect_masked_smoke \
+  --max-samples 32 \
+  --steps 40 \
+  --batch-size 1 \
+  --eval-every 10 \
+  --resize 256x256
+```
+
 训练过程会写出 `train_loss.csv`、`eval_loss.csv`、`val_predictions.csv`、
 `best_val_predictions.csv`、`checkpoint.pt`、`best_checkpoint.pt` 和
 `loss_curve.png`。`eval_loss.csv` 默认每 `--eval-every` step 在 held-out
 episode split 上评估，`loss_curve.png` 同时画训练 loss 滑动均值和 eval
 loss 曲线。`val_predictions.csv` 对应 final step，`best_val_predictions.csv`
-对应验证集 total MSE 最低的 checkpoint；正式复算 action consistency 时优先使用
-`best_checkpoint.pt`。`--val-max-samples 0` 表示验证时使用全部 held-out samples。
+对应验证集 total MSE 最低的 checkpoint；启用 mask 时 checkpoint 选择改用
+`masked_total_mse`。验证指标同时输出原始 action 单位下的 `*_mse`、
+`masked_*_mse`、`*_relative_l2_error` 和 `masked_*_relative_l2_error`。
+正式复算 action consistency 时优先使用 `best_checkpoint.pt`。
+`--val-max-samples 0` 表示验证时使用全部 held-out samples。
 如果训练更长，可用 `--lr-scheduler cosine --min-lr-ratio 0.05` 做学习率衰减。
 
 已训练 checkpoint 可用同一 held-out split 复算验证集预测，不重训：
@@ -539,6 +634,7 @@ scripts/flip_run.sh wan_vae_idm --cuda 2 -- validate \
   --task-short Inspire_Collect_Clothes_MainCamOnly \
   --checkpoint tmp/wan_vae_idm_collect_smoke/best_checkpoint.pt \
   --output-dir tmp/wan_vae_idm_collect_smoke/validate_all \
+  --action-mask-root default \
   --max-samples 0 \
   --clip-stride 0.5 \
   --val-max-samples 0 \
@@ -555,15 +651,19 @@ scripts/flip_run.sh wan_vae_idm --cuda 2 -- eval \
   --eval-dir training_data/log/<run>/full_eval/in_task_eval \
   --records-jsonl training_data/log/<run>/full_eval/data_split/in_task_eval.jsonl \
   --output-csv tmp/wan_vae_idm_collect_eval/action_metrics.csv \
+  --action-mask-root default \
   --max-samples 8 \
   --resize 256x256
 ```
 
 输出 CSV/JSON 字段包括 `gt_idm_arm_mse`、`gt_idm_hand_mse`、
 `gt_idm_arm_hand_mse`、`gen_idm_arm_mse`、`gen_idm_hand_mse`、
-`gen_idm_arm_hand_mse`，以及对应的 `idm_*_gap` / `idm_*_ratio`。其中 GT
-视频上的 IDM error 作为该监督模型在真实视频上的误差下限，生成视频指标越接近
-GT 下限，说明 arm-hand action cue 越一致。
+`gen_idm_arm_hand_mse`，以及对应的 `idm_*_gap` / `idm_*_ratio`。启用 mask
+后额外输出 `gt_idm_masked_*_mse`、`gen_idm_masked_*_mse`、
+`idm_masked_*_gap` / `idm_masked_*_ratio`、`visible_action_count`、
+`visible_action_ratio`、`visible_arm_ratio`、`visible_hand_ratio` 和逐维
+`mask_XX` / `mask_ratio_XX`。其中 GT 视频上的 IDM error 作为该监督模型在真实
+视频上的误差下限，生成视频指标越接近 GT 下限，说明 arm-hand action cue 越一致。
 
 三任务 H2R Baseline/Ours 生成视频 action 复算使用 `eval-h2r` 子命令。该入口按
 `robot_task` 分派到 Collect Clothes、Washing Machine、Pickup Pillow 三个 IDM

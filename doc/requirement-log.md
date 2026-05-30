@@ -1033,3 +1033,13 @@
 - `eval-h2r` 当前只统计 `augment=normal` 的 eval records，跳过 hflip 增强样本，避免翻转视频和未翻转 action label 不一致。
 - `src/pipeline/wan_vae_idm.py`：action parquet 读取扩展为 `data/chunk-*/*.parquet`，用于 Washing Machine 等多 parquet 原始数据。
 - 文档更新 `doc/step_5_training_infra.md` 和 `doc/scripts_inventory.md`，记录命令、输出目录和三任务限制。
+## 2026-05-30 — Wan VAE IDM 可见 action mask 训练
+
+**用户原始需求：**
+> task47 / task48 的 Wan VAE arm-hand IDM 直接对完整 24 维 action 计算 loss，但第一人称视频中不一定能看到完整胳膊或手。需要基于 robot mesh / 投影信息逐帧计算 visible joint / action mask，loss 只计算画面内可见 action 维度，并把 mask artifact 稳定保存；当前只覆盖 Collect Clothes、Washing Machine、Pickup Pillow 三个 H2R 任务。
+
+**直接修改：**
+- 新增 `src/pipeline/action_mask.py`：定义 24 维 arm-hand 和 48 维 full-body IDM action mask schema、显式 body-part 映射、artifact 读取和 clip-level mask 聚合。
+- 新增 `src/pipeline/action_mask_precompute.py`：基于 G1 FK mesh 投影逐帧计算 action 相关 body part 可见性；`--target-mode arm_hand` 覆盖左右臂/手，`--target-mode full_body` 覆盖 torso、左右腿、左右臂、左右手；支持 `--clip-middle-only` 只渲染 IDM 监督会访问的中间帧，支持 `--workers` 按 segment 并行预计算；写出 `training_data/action_mask/<task>/<episode>/<seg>.npz` 和 `index.jsonl`。
+- `src/pipeline/wan_vae_idm.py`：`train` / `validate` / `eval` 新增 `--target-mode`、`--action-mask-root`、`--action-mask-min-frame-ratio`、`--empty-action-mask-policy`；`arm_hand` 使用 `action.ee_action + action.hand_cmd` 24 维，`full_body` 使用 `action.robot_q_desired + action.hand_cmd` 48 维；action label 与 mask 都对齐到 17 帧 clip 的中间帧；IDM head 改为纯 3D CNN + MLP，Wan VAE latent `[B,48,5,16,16]` 经 CNN 到 `[B,256,5,8,8]` 后 spatial pool/readout/MLP 输出 action；启用 mask 后训练使用 visible 维度 masked loss，验证/eval 同时输出 unmasked 与 masked MSE、relative L2 error、visible count/ratio 和逐维 mask。
+- `doc/step_5_training_infra.md`、`doc/scripts_inventory.md`：补充 action mask precompute、维度映射、masked 训练/验证/eval 参数与输出字段。
