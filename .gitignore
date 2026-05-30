@@ -61,7 +61,7 @@ ref-cosmos-transfer1/
 models/
 training_data/
 wandb/
-logs/
+/logs/
 cmd.sh
 draft.md
 *.log
