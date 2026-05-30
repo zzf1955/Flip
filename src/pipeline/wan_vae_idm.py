@@ -1,14 +1,13 @@
-"""Wan VAE based inverse dynamics model for arm-hand action consistency.
+"""Wan VAE based inverse dynamics model for action consistency.
 
 This module trains a lightweight Video2Action head on top of frozen Wan 2.2
-VAE latents.  The model predicts clip-level mean action:
+VAE latents.  The model predicts the middle-frame action for a 17-frame clip:
 
-  - ``action.ee_action``: 12-dim dual-arm end-effector action
-  - ``action.hand_cmd``: 12-dim dual-hand command
+  - ``action.ee_action`` + ``action.hand_cmd`` for 24-dim arm-hand mode
+  - ``action.robot_q_desired`` + ``action.hand_cmd`` for 48-dim full-body mode
 
-The action target is averaged over the sampled 1s video window.  Evaluation
-compares IDM-predicted actions from generated and GT videos against the same
-ground-truth action target.
+Evaluation compares IDM-predicted actions from generated and GT videos against
+the same ground-truth action target.
 """
 
 from __future__ import annotations
@@ -31,6 +30,13 @@ import torch.nn.functional as F
 
 from src.core.config import DATASET_ROOT, MAIN_ROOT
 from src.core.wan_loader import load_vae
+from src.pipeline.action_mask import (
+    ActionMaskResolver,
+    ClipActionMask,
+    action_dim_names_for_mode,
+    action_dim_parts_for_mode,
+    default_action_mask_root,
+)
 from src.pipeline.mitty_cache import encode_video_array_batch
 from src.pipeline.train_mitty import DEFAULT_VAE
 
@@ -41,12 +47,50 @@ DEFAULT_NUM_FRAMES = 17
 ARM_DIM = 12
 HAND_DIM = 12
 ACTION_DIM = ARM_DIM + HAND_DIM
+ROBOT_Q_DIM = 36
+FULL_BODY_ACTION_DIM = ROBOT_Q_DIM + HAND_DIM
+TARGET_MODES = ("arm_hand", "full_body")
+
+
+def validate_target_mode(target_mode: str) -> str:
+    if target_mode not in TARGET_MODES:
+        raise ValueError(f"Unsupported target_mode={target_mode!r}, expected {TARGET_MODES}")
+    return target_mode
+
+
+def target_action_dim(target_mode: str) -> int:
+    target_mode = validate_target_mode(target_mode)
+    return ACTION_DIM if target_mode == "arm_hand" else FULL_BODY_ACTION_DIM
+
+
+def target_action_slices(target_mode: str) -> dict[str, slice]:
+    target_mode = validate_target_mode(target_mode)
+    if target_mode == "arm_hand":
+        return {
+            "total": slice(0, ACTION_DIM),
+            "arm": slice(0, ARM_DIM),
+            "hand": slice(ARM_DIM, ACTION_DIM),
+        }
+    return {
+        "total": slice(0, FULL_BODY_ACTION_DIM),
+        "root": slice(0, 7),
+        "left_leg": slice(7, 13),
+        "right_leg": slice(13, 19),
+        "waist": slice(19, 22),
+        "left_arm": slice(22, 29),
+        "right_arm": slice(29, 36),
+        "arm": slice(22, 36),
+        "left_hand": slice(36, 42),
+        "right_hand": slice(42, 48),
+        "hand": slice(36, 48),
+    }
 
 
 @dataclass(frozen=True)
 class ClipSample:
     video_path: str
     episode: int
+    episode_name: str
     segment: str
     frame_start: int
     clip_start: float
@@ -54,6 +98,15 @@ class ClipSample:
     rel_frame_indices: tuple[int, ...]
     abs_frame_indices: tuple[int, ...]
     target: tuple[float, ...]
+    action_mask: tuple[float, ...] | None = None
+    action_mask_frame_ratio: tuple[float, ...] | None = None
+    visible_action_count: int = ACTION_DIM
+    visible_arm_count: int = ARM_DIM
+    visible_hand_count: int = HAND_DIM
+    visible_action_ratio: float = 1.0
+    visible_arm_ratio: float = 1.0
+    visible_hand_ratio: float = 1.0
+    action_mask_path: str = ""
 
 
 def parse_resize(value: str) -> tuple[int, int] | None:
@@ -96,6 +149,15 @@ def resolve_task_args(args: argparse.Namespace) -> None:
         args.segment_root = str(default_task_segment_root(task_short))
 
 
+def resolve_action_mask_root_arg(args: argparse.Namespace) -> Path | None:
+    root = getattr(args, "action_mask_root", None)
+    if root is None or str(root).strip() == "":
+        return None
+    if str(root).lower() == "default":
+        return default_action_mask_root()
+    return Path(root)
+
+
 def load_action_frame_table(data_root: Path) -> pd.DataFrame:
     data_path = data_root / "data" / "chunk-000" / "file-000.parquet"
     if not data_path.is_file():
@@ -106,6 +168,7 @@ def load_action_frame_table(data_root: Path) -> pd.DataFrame:
         "frame_index",
         "action.ee_action",
         "action.hand_cmd",
+        "action.robot_q_desired",
     }
     missing = sorted(required - set(df.columns))
     if missing:
@@ -124,7 +187,13 @@ class ActionResolver:
             for ep, group in self.df.groupby("episode_index", sort=False)
         }
 
-    def target_for_indices(self, episode: int, frame_indices: list[int]) -> np.ndarray:
+    def target_for_indices(
+        self,
+        episode: int,
+        frame_indices: list[int],
+        *,
+        target_mode: str,
+    ) -> np.ndarray:
         if episode not in self._episode_rows:
             raise ValueError(f"Episode {episode} not found in {self.data_root}")
         rows = self._episode_rows[episode]
@@ -133,18 +202,26 @@ class ActionResolver:
             raise ValueError(
                 f"Missing action frames for episode {episode}: {missing[:8]}"
             )
-        actions = []
-        for idx in frame_indices:
-            row = rows.loc[idx]
-            ee = np.asarray(row["action.ee_action"], dtype=np.float32)
-            hand = np.asarray(row["action.hand_cmd"], dtype=np.float32)
-            if ee.shape != (ARM_DIM,) or hand.shape != (HAND_DIM,):
+        idx = frame_indices[len(frame_indices) // 2]
+        row = rows.loc[idx]
+        ee = np.asarray(row["action.ee_action"], dtype=np.float32)
+        hand = np.asarray(row["action.hand_cmd"], dtype=np.float32)
+        robot_q = np.asarray(row["action.robot_q_desired"], dtype=np.float32)
+        if ee.shape != (ARM_DIM,) or hand.shape != (HAND_DIM,):
+            raise ValueError(
+                f"Bad action shape at episode={episode} frame={idx}: "
+                f"ee={ee.shape}, hand={hand.shape}"
+            )
+        if target_mode == "arm_hand":
+            return np.concatenate([ee, hand], axis=0).astype(np.float32)
+        if target_mode == "full_body":
+            if robot_q.shape != (ROBOT_Q_DIM,):
                 raise ValueError(
-                    f"Bad action shape at episode={episode} frame={idx}: "
-                    f"ee={ee.shape}, hand={hand.shape}"
+                    f"Bad full-body action shape at episode={episode} frame={idx}: "
+                    f"robot_q={robot_q.shape}, hand={hand.shape}"
                 )
-            actions.append(np.concatenate([ee, hand], axis=0))
-        return np.stack(actions, axis=0).mean(axis=0).astype(np.float32)
+            return np.concatenate([robot_q, hand], axis=0).astype(np.float32)
+        raise ValueError(f"Unsupported target_mode={target_mode!r}")
 
 
 def clip_frame_indices(
@@ -236,6 +313,30 @@ def read_video_uniform_frames(
     return np.stack(selected, axis=0).astype(np.uint8)
 
 
+def clip_sample_action_mask_fields(mask: ClipActionMask) -> dict:
+    return {
+        "action_mask": tuple(float(v) for v in mask.mask.tolist()),
+        "action_mask_frame_ratio": tuple(float(v) for v in mask.frame_ratios.tolist()),
+        "visible_action_count": mask.visible_action_count,
+        "visible_arm_count": mask.visible_arm_count,
+        "visible_hand_count": mask.visible_hand_count,
+        "visible_action_ratio": mask.visible_action_ratio,
+        "visible_arm_ratio": mask.visible_arm_ratio,
+        "visible_hand_ratio": mask.visible_hand_ratio,
+        "action_mask_path": mask.mask_path,
+    }
+
+
+def require_nonempty_clip_mask(sample_id: str, mask: ClipActionMask, policy: str) -> bool:
+    if mask.visible_action_count > 0:
+        return True
+    if policy == "drop":
+        return False
+    if policy == "error":
+        raise ValueError(f"Clip has no visible action dimensions: {sample_id}")
+    raise ValueError(f"Unsupported empty action mask policy: {policy!r}")
+
+
 def discover_segment_clips(
     resolver: ActionResolver,
     segment_root: Path,
@@ -246,12 +347,25 @@ def discover_segment_clips(
     num_frames: int,
     target_fps: float,
     seed: int,
+    task_short: str,
+    target_mode: str,
+    action_mask_root: Path | None,
+    action_mask_min_frame_ratio: float,
+    empty_action_mask_policy: str,
 ) -> list[ClipSample]:
     if not segment_root.is_dir():
         raise FileNotFoundError(f"Segment root not found: {segment_root}")
     if clip_stride <= 0:
         raise ValueError(f"clip_stride must be positive, got {clip_stride}")
     samples: list[ClipSample] = []
+    mask_resolver = None
+    if action_mask_root is not None:
+        mask_resolver = ActionMaskResolver(
+            action_mask_root,
+            task_short,
+            min_frame_ratio=action_mask_min_frame_ratio,
+            target_mode=target_mode,
+        )
     for joints_path in sorted(segment_root.glob("ep*/seg*_joints.parquet")):
         seg_df = pd.read_parquet(joints_path)
         required = {"episode_index", "frame_index"}
@@ -278,14 +392,31 @@ def discover_segment_clips(
         if not video_path.is_file():
             raise FileNotFoundError(f"Segment video not found: {video_path}")
         segment = joints_path.stem.replace("_joints", "")
+        episode_name = joints_path.parent.name
         for clip_start in starts:
             rel_indices = clip_frame_indices(clip_start, clip_dur, num_frames, target_fps)
             abs_indices = [frame_start + idx for idx in rel_indices]
-            target = resolver.target_for_indices(episode, abs_indices)
+            target = resolver.target_for_indices(
+                episode,
+                abs_indices,
+                target_mode=target_mode,
+            )
+            mask_fields = {}
+            if mask_resolver is not None:
+                clip_id = f"{task_short}/{episode_name}/{segment}@{clip_start:.3f}"
+                clip_mask = mask_resolver.load_clip(episode_name, segment, rel_indices)
+                if not require_nonempty_clip_mask(
+                    clip_id,
+                    clip_mask,
+                    empty_action_mask_policy,
+                ):
+                    continue
+                mask_fields = clip_sample_action_mask_fields(clip_mask)
             samples.append(
                 ClipSample(
                     video_path=str(video_path),
                     episode=episode,
+                    episode_name=episode_name,
                     segment=segment,
                     frame_start=frame_start,
                     clip_start=float(clip_start),
@@ -293,6 +424,7 @@ def discover_segment_clips(
                     rel_frame_indices=tuple(rel_indices),
                     abs_frame_indices=tuple(abs_indices),
                     target=tuple(float(v) for v in target.tolist()),
+                    **mask_fields,
                 )
             )
     random.Random(seed).shuffle(samples)
@@ -319,56 +451,68 @@ class ClipDataset(torch.utils.data.Dataset):
             self.resize,
         )
         target = np.asarray(sample.target, dtype=np.float32)
-        return {
+        item = {
             "frames": frames,
             "target": target,
             "sample_index": idx,
         }
+        if sample.action_mask is not None:
+            action_mask = np.asarray(sample.action_mask, dtype=np.float32)
+            if action_mask.shape != target.shape:
+                raise ValueError(
+                    f"Bad action mask shape for sample {idx}: {action_mask.shape}"
+                )
+            item["action_mask"] = action_mask
+        return item
 
 
 def collate_clip_batch(items: list[dict]) -> dict:
-    return {
+    batch = {
         "frames": [item["frames"] for item in items],
         "target": torch.from_numpy(np.stack([item["target"] for item in items], axis=0)),
         "sample_index": [item["sample_index"] for item in items],
     }
-
-
-class ResidualConv3dBlock(nn.Module):
-    def __init__(self, channels: int, dropout: float):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.GroupNorm(16, channels),
-            nn.SiLU(),
-            nn.Conv3d(channels, channels, kernel_size=3, padding=1),
-            nn.GroupNorm(16, channels),
-            nn.SiLU(),
-            nn.Dropout3d(dropout),
-            nn.Conv3d(channels, channels, kernel_size=3, padding=1),
+    has_mask = ["action_mask" in item for item in items]
+    if any(has_mask) and not all(has_mask):
+        raise ValueError("Batch mixes masked and unmasked samples")
+    if all(has_mask):
+        batch["action_mask"] = torch.from_numpy(
+            np.stack([item["action_mask"] for item in items], axis=0)
         )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.net(x)
+    return batch
 
 
 class WanVaeActionHead(nn.Module):
     def __init__(
         self,
         latent_channels: int = 48,
-        head_type: str = "small",
-        conv_channels: int = 128,
-        conv_blocks: int = 2,
-        hidden_dim: int = 256,
-        mlp_layers: int = 2,
+        action_dim: int = ACTION_DIM,
+        target_mode: str = "arm_hand",
+        head_type: str = "cnn_mlp",
+        conv_channels: int = 256,
+        conv_blocks: int = 4,
+        readout_dim: int = 1024,
+        hidden_dim: int = 1024,
+        mlp_layers: int = 3,
         dropout: float = 0.0,
     ):
         super().__init__()
-        if head_type not in {"small", "residual"}:
-            raise ValueError(f"Unsupported head_type={head_type!r}")
+        self.action_dim = int(action_dim)
+        self.target_mode = validate_target_mode(target_mode)
+        expected_dim = target_action_dim(self.target_mode)
+        if self.action_dim != expected_dim:
+            raise ValueError(
+                f"action_dim={self.action_dim} does not match "
+                f"target_mode={self.target_mode!r} expected_dim={expected_dim}"
+            )
+        if head_type != "cnn_mlp":
+            raise ValueError(f"Unsupported head_type={head_type!r}; expected 'cnn_mlp'")
         if conv_channels <= 0:
             raise ValueError(f"conv_channels must be positive, got {conv_channels}")
-        if conv_blocks <= 0:
-            raise ValueError(f"conv_blocks must be positive, got {conv_blocks}")
+        if conv_blocks < 2:
+            raise ValueError(f"conv_blocks must be at least 2, got {conv_blocks}")
+        if readout_dim <= 0:
+            raise ValueError(f"readout_dim must be positive, got {readout_dim}")
         if hidden_dim <= 0:
             raise ValueError(f"hidden_dim must be positive, got {hidden_dim}")
         if mlp_layers <= 0:
@@ -376,64 +520,60 @@ class WanVaeActionHead(nn.Module):
         if dropout < 0.0:
             raise ValueError(f"dropout must be non-negative, got {dropout}")
 
-        if head_type == "small":
-            self.encoder = nn.Sequential(
-                nn.Conv3d(latent_channels, conv_channels, kernel_size=3, padding=1),
-                nn.SiLU(),
+        first_channels = max(1, conv_channels // 2)
+        conv_layers: list[nn.Module] = [
+            nn.Conv3d(
+                latent_channels,
+                first_channels,
+                kernel_size=3,
+                padding=1,
+            ),
+            nn.SiLU(),
+            nn.Conv3d(
+                first_channels,
+                conv_channels,
+                kernel_size=3,
+                stride=(1, 2, 2),
+                padding=1,
+            ),
+            nn.SiLU(),
+        ]
+        for _ in range(conv_blocks - 2):
+            conv_layers.extend([
                 nn.Conv3d(conv_channels, conv_channels, kernel_size=3, padding=1),
                 nn.SiLU(),
-                nn.AdaptiveAvgPool3d((1, 1, 1)),
-                nn.Flatten(),
-            )
-            trunk_layers: list[nn.Module] = [
-                nn.Linear(conv_channels, hidden_dim),
-                nn.SiLU(),
-            ]
-            for _ in range(mlp_layers - 1):
-                trunk_layers.extend([
-                    nn.Linear(hidden_dim, hidden_dim),
-                    nn.SiLU(),
-                ])
-            self.trunk = nn.Sequential(*trunk_layers)
-        else:
-            conv_layers: list[nn.Module] = [
-                nn.Conv3d(latent_channels, conv_channels, kernel_size=3, padding=1),
-                nn.SiLU(),
-            ]
-            for _ in range(conv_blocks):
-                conv_layers.append(ResidualConv3dBlock(conv_channels, dropout))
-            conv_layers.extend([
-                nn.GroupNorm(16, conv_channels),
-                nn.SiLU(),
-                nn.AdaptiveAvgPool3d((1, 1, 1)),
-                nn.Flatten(),
             ])
-            self.encoder = nn.Sequential(*conv_layers)
-
-            mlp: list[nn.Module] = []
-            in_dim = conv_channels
-            for _ in range(mlp_layers):
-                mlp.extend([
-                    nn.Linear(in_dim, hidden_dim),
-                    nn.LayerNorm(hidden_dim),
-                    nn.SiLU(),
-                    nn.Dropout(dropout),
-                ])
-                in_dim = hidden_dim
-            self.trunk = nn.Sequential(*mlp)
-        self.arm_head = nn.Linear(hidden_dim, ARM_DIM)
-        self.hand_head = nn.Linear(hidden_dim, HAND_DIM)
+        self.encoder = nn.Sequential(*conv_layers)
+        self.readout = nn.Sequential(
+            nn.Linear(conv_channels * 5, readout_dim),
+            nn.SiLU(),
+        )
+        mlp_layers_list: list[nn.Module] = []
+        in_dim = readout_dim
+        for layer_idx in range(mlp_layers - 1):
+            out_dim = max(self.action_dim * 2, hidden_dim // (2 ** layer_idx))
+            mlp_layers_list.extend([
+                nn.Linear(in_dim, out_dim),
+                nn.SiLU(),
+                nn.Dropout(dropout),
+            ])
+            in_dim = out_dim
+        mlp_layers_list.append(nn.Linear(in_dim, self.action_dim))
+        self.mlp = nn.Sequential(*mlp_layers_list)
 
     def forward(self, latent: torch.Tensor) -> dict[str, torch.Tensor]:
         x = self.encoder(latent.float())
-        x = self.trunk(x)
-        arm = self.arm_head(x)
-        hand = self.hand_head(x)
-        return {
-            "arm": arm,
-            "hand": hand,
-            "action": torch.cat([arm, hand], dim=-1),
-        }
+        if x.ndim != 5:
+            raise ValueError(f"Expected 5D latent features, got {x.shape}")
+        if x.shape[2:] != (5, 8, 8):
+            raise ValueError(f"Expected CNN output [B, C, 5, 8, 8], got {x.shape}")
+        x = x.mean(dim=(-1, -2)).permute(0, 2, 1).contiguous()
+        if x.shape[1:] != (5, x.shape[-1]):
+            raise ValueError(f"Expected pooled shape [B, 5, C], got {x.shape}")
+        x = x.flatten(start_dim=1)
+        x = self.readout(x)
+        action = self.mlp(x)
+        return {"action": action}
 
 
 def split_samples(
@@ -473,11 +613,124 @@ def target_stats(samples: list[ClipSample]) -> tuple[torch.Tensor, torch.Tensor]
     return torch.from_numpy(mean), torch.from_numpy(std)
 
 
-def mse_parts(pred_action: torch.Tensor, target_action: torch.Tensor) -> dict[str, torch.Tensor]:
-    arm = F.mse_loss(pred_action[:, :ARM_DIM], target_action[:, :ARM_DIM])
-    hand = F.mse_loss(pred_action[:, ARM_DIM:], target_action[:, ARM_DIM:])
-    total = F.mse_loss(pred_action, target_action)
-    return {"arm": arm, "hand": hand, "total": total}
+def mse_parts(
+    pred_action: torch.Tensor,
+    target_action: torch.Tensor,
+    *,
+    target_mode: str,
+) -> dict[str, torch.Tensor]:
+    slices = target_action_slices(target_mode)
+    parts = {
+        name: F.mse_loss(pred_action[:, slc], target_action[:, slc])
+        for name, slc in slices.items()
+        if name != "total"
+    }
+    parts["total"] = F.mse_loss(pred_action, target_action)
+    return parts
+
+
+def _masked_mse_or_none(
+    pred_action: torch.Tensor,
+    target_action: torch.Tensor,
+    mask: torch.Tensor,
+    slc: slice,
+) -> torch.Tensor | None:
+    part_mask = mask[:, slc].to(dtype=pred_action.dtype)
+    denom = part_mask.sum()
+    if float(denom.detach().cpu()) <= 0.0:
+        return None
+    diff = (pred_action[:, slc] - target_action[:, slc]) ** 2
+    return (diff * part_mask).sum() / denom
+
+
+def masked_mse_parts(
+    pred_action: torch.Tensor,
+    target_action: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    target_mode: str,
+) -> dict[str, torch.Tensor | None]:
+    if mask.shape != pred_action.shape:
+        raise ValueError(f"mask shape {mask.shape} does not match prediction {pred_action.shape}")
+    slices = target_action_slices(target_mode)
+    total = _masked_mse_or_none(pred_action, target_action, mask, slices["total"])
+    if total is None:
+        raise ValueError("Masked MSE received a batch with zero visible action dimensions")
+    parts: dict[str, torch.Tensor | None] = {"total": total}
+    for name, slc in slices.items():
+        if name == "total":
+            continue
+        parts[name] = _masked_mse_or_none(pred_action, target_action, mask, slc)
+    return parts
+
+
+def masked_sse_counts(
+    pred_action: torch.Tensor,
+    target_action: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    target_mode: str,
+) -> dict[str, tuple[float, float]]:
+    if mask.shape != pred_action.shape:
+        raise ValueError(f"mask shape {mask.shape} does not match prediction {pred_action.shape}")
+    diff = (pred_action - target_action) ** 2
+    mask = mask.to(dtype=diff.dtype)
+    slices = target_action_slices(target_mode)
+
+    def part(slc: slice) -> tuple[float, float]:
+        part_mask = mask[:, slc]
+        return (
+            float((diff[:, slc] * part_mask).sum().detach().cpu()),
+            float(part_mask.sum().detach().cpu()),
+        )
+
+    return {name: part(slc) for name, slc in slices.items()}
+
+
+def sse_target_sse_parts(
+    pred_action: torch.Tensor,
+    target_action: torch.Tensor,
+    *,
+    target_mode: str,
+) -> dict[str, tuple[float, float]]:
+    diff = (pred_action - target_action) ** 2
+    target_sq = target_action ** 2
+    slices = target_action_slices(target_mode)
+    return {
+        name: (
+            float(diff[:, slc].sum().detach().cpu()),
+            float(target_sq[:, slc].sum().detach().cpu()),
+        )
+        for name, slc in slices.items()
+    }
+
+
+def masked_sse_target_sse_parts(
+    pred_action: torch.Tensor,
+    target_action: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    target_mode: str,
+) -> dict[str, tuple[float, float]]:
+    if mask.shape != pred_action.shape:
+        raise ValueError(f"mask shape {mask.shape} does not match prediction {pred_action.shape}")
+    diff = (pred_action - target_action) ** 2
+    target_sq = target_action ** 2
+    mask = mask.to(dtype=diff.dtype)
+    slices = target_action_slices(target_mode)
+    return {
+        name: (
+            float((diff[:, slc] * mask[:, slc]).sum().detach().cpu()),
+            float((target_sq[:, slc] * mask[:, slc]).sum().detach().cpu()),
+        )
+        for name, slc in slices.items()
+    }
+
+
+def tensor_or_nan(value: torch.Tensor | None) -> float:
+    if value is None:
+        return float("nan")
+    return float(value.detach().cpu())
 
 
 def weighted_action_loss(parts: dict[str, torch.Tensor],
@@ -490,6 +743,28 @@ def weighted_action_loss(parts: dict[str, torch.Tensor],
     return (
         parts["arm"] * arm_weight + parts["hand"] * hand_weight
     ) / (arm_weight + hand_weight)
+
+
+def weighted_masked_action_loss(
+    parts: dict[str, torch.Tensor | None],
+    arm_weight: float,
+    hand_weight: float,
+) -> torch.Tensor:
+    if arm_weight <= 0.0 or hand_weight <= 0.0:
+        raise ValueError(
+            f"loss weights must be positive, got arm={arm_weight}, hand={hand_weight}"
+        )
+    weighted = []
+    weights = []
+    if parts["arm"] is not None:
+        weighted.append(parts["arm"] * arm_weight)
+        weights.append(arm_weight)
+    if parts["hand"] is not None:
+        weighted.append(parts["hand"] * hand_weight)
+        weights.append(hand_weight)
+    if not weighted:
+        raise ValueError("Masked loss has neither visible arm nor visible hand dimensions")
+    return sum(weighted) / sum(weights)
 
 
 def encode_batch(vae, frames: list[np.ndarray], device: str) -> torch.Tensor:
@@ -509,7 +784,10 @@ def train(args: argparse.Namespace) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     resize = parse_resize(args.resize)
+    target_mode = validate_target_mode(args.target_mode)
+    action_dim = target_action_dim(target_mode)
     resolver = ActionResolver(Path(args.data_root))
+    action_mask_root = resolve_action_mask_root_arg(args)
     samples = discover_segment_clips(
         resolver,
         Path(args.segment_root),
@@ -519,6 +797,11 @@ def train(args: argparse.Namespace) -> None:
         num_frames=args.num_frames,
         target_fps=args.target_fps,
         seed=seed,
+        task_short=args.task_short,
+        target_mode=target_mode,
+        action_mask_root=action_mask_root,
+        action_mask_min_frame_ratio=args.action_mask_min_frame_ratio,
+        empty_action_mask_policy=args.empty_action_mask_policy,
     )
     train_samples, val_samples = split_samples(
         samples, args.train_ratio, args.split_by, seed,
@@ -544,15 +827,28 @@ def train(args: argparse.Namespace) -> None:
         f"val_episodes={len({s.episode for s in val_samples})}",
         flush=True,
     )
+    if action_mask_root is not None:
+        visible_counts = np.asarray([sample.visible_action_count for sample in samples], dtype=np.float32)
+        print(
+            f"action_mask_root={action_mask_root} "
+            f"min_frame_ratio={args.action_mask_min_frame_ratio:.3f} "
+            f"visible_action_count_mean={visible_counts.mean():.2f} "
+            f"visible_action_count_min={visible_counts.min():.0f} "
+            f"visible_action_count_max={visible_counts.max():.0f}",
+            flush=True,
+        )
 
     device = args.device
     vae = load_vae(args.vae_path, torch.bfloat16, home_device=device)
     for param in vae.parameters():
         param.requires_grad_(False)
     model = WanVaeActionHead(
+        action_dim=action_dim,
+        target_mode=target_mode,
         head_type=args.head_type,
         conv_channels=args.conv_channels,
         conv_blocks=args.conv_blocks,
+        readout_dim=args.readout_dim,
         hidden_dim=args.hidden_dim,
         mlp_layers=args.mlp_layers,
         dropout=args.dropout,
@@ -608,8 +904,9 @@ def train(args: argparse.Namespace) -> None:
             eval_history.append(row)
         last_eval_step = eval_step
         write_metric_rows(eval_history, out_dir / "eval_loss.csv")
-        if metrics["total_mse"] < best_eval_total:
-            best_eval_total = metrics["total_mse"]
+        selection_key = "masked_total_mse" if "masked_total_mse" in metrics else "total_mse"
+        if metrics[selection_key] < best_eval_total:
+            best_eval_total = metrics[selection_key]
             save_checkpoint(
                 model,
                 mean,
@@ -624,8 +921,9 @@ def train(args: argparse.Namespace) -> None:
             f"total_mse={metrics['total_mse']:.6f} "
             f"arm_mse={metrics['arm_mse']:.6f} "
             f"hand_mse={metrics['hand_mse']:.6f} "
+            f"select_{selection_key}={metrics[selection_key]:.6f} "
             f"mean_baseline_total_mse={metrics['mean_baseline_total_mse']:.6f} "
-            f"best_total_mse={best_eval_total:.6f}",
+            f"best_select_mse={best_eval_total:.6f}",
             flush=True,
         )
         return metrics
@@ -641,8 +939,30 @@ def train(args: argparse.Namespace) -> None:
             norm_target = (target - mean_dev) / std_dev
             latent = encode_batch(vae, batch["frames"], device)
             pred = model(latent)["action"]
-            parts = mse_parts(pred, norm_target)
-            loss = weighted_action_loss(parts, args.arm_loss_weight, args.hand_loss_weight)
+            unmasked_parts = mse_parts(pred, norm_target, target_mode=target_mode)
+            action_mask = batch.get("action_mask")
+            if action_mask is not None:
+                action_mask = action_mask.to(device)
+                parts = masked_mse_parts(
+                    pred,
+                    norm_target,
+                    action_mask,
+                    target_mode=target_mode,
+                )
+                if target_mode == "arm_hand":
+                    loss = weighted_masked_action_loss(
+                        parts, args.arm_loss_weight, args.hand_loss_weight,
+                    )
+                else:
+                    loss = parts["total"]
+                visible_count = float(action_mask.sum(dim=1).mean().detach().cpu())
+            else:
+                parts = unmasked_parts
+                if target_mode == "arm_hand":
+                    loss = weighted_action_loss(parts, args.arm_loss_weight, args.hand_loss_weight)
+                else:
+                    loss = parts["total"]
+                visible_count = float(action_dim)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
@@ -652,16 +972,27 @@ def train(args: argparse.Namespace) -> None:
             row = {
                 "step": step,
                 "loss": float(loss.detach().cpu()),
-                "unweighted_loss": float(parts["total"].detach().cpu()),
-                "arm_loss": float(parts["arm"].detach().cpu()),
-                "hand_loss": float(parts["hand"].detach().cpu()),
+                "unweighted_loss": tensor_or_nan(parts["total"]),
+                "arm_loss": tensor_or_nan(parts["arm"]),
+                "hand_loss": tensor_or_nan(parts["hand"]),
+                "unmasked_total_loss": float(unmasked_parts["total"].detach().cpu()),
+                "unmasked_arm_loss": float(unmasked_parts["arm"].detach().cpu()),
+                "unmasked_hand_loss": float(unmasked_parts["hand"].detach().cpu()),
+                "visible_action_count": visible_count,
                 "lr": float(optimizer.param_groups[0]["lr"]),
             }
+            for key, value in parts.items():
+                if key not in {"total", "arm", "hand"}:
+                    row[f"{key}_loss"] = tensor_or_nan(value)
+            for key, value in unmasked_parts.items():
+                if key not in {"total", "arm", "hand"}:
+                    row[f"unmasked_{key}_loss"] = float(value.detach().cpu())
             history.append(row)
             if step == 1 or step % args.log_every == 0 or step == args.steps:
                 print(
                     f"step={step:04d} loss={row['loss']:.6f} "
-                    f"arm={row['arm_loss']:.6f} hand={row['hand_loss']:.6f}",
+                    f"arm={row['arm_loss']:.6f} hand={row['hand_loss']:.6f} "
+                    f"visible={row['visible_action_count']:.1f}",
                     flush=True,
                 )
             if args.eval_every > 0 and (step % args.eval_every == 0 or step == args.steps):
@@ -687,13 +1018,7 @@ def train(args: argparse.Namespace) -> None:
         (out_dir / "best_val_metrics.json").write_text(
             json.dumps(best_metrics, ensure_ascii=False, indent=2)
         )
-    with (out_dir / "train_loss.csv").open("w", newline="") as fh:
-        writer = csv.DictWriter(
-            fh,
-            fieldnames=["step", "loss", "unweighted_loss", "arm_loss", "hand_loss", "lr"],
-        )
-        writer.writeheader()
-        writer.writerows(history)
+    write_metric_rows(history, out_dir / "train_loss.csv")
     plot_loss_curves(out_dir)
     print(json.dumps({"val": val_metrics, "out_dir": str(out_dir)}, indent=2), flush=True)
 
@@ -712,6 +1037,7 @@ def validate(
 ) -> dict[str, float]:
     if not samples:
         return {}
+    target_mode = validate_target_mode(args.target_mode)
     model.eval()
     val_subset = samples if args.val_max_samples <= 0 else samples[: args.val_max_samples]
     loader = torch.utils.data.DataLoader(
@@ -722,8 +1048,20 @@ def validate(
         collate_fn=collate_clip_batch,
         drop_last=False,
     )
-    sums = {"total": 0.0, "arm": 0.0, "hand": 0.0}
-    baseline_sums = {"total": 0.0, "arm": 0.0, "hand": 0.0}
+    metric_keys = list(target_action_slices(target_mode))
+    sums = {key: 0.0 for key in metric_keys}
+    baseline_sums = {key: 0.0 for key in metric_keys}
+    relative_sse = {key: 0.0 for key in metric_keys}
+    relative_target_sse = {key: 0.0 for key in metric_keys}
+    masked_sums = {key: 0.0 for key in metric_keys}
+    masked_counts = {key: 0.0 for key in metric_keys}
+    masked_baseline_sums = {key: 0.0 for key in metric_keys}
+    masked_baseline_counts = {key: 0.0 for key in metric_keys}
+    masked_relative_sse = {key: 0.0 for key in metric_keys}
+    masked_relative_target_sse = {key: 0.0 for key in metric_keys}
+    visible_action_counts = []
+    visible_arm_ratios = []
+    visible_hand_ratios = []
     pred_rows = []
     pred_chunks = []
     target_chunks = []
@@ -733,14 +1071,57 @@ def validate(
         latent = encode_batch(vae, batch["frames"], device)
         pred_norm = model(latent)["action"]
         pred = pred_norm * std + mean
-        parts = mse_parts(pred, target)
+        parts = mse_parts(pred, target, target_mode=target_mode)
+        rel_parts = sse_target_sse_parts(pred, target, target_mode=target_mode)
         baseline = mean.unsqueeze(0).expand_as(target)
-        baseline_parts = mse_parts(baseline, target)
+        baseline_parts = mse_parts(baseline, target, target_mode=target_mode)
+        action_mask = batch.get("action_mask")
         n = target.shape[0]
         count += n
         for key in sums:
             sums[key] += float(parts[key].detach().cpu()) * n
             baseline_sums[key] += float(baseline_parts[key].detach().cpu()) * n
+            part_sse, part_target_sse = rel_parts[key]
+            relative_sse[key] += part_sse
+            relative_target_sse[key] += part_target_sse
+        if action_mask is not None:
+            action_mask = action_mask.to(device)
+            pred_masked = masked_sse_counts(
+                pred,
+                target,
+                action_mask,
+                target_mode=target_mode,
+            )
+            baseline_masked = masked_sse_counts(
+                baseline,
+                target,
+                action_mask,
+                target_mode=target_mode,
+            )
+            rel_masked = masked_sse_target_sse_parts(
+                pred,
+                target,
+                action_mask,
+                target_mode=target_mode,
+            )
+            for key in masked_sums:
+                sse, denom = pred_masked[key]
+                base_sse, base_denom = baseline_masked[key]
+                part_sse, part_target_sse = rel_masked[key]
+                masked_sums[key] += sse
+                masked_counts[key] += denom
+                masked_baseline_sums[key] += base_sse
+                masked_baseline_counts[key] += base_denom
+                masked_relative_sse[key] += part_sse
+                masked_relative_target_sse[key] += part_target_sse
+            mask_cpu = action_mask.detach().cpu().numpy()
+            visible_action_counts.extend(mask_cpu.sum(axis=1).astype(float).tolist())
+            if target_mode == "arm_hand":
+                visible_arm_ratios.extend(mask_cpu[:, :ARM_DIM].mean(axis=1).astype(float).tolist())
+                visible_hand_ratios.extend(mask_cpu[:, ARM_DIM:].mean(axis=1).astype(float).tolist())
+            else:
+                visible_arm_ratios.extend(mask_cpu[:, 22:36].mean(axis=1).astype(float).tolist())
+                visible_hand_ratios.extend(mask_cpu[:, 36:48].mean(axis=1).astype(float).tolist())
         pred_cpu = pred.detach().cpu().numpy()
         target_cpu = target.detach().cpu().numpy()
         pred_chunks.append(pred_cpu)
@@ -754,11 +1135,21 @@ def validate(
                 "clip_start": sample.clip_start,
                 "clip_dur": sample.clip_dur,
                 "video_path": sample.video_path,
+                "visible_action_count": sample.visible_action_count,
+                "visible_arm_count": sample.visible_arm_count,
+                "visible_hand_count": sample.visible_hand_count,
+                "visible_action_ratio": sample.visible_action_ratio,
+                "visible_arm_ratio": sample.visible_arm_ratio,
+                "visible_hand_ratio": sample.visible_hand_ratio,
+                "action_mask_path": sample.action_mask_path,
             }
-            for dim in range(ACTION_DIM):
+            for dim in range(target_action_dim(target_mode)):
                 row[f"target_{dim:02d}"] = float(target_cpu[local_idx, dim])
                 row[f"pred_{dim:02d}"] = float(pred_cpu[local_idx, dim])
                 row[f"err_{dim:02d}"] = float(pred_cpu[local_idx, dim] - target_cpu[local_idx, dim])
+                if sample.action_mask is not None:
+                    row[f"mask_{dim:02d}"] = float(sample.action_mask[dim])
+                    row[f"mask_ratio_{dim:02d}"] = float(sample.action_mask_frame_ratio[dim])
             pred_rows.append(row)
     model.train()
     metrics = {f"{key}_mse": value / count for key, value in sums.items()}
@@ -766,16 +1157,42 @@ def validate(
         f"mean_baseline_{key}_mse": value / count
         for key, value in baseline_sums.items()
     })
+    for key in metric_keys:
+        denom = max(relative_target_sse[key], 1e-12)
+        metrics[f"{key}_relative_l2_error"] = float(math.sqrt(relative_sse[key] / denom))
+    if masked_counts["total"] > 0.0:
+        for key in masked_sums:
+            if masked_counts[key] > 0.0:
+                metrics[f"masked_{key}_mse"] = masked_sums[key] / masked_counts[key]
+                metrics[f"mean_baseline_masked_{key}_mse"] = (
+                    masked_baseline_sums[key] / masked_baseline_counts[key]
+                )
+                denom = max(masked_relative_target_sse[key], 1e-12)
+                metrics[f"masked_{key}_relative_l2_error"] = float(
+                    math.sqrt(masked_relative_sse[key] / denom)
+                )
+            else:
+                metrics[f"masked_{key}_mse"] = float("nan")
+                metrics[f"mean_baseline_masked_{key}_mse"] = float("nan")
+                metrics[f"masked_{key}_relative_l2_error"] = float("nan")
+        metrics["visible_action_count_mean"] = float(np.mean(visible_action_counts))
+        metrics["visible_action_ratio_mean"] = float(
+            np.mean(visible_action_counts) / target_action_dim(target_mode)
+        )
+        metrics["visible_arm_ratio_mean"] = float(np.mean(visible_arm_ratios))
+        metrics["visible_hand_ratio_mean"] = float(np.mean(visible_hand_ratios))
     pred_all = np.concatenate(pred_chunks, axis=0)
     target_all = np.concatenate(target_chunks, axis=0)
     pred_std = pred_all.std(axis=0)
     target_std = target_all.std(axis=0)
     metrics["pred_std_mean"] = float(pred_std.mean())
     metrics["target_std_mean"] = float(target_std.mean())
-    metrics["pred_arm_std_mean"] = float(pred_std[:ARM_DIM].mean())
-    metrics["target_arm_std_mean"] = float(target_std[:ARM_DIM].mean())
-    metrics["pred_hand_std_mean"] = float(pred_std[ARM_DIM:].mean())
-    metrics["target_hand_std_mean"] = float(target_std[ARM_DIM:].mean())
+    arm_slice = target_action_slices(target_mode)["arm"]
+    hand_slice = target_action_slices(target_mode)["hand"]
+    metrics["pred_arm_std_mean"] = float(pred_std[arm_slice].mean())
+    metrics["target_arm_std_mean"] = float(target_std[arm_slice].mean())
+    metrics["pred_hand_std_mean"] = float(pred_std[hand_slice].mean())
+    metrics["target_hand_std_mean"] = float(target_std[hand_slice].mean())
     if prediction_path is not None:
         write_prediction_rows(pred_rows, prediction_path)
     return metrics
@@ -892,10 +1309,12 @@ def save_checkpoint(
             "head_type": args.head_type,
             "conv_channels": args.conv_channels,
             "conv_blocks": args.conv_blocks,
+            "readout_dim": args.readout_dim,
             "hidden_dim": args.hidden_dim,
             "mlp_layers": args.mlp_layers,
             "dropout": args.dropout,
-            "action_dim": ACTION_DIM,
+            "action_dim": target_action_dim(args.target_mode),
+            "target_mode": args.target_mode,
             "arm_dim": ARM_DIM,
             "hand_dim": HAND_DIM,
         },
@@ -915,6 +1334,12 @@ def save_checkpoint(
             "hand_loss_weight": args.hand_loss_weight,
             "lr_scheduler": args.lr_scheduler,
             "min_lr_ratio": args.min_lr_ratio,
+            "target_mode": args.target_mode,
+            "action_mask_root": getattr(args, "action_mask_root", None),
+            "action_mask_min_frame_ratio": getattr(args, "action_mask_min_frame_ratio", None),
+            "empty_action_mask_policy": getattr(args, "empty_action_mask_policy", None),
+            "action_dim_names": list(action_dim_names_for_mode(args.target_mode)),
+            "action_dim_parts": list(action_dim_parts_for_mode(args.target_mode)),
         },
         "val_metrics": val_metrics,
     }
@@ -925,11 +1350,16 @@ def load_action_model(checkpoint: Path, device: str) -> tuple[WanVaeActionHead, 
     ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
     model_cfg = ckpt["model"]
     head_type = str(model_cfg.get("head_type", "residual"))
+    target_mode = str(model_cfg.get("target_mode", "arm_hand"))
+    action_dim = int(model_cfg.get("action_dim", target_action_dim(target_mode)))
     model = WanVaeActionHead(
         latent_channels=int(model_cfg["latent_channels"]),
+        action_dim=action_dim,
+        target_mode=target_mode,
         head_type=head_type,
         conv_channels=int(model_cfg["conv_channels"]),
         conv_blocks=int(model_cfg["conv_blocks"]),
+        readout_dim=int(model_cfg.get("readout_dim", 1024)),
         hidden_dim=int(model_cfg["hidden_dim"]),
         mlp_layers=int(model_cfg["mlp_layers"]),
         dropout=float(model_cfg["dropout"]),
@@ -949,6 +1379,7 @@ def record_action_target(
     segment_root: Path,
     task_short: str,
     task_full: str,
+    target_mode: str,
 ) -> np.ndarray:
     task = record.get("robot_task") or record.get("task")
     expected_tasks = {task_short, task_full}
@@ -968,7 +1399,23 @@ def record_action_target(
     clip_dur = float(record["clip_dur"])
     rel = clip_frame_indices(clip_start, clip_dur, num_frames, target_fps)
     abs_indices = [frame_start + idx for idx in rel]
-    return resolver.target_for_indices(episode, abs_indices)
+    return resolver.target_for_indices(episode, abs_indices, target_mode=target_mode)
+
+
+def record_action_mask(
+    record: dict,
+    mask_resolver: ActionMaskResolver,
+    num_frames: int,
+    target_fps: float,
+) -> ClipActionMask:
+    episode_raw = record.get("episode")
+    seg = record.get("seg")
+    if not episode_raw or not seg:
+        raise ValueError(f"Eval record missing episode/seg: {record}")
+    clip_start = float(record["clip_start"])
+    clip_dur = float(record["clip_dur"])
+    rel = clip_frame_indices(clip_start, clip_dur, num_frames, target_fps)
+    return mask_resolver.load_clip(str(episode_raw), str(seg), rel)
 
 
 @torch.no_grad()
@@ -1011,9 +1458,24 @@ def eval_existing(args: argparse.Namespace) -> None:
 
     device = args.device
     model, mean, std, ckpt = load_action_model(Path(args.checkpoint), device)
+    ckpt_target_mode = str(ckpt.get("model", {}).get("target_mode", "arm_hand"))
+    if args.target_mode != ckpt_target_mode:
+        raise ValueError(
+            f"--target-mode {args.target_mode!r} does not match checkpoint "
+            f"target_mode {ckpt_target_mode!r}"
+        )
     vae = load_vae(args.vae_path, torch.bfloat16, home_device=device)
     resolver = ActionResolver(Path(args.data_root))
     segment_root = Path(args.segment_root)
+    action_mask_root = resolve_action_mask_root_arg(args)
+    mask_resolver = None
+    if action_mask_root is not None:
+        mask_resolver = ActionMaskResolver(
+            action_mask_root,
+            args.task_short,
+            min_frame_ratio=args.action_mask_min_frame_ratio,
+            target_mode=args.target_mode,
+        )
 
     rows = []
     for idx, record in enumerate(records):
@@ -1026,6 +1488,7 @@ def eval_existing(args: argparse.Namespace) -> None:
             segment_root,
             args.task_short,
             args.task_full,
+            args.target_mode,
         )
         gt_pred = predict_video_action(
             eval_dir / f"gt_{sample_id}.mp4", model, vae, mean, std,
@@ -1035,7 +1498,23 @@ def eval_existing(args: argparse.Namespace) -> None:
             eval_dir / f"gen_{sample_id}.mp4", model, vae, mean, std,
             num_frames=args.num_frames, resize=resize, device=device,
         )
-        row = action_metric_row(sample_id, target, gt_pred, gen_pred)
+        clip_mask = None
+        if mask_resolver is not None:
+            clip_mask = record_action_mask(
+                record,
+                mask_resolver,
+                args.num_frames,
+                args.target_fps,
+            )
+            require_nonempty_clip_mask(sample_id, clip_mask, args.empty_action_mask_policy)
+        row = action_metric_row(
+            sample_id,
+            target,
+            gt_pred,
+            gen_pred,
+            clip_mask=clip_mask,
+            target_mode=args.target_mode,
+        )
         rows.append(row)
         if idx == 0 or (idx + 1) % args.log_every == 0 or idx + 1 == len(records):
             print(f"eval {idx + 1}/{len(records)} sample={sample_id}", flush=True)
@@ -1058,7 +1537,9 @@ def validate_checkpoint(args: argparse.Namespace) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     resize = parse_resize(args.resize)
+    target_mode = validate_target_mode(args.target_mode)
     resolver = ActionResolver(Path(args.data_root))
+    action_mask_root = resolve_action_mask_root_arg(args)
     samples = discover_segment_clips(
         resolver,
         Path(args.segment_root),
@@ -1068,11 +1549,22 @@ def validate_checkpoint(args: argparse.Namespace) -> None:
         num_frames=args.num_frames,
         target_fps=args.target_fps,
         seed=seed,
+        task_short=args.task_short,
+        target_mode=target_mode,
+        action_mask_root=action_mask_root,
+        action_mask_min_frame_ratio=args.action_mask_min_frame_ratio,
+        empty_action_mask_policy=args.empty_action_mask_policy,
     )
     _, val_samples = split_samples(samples, args.train_ratio, args.split_by, seed)
 
     device = args.device
     model, mean, std, ckpt = load_action_model(Path(args.checkpoint), device)
+    ckpt_target_mode = str(ckpt.get("model", {}).get("target_mode", "arm_hand"))
+    if args.target_mode != ckpt_target_mode:
+        raise ValueError(
+            f"--target-mode {args.target_mode!r} does not match checkpoint "
+            f"target_mode {ckpt_target_mode!r}"
+        )
     vae = load_vae(args.vae_path, torch.bfloat16, home_device=device)
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1099,34 +1591,85 @@ def action_metric_row(
     target: np.ndarray,
     gt_pred: np.ndarray,
     gen_pred: np.ndarray,
+    *,
+    clip_mask: ClipActionMask | None = None,
+    target_mode: str = "arm_hand",
 ) -> dict[str, float | str]:
     def mse(a: np.ndarray, b: np.ndarray) -> float:
         return float(np.mean((a - b) ** 2))
 
-    row = {
-        "sample_id": sample_id,
-        "gt_idm_arm_mse": mse(gt_pred[:ARM_DIM], target[:ARM_DIM]),
-        "gt_idm_hand_mse": mse(gt_pred[ARM_DIM:], target[ARM_DIM:]),
-        "gt_idm_arm_hand_mse": mse(gt_pred, target),
-        "gen_idm_arm_mse": mse(gen_pred[:ARM_DIM], target[:ARM_DIM]),
-        "gen_idm_hand_mse": mse(gen_pred[ARM_DIM:], target[ARM_DIM:]),
-        "gen_idm_arm_hand_mse": mse(gen_pred, target),
-    }
-    for part in ("arm", "hand", "arm_hand"):
+    def masked_mse(a: np.ndarray, b: np.ndarray, mask: np.ndarray) -> float:
+        visible = mask.astype(bool)
+        if int(visible.sum()) == 0:
+            raise ValueError(f"Empty action mask for eval sample {sample_id}")
+        return float(np.mean((a[visible] - b[visible]) ** 2))
+
+    slices = target_action_slices(target_mode)
+    action_dim = target_action_dim(target_mode)
+    row: dict[str, float | str] = {"sample_id": sample_id}
+    if target_mode == "arm_hand":
+        eval_parts = {
+            "arm": slices["arm"],
+            "hand": slices["hand"],
+            "arm_hand": slices["total"],
+        }
+    else:
+        eval_parts = slices
+    for part, slc in eval_parts.items():
+        row[f"gt_idm_{part}_mse"] = mse(gt_pred[slc], target[slc])
+        row[f"gen_idm_{part}_mse"] = mse(gen_pred[slc], target[slc])
+    for part in eval_parts:
         gt_key = f"gt_idm_{part}_mse"
         gen_key = f"gen_idm_{part}_mse"
         gap = float(row[gen_key]) - float(row[gt_key])
         ratio = float(row[gen_key]) / max(float(row[gt_key]), 1e-12)
         row[f"idm_{part}_gap"] = gap
         row[f"idm_{part}_ratio"] = ratio
+    if clip_mask is not None:
+        mask = clip_mask.mask.astype(bool)
+        row.update({
+            "visible_action_count": clip_mask.visible_action_count,
+            "visible_arm_count": clip_mask.visible_arm_count,
+            "visible_hand_count": clip_mask.visible_hand_count,
+            "visible_action_ratio": clip_mask.visible_action_ratio,
+            "visible_arm_ratio": clip_mask.visible_arm_ratio,
+            "visible_hand_ratio": clip_mask.visible_hand_ratio,
+            "action_mask_path": clip_mask.mask_path,
+        })
+        for part, slc in eval_parts.items():
+            part_mask = mask[slc]
+            if int(part_mask.sum()) > 0:
+                row[f"gt_idm_masked_{part}_mse"] = masked_mse(
+                    gt_pred[slc], target[slc], part_mask,
+                )
+                row[f"gen_idm_masked_{part}_mse"] = masked_mse(
+                    gen_pred[slc], target[slc], part_mask,
+                )
+            else:
+                row[f"gt_idm_masked_{part}_mse"] = float("nan")
+                row[f"gen_idm_masked_{part}_mse"] = float("nan")
+        for part in eval_parts:
+            gt_key = f"gt_idm_masked_{part}_mse"
+            gen_key = f"gen_idm_masked_{part}_mse"
+            gap = float(row[gen_key]) - float(row[gt_key])
+            ratio = float(row[gen_key]) / max(float(row[gt_key]), 1e-12)
+            row[f"idm_masked_{part}_gap"] = gap
+            row[f"idm_masked_{part}_ratio"] = ratio
+        for dim in range(action_dim):
+            row[f"mask_{dim:02d}"] = float(mask[dim])
+            row[f"mask_ratio_{dim:02d}"] = float(clip_mask.frame_ratios[dim])
     return row
 
 
 def summarize_action_rows(rows: list[dict[str, float | str]]) -> dict[str, float | int]:
-    keys = [key for key in rows[0] if key != "sample_id"]
+    keys = [
+        key for key, value in rows[0].items()
+        if key != "sample_id" and isinstance(value, (int, float, np.integer, np.floating))
+    ]
     summary: dict[str, float | int] = {"n_samples": len(rows)}
     for key in keys:
-        summary[key] = float(np.mean([float(row[key]) for row in rows]))
+        values = np.asarray([float(row[key]) for row in rows], dtype=np.float64)
+        summary[key] = float(np.nanmean(values))
     return summary
 
 
@@ -1159,11 +1702,13 @@ def build_parser() -> argparse.ArgumentParser:
     train_p.add_argument("--steps", type=int, default=80)
     train_p.add_argument("--batch-size", type=int, default=1)
     train_p.add_argument("--workers", type=int, default=0)
-    train_p.add_argument("--head-type", choices=["small", "residual"], default="small")
-    train_p.add_argument("--conv-channels", type=int, default=128)
-    train_p.add_argument("--conv-blocks", type=int, default=2)
-    train_p.add_argument("--hidden-dim", type=int, default=256)
-    train_p.add_argument("--mlp-layers", type=int, default=2)
+    train_p.add_argument("--head-type", choices=["cnn_mlp"], default="cnn_mlp")
+    train_p.add_argument("--conv-channels", type=int, default=256)
+    train_p.add_argument("--conv-blocks", type=int, default=4,
+                         help="3D CNN blocks; second block downsamples Wan VAE 16x16 latent to 8x8")
+    train_p.add_argument("--readout-dim", type=int, default=1024)
+    train_p.add_argument("--hidden-dim", type=int, default=1024)
+    train_p.add_argument("--mlp-layers", type=int, default=3)
     train_p.add_argument("--dropout", type=float, default=0.0)
     train_p.add_argument("--lr", type=float, default=1e-3)
     train_p.add_argument("--weight-decay", type=float, default=1e-4)
@@ -1226,6 +1771,35 @@ def add_common_data_args(parser: argparse.ArgumentParser) -> None:
                         help="WIDTHxHEIGHT for Wan VAE input, or 'native'")
     parser.add_argument("--num-frames", type=int, default=DEFAULT_NUM_FRAMES)
     parser.add_argument("--target-fps", type=float, default=DEFAULT_TARGET_FPS)
+    parser.add_argument(
+        "--target-mode",
+        choices=list(TARGET_MODES),
+        default="arm_hand",
+        help=(
+            "arm_hand predicts action.ee_action + action.hand_cmd (24 dims); "
+            "full_body predicts action.robot_q_desired + action.hand_cmd (48 dims)"
+        ),
+    )
+    parser.add_argument(
+        "--action-mask-root",
+        default=None,
+        help=(
+            "optional visible action mask root; use 'default' for "
+            "training_data/action_mask. If set, missing or mismatched masks error."
+        ),
+    )
+    parser.add_argument(
+        "--action-mask-min-frame-ratio",
+        type=float,
+        default=0.25,
+        help="clip dimension is visible when this ratio of selected frames is visible",
+    )
+    parser.add_argument(
+        "--empty-action-mask-policy",
+        choices=["error", "drop"],
+        default="error",
+        help="error on clips with zero visible dimensions, or drop them during discovery",
+    )
 
 
 def main() -> None:
