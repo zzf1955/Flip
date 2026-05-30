@@ -1,5 +1,24 @@
 # 需求日志
 
+## 2026-05-30
+
+**用户原始需求：**
+> 新写一个 IDM：明确 action 与相邻帧状态的关系；看到两帧预测两帧之间的 action；
+> 使用小 CNN；手部和胳膊训练两个小网络，而不是混在一起。
+
+**创建的任务：**
+- [051] 两帧小 CNN 双网络 IDM
+
+**完成改动：**
+- 新增 `src.pipeline.wan_pair_idm`：使用相邻 RGB 帧 `(s_t, s_{t+1})` 预测
+  `a_t`，明确 action 对齐为 `frame_index=t` 的 `action.ee_action` /
+  `action.hand_cmd`。
+- arm 与 hand 使用两套独立小 CNN，在同一训练入口中同时训练、保存和评估。
+- `scripts/flip_run.sh` 新增 `wan_pair_idm` 子命令；文档记录 smoke、正式训练和
+  held-out validate 命令。
+
+---
+
 ## 2026-05-07
 
 **用户原始需求：**
