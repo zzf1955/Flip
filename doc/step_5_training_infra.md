@@ -496,7 +496,8 @@ Collect Clothes episode held-out 验证显示大 residual head 更容易保守�
 `--task-short` / `--task-full` 显式切到其他 MainCamOnly 任务；脚本不会在任务名
 不匹配时隐式 fallback。
 
-训练标签直接从原始 LeRobot parquet 读取：
+训练标签直接从原始 LeRobot parquet 读取；脚本会读取 `data/chunk-*/*.parquet`
+下所有 parquet 文件，不再假设每个任务只有 `file-000.parquet`：
 
 - `action.ee_action`：12 维双臂末端执行器 action。
 - `action.hand_cmd`：12 维双手命令。
@@ -563,6 +564,38 @@ scripts/flip_run.sh wan_vae_idm --cuda 2 -- eval \
 `gen_idm_arm_hand_mse`，以及对应的 `idm_*_gap` / `idm_*_ratio`。其中 GT
 视频上的 IDM error 作为该监督模型在真实视频上的误差下限，生成视频指标越接近
 GT 下限，说明 arm-hand action cue 越一致。
+
+三任务 H2R Baseline/Ours 生成视频 action 复算使用 `eval-h2r` 子命令。该入口按
+`robot_task` 分派到 Collect Clothes、Washing Machine、Pickup Pillow 三个 IDM
+checkpoint，只接受这三个任务；records 中出现其它任务会直接失败。当前只统计
+`augment=normal` 的 records，跳过 hflip 增强样本，避免翻转视频和未翻转 action label
+不一致污染 action 误差。Washing Machine
+历史 eval records 可能使用无 `MainCamOnly` 后缀的
+`Inspire_Put_Clothes_into_Washing_Machine`，脚本会显式把它映射到
+Washing Machine checkpoint，同时仍从对应无后缀原始数据和 segment 中解析 GT action。
+
+示例命令：
+
+```bash
+scripts/flip_run.sh wan_vae_idm --cuda 2 -- eval-h2r \
+  --device cuda:0 \
+  --run Baseline=training_data/log/final_mitty_0507_004901-h2r_1s-400d_r96_self_qkv_1000s_0507_004922 \
+  --run Ours=training_data/log/final_ours_step3_0507_004839-h2r_1s-400d_r96_self_qkvo_ffn_1000s_0507_051842 \
+  --collect-checkpoint .worktrees/t047/tmp/wan_vae_idm_collect_stride05_s4000_arm2_cosine/best_checkpoint.pt \
+  --wash-checkpoint .worktrees/t048/tmp/wan_vae_idm_wash_stride05_s4000_arm2_cosine/best_checkpoint.pt \
+  --pillow-checkpoint .worktrees/t048/tmp/wan_vae_idm_pillow_stride05_s4000_arm2_cosine/best_checkpoint.pt \
+  --output-dir output/idm_h2r_action_eval \
+  --resize 256x256
+```
+
+输出写到 `output/idm_h2r_action_eval/`，每个 run 子目录包含
+`per_sample_actions.jsonl`、`per_sample_metrics.csv`、`summary_by_task.csv` 和
+`config.json`。根目录额外包含跨 run 的 `per_sample_metrics.csv`、
+`summary_by_task.csv`、`summary_compare_baseline_ours.csv` 和 `config.json`。
+逐样本指标同时包含真实视频预测 action vs GT action、生成视频预测 action vs GT
+action、生成视频预测 action vs 真实视频预测 action 的 arm / hand / arm_hand MSE。
+`summary_compare_baseline_ours.csv` 中的 `delta_*` 字段定义为 Ours 减 Baseline；
+对 MSE / gap / ratio 来说，负值表示 Ours 更接近对应目标。
 
 如需在已有 `full_eval/` 视频上同时查看前景 patch 与前景 patch 之外的背景
 patch 分布差异，可使用独立脚本：
