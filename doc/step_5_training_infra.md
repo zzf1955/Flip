@@ -665,6 +665,70 @@ scripts/flip_run.sh wan_vae_idm --cuda 2 -- eval \
 `mask_XX` / `mask_ratio_XX`。其中 GT 视频上的 IDM error 作为该监督模型在真实
 视频上的误差下限，生成视频指标越接近 GT 下限，说明 arm-hand action cue 越一致。
 
+### 两帧 Pair IDM
+
+`src.pipeline.wan_pair_idm` 是独立于 `wan_vae_idm` 的两帧 inverse dynamics
+baseline。它不加载 Wan VAE，而是直接读取 segment 视频中的相邻 RGB 帧，将
+`frame_t` 和 `frame_{t+1}` resize 后拼成 6 通道输入，并预测同一原始 LeRobot
+episode 中 `frame_index=t` 的 action。该脚本固定使用
+`(s_t, s_{t+1}) -> a_t` 对齐口径：
+
+- arm 网络预测 `action.ee_action` 12 维。
+- hand 网络预测 `action.hand_cmd` 12 维。
+- arm / hand 是两套独立小 CNN，在同一训练入口中同时训练和保存，不共享参数。
+
+训练输出包括 `train_loss.csv`、`eval_loss.csv`、`checkpoint.pt`、
+`best_checkpoint.pt`、`val_predictions.csv`、`best_val_predictions.csv` 和
+`loss_curve.png`。checkpoint 中分别保存 `arm_model_state` 与
+`hand_model_state`，并保存两类 action 各自的 mean/std。
+
+小规模 smoke 示例：
+
+```bash
+scripts/flip_run.sh wan_pair_idm --cuda 2 -- train \
+  --device cuda:0 \
+  --task-short Inspire_Pickup_Pillow_MainCamOnly \
+  --output-dir tmp/wan_pair_idm_pillow_smoke \
+  --max-samples 128 \
+  --steps 10 \
+  --batch-size 8 \
+  --eval-every 5 \
+  --val-max-samples 32 \
+  --resize 256x256
+```
+
+Pick up Pillow 正式训练示例：
+
+```bash
+scripts/flip_run.sh wan_pair_idm --cuda 2 -- train \
+  --device cuda:0 \
+  --task-short Inspire_Pickup_Pillow_MainCamOnly \
+  --output-dir tmp/wan_pair_idm_pillow_s4000 \
+  --max-samples 0 \
+  --steps 4000 \
+  --batch-size 16 \
+  --lr 1e-4 \
+  --lr-scheduler cosine \
+  --min-lr-ratio 0.05 \
+  --eval-every 250 \
+  --val-max-samples 2048 \
+  --resize 256x256
+```
+
+完整 held-out 复算：
+
+```bash
+scripts/flip_run.sh wan_pair_idm --cuda 2 -- validate \
+  --device cuda:0 \
+  --task-short Inspire_Pickup_Pillow_MainCamOnly \
+  --checkpoint tmp/wan_pair_idm_pillow_s4000/best_checkpoint.pt \
+  --output-dir tmp/wan_pair_idm_pillow_s4000/validate_all \
+  --max-samples 0 \
+  --val-max-samples 0 \
+  --batch-size 16 \
+  --resize 256x256
+```
+
 三任务 H2R Baseline/Ours 生成视频 action 复算使用 `eval-h2r` 子命令。该入口按
 `robot_task` 分派到 Collect Clothes、Washing Machine、Pickup Pillow 三个 IDM
 checkpoint，只接受这三个任务；records 中出现其它任务会直接失败。当前只统计
