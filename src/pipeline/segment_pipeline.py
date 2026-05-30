@@ -1,9 +1,9 @@
 """Batch pipeline: segment inpaint + human overlay.
 
 For each 4s video segment:
-  Phase A: FK → SAM2 prompts (extract frames + compute FK masks)
+  Phase A: FK → SAM2 prompts (extract frames + compute FK masks + original video)
   Phase B: SAM2 video segmentation (robot mask)
-  Phase C: Mask postprocess → ProPainter/LaMa inpaint (clean background)
+  Phase C: Mask postprocess → blur_r2r control preview + ProPainter/LaMa inpaint
   Phase D: SMPLH retarget → render human overlay on clean background
 
 Usage:
@@ -51,6 +51,8 @@ from src.core.data import open_video_writer, write_frame, close_video
 
 DEFAULT_INTERMEDIATE_ROOT = SEGMENT_PIPELINE_DIR
 DEFAULT_FINAL_ROOT = OVERLAY_4S_DIR
+DEFAULT_BLUR_R2R_KSIZE = 51
+DEFAULT_BLUR_R2R_PIXEL_EXPAND = 16
 
 # ── Body part definitions (from sam2_inpaint.py) ──
 
@@ -172,6 +174,107 @@ def mask_to_point_prompts(mask, bbox, neg_margin=16):
     return np.array(points, dtype=np.float32), np.array(labels, dtype=np.int32)
 
 
+def soften_blur_mask(mask, pixel_expand):
+    """Match blur_r2r mask feathering used by make_pair.py."""
+    out = cv2.GaussianBlur(mask, (7, 7), 0)
+    out = (out > 128).astype(np.uint8) * 255
+    d = 15 + 2 * pixel_expand
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (d, d))
+    out = cv2.dilate(out, kernel)
+    blur_k = 21 + 2 * (pixel_expand // 2)
+    if blur_k % 2 == 0:
+        blur_k += 1
+    out = cv2.GaussianBlur(out, (blur_k, blur_k), 0)
+    return out
+
+
+def blur_frame_in_mask(frame, soft_mask, ksize):
+    blurred = cv2.GaussianBlur(frame, (ksize, ksize), 0)
+    alpha = soft_mask.astype(np.float32) / 255.0
+    out = alpha[..., None] * blurred + (1.0 - alpha[..., None]) * frame
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def read_video_bgr(video_path, max_frames=None):
+    container = av.open(video_path)
+    stream = container.streams.video[0]
+    frames = []
+    for i, frame in enumerate(container.decode(stream)):
+        if max_frames is not None and i >= max_frames:
+            break
+        frames.append(frame.to_ndarray(format="bgr24"))
+    container.close()
+    if not frames:
+        raise RuntimeError(f"video has no frames: {video_path}")
+    return frames
+
+
+def read_mask_video(mask_video_path, max_frames=None):
+    frames = read_video_bgr(mask_video_path, max_frames=max_frames)
+    masks = []
+    for frame in frames:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        masks.append((gray > 128).astype(np.uint8) * 255)
+    return masks
+
+
+def write_video_bgr(frames, out_path, fps):
+    if not frames:
+        raise ValueError(f"no frames to write: {out_path}")
+    h, w = frames[0].shape[:2]
+    container, stream = open_video_writer(out_path, w, h, fps)
+    for frame in frames:
+        write_frame(container, stream, frame)
+    close_video(container, stream)
+
+
+def write_blur_r2r_video(frames, masks, out_path, fps,
+                         blur_ksize, pixel_expand):
+    if len(frames) != len(masks):
+        raise ValueError(
+            f"frame/mask count mismatch for blur_r2r video: "
+            f"frames={len(frames)}, masks={len(masks)}")
+    if not frames:
+        raise ValueError(f"no frames to write: {out_path}")
+
+    h, w = frames[0].shape[:2]
+    container, stream = open_video_writer(out_path, w, h, fps)
+    for frame, mask in zip(frames, masks):
+        if mask.shape[:2] != frame.shape[:2]:
+            raise ValueError(
+                f"mask/frame shape mismatch for blur_r2r video: "
+                f"mask={mask.shape[:2]}, frame={frame.shape[:2]}")
+        soft = soften_blur_mask(mask, pixel_expand)
+        write_frame(container, stream, blur_frame_in_mask(frame, soft, blur_ksize))
+    close_video(container, stream)
+
+
+def ensure_original_and_blur_outputs(seg_video, postproc_mask_video,
+                                     out_original, out_blur, fps,
+                                     max_frames, blur_ksize,
+                                     pixel_expand):
+    need_original = (
+        not os.path.isfile(out_original) or os.path.getsize(out_original) == 0)
+    need_blur = not os.path.isfile(out_blur) or os.path.getsize(out_blur) == 0
+    if not need_original and not need_blur:
+        return
+
+    frames = read_video_bgr(seg_video, max_frames=max_frames)
+    if need_original:
+        write_video_bgr(frames, out_original, fps)
+
+    if need_blur:
+        if (not os.path.isfile(postproc_mask_video)
+                or os.path.getsize(postproc_mask_video) == 0):
+            raise FileNotFoundError(
+                f"postprocessed SAM2 mask video missing for blur_r2r output: "
+                f"{postproc_mask_video}")
+        masks = read_mask_video(postproc_mask_video, max_frames=len(frames))
+        write_blur_r2r_video(
+            frames, masks, out_blur, fps,
+            blur_ksize=blur_ksize, pixel_expand=pixel_expand)
+
+
 # ── Model loading ──
 
 def load_models(device, sam2_model, inpaint_method, skip_human=False):
@@ -257,9 +360,10 @@ def process_segment(seg_info, task_manifest, models, args):
 
     Outputs:
       Intermediate (output/segment_pipeline/{task}/ep{N}/seg{M}/):
+        00_original.mp4,
         01_mesh_overlay.mp4, 02_mesh_mask.mp4, 03_mesh_bbox.mp4,
         04_sam2_mask.mp4, 05_sam2_postproc.mp4, 06_sam2_overlay.mp4,
-        07_inpaint.mp4
+        07_inpaint.mp4, 08_blur_r2r_control.mp4
       Final (training_data/overlay/4s/{task}/ep{N}/):
         seg{M}_human.mp4
     """
@@ -277,6 +381,7 @@ def process_segment(seg_info, task_manifest, models, args):
     inter_dir = os.path.join(args.intermediate_root, task_short,
                               f"ep{ep:03d}", f"seg{seg_idx:02d}")
     os.makedirs(inter_dir, exist_ok=True)
+    out00_original = os.path.join(inter_dir, "00_original.mp4")
     out01_overlay = os.path.join(inter_dir, "01_mesh_overlay.mp4")
     out02_mask = os.path.join(inter_dir, "02_mesh_mask.mp4")
     out03_bbox = os.path.join(inter_dir, "03_mesh_bbox.mp4")
@@ -284,6 +389,7 @@ def process_segment(seg_info, task_manifest, models, args):
     out05_postproc = os.path.join(inter_dir, "05_sam2_postproc.mp4")
     out06_overlay = os.path.join(inter_dir, "06_sam2_overlay.mp4")
     out07_inpaint = os.path.join(inter_dir, "07_inpaint.mp4")
+    out08_blur = os.path.join(inter_dir, "08_blur_r2r_control.mp4")
 
     final_dir = os.path.join(args.final_root, task_short, f"ep{ep:03d}")
     os.makedirs(final_dir, exist_ok=True)
@@ -293,13 +399,17 @@ def process_segment(seg_info, task_manifest, models, args):
         return os.path.isfile(p) and os.path.getsize(p) > 0
 
     # Resume: if human done (and we want it), skip entirely
+    original_done = _exists(out00_original)
+    blur_done = _exists(out08_blur)
     human_done = _exists(human_out)
     inpaint_done = _exists(out07_inpaint)
-    if args.resume and human_done and (args.skip_human or True):
-        print(f"  [{seg_id}] skipped (human exists)")
+    if args.resume and not args.skip_human and human_done and \
+            inpaint_done and original_done and blur_done:
+        print(f"  [{seg_id}] skipped (human/original/blur exist)")
         return True
-    if args.resume and args.skip_human and inpaint_done:
-        print(f"  [{seg_id}] skipped (inpaint exists, skip-human)")
+    if args.resume and args.skip_human and inpaint_done and \
+            original_done and blur_done:
+        print(f"  [{seg_id}] skipped (inpaint/original/blur exist, skip-human)")
         return True
 
     if not os.path.isfile(seg_video):
@@ -342,10 +452,14 @@ def process_segment(seg_info, task_manifest, models, args):
         if processed > 0:
             h, w = inpaint_frames[0].shape[:2]
         print(f"  [{seg_id}] reusing inpaint ({processed} frames)")
+        ensure_original_and_blur_outputs(
+            seg_video, out05_postproc, out00_original, out08_blur, fps,
+            max_frames=processed, blur_ksize=args.blur_ksize,
+            pixel_expand=args.blur_pixel_expand)
     else:
         # ──────────────────────────────────────
         # Phase A: Extract frames + FK + prompts
-        #   Writes: 01_mesh_overlay, 02_mesh_mask, 03_mesh_bbox
+        #   Writes: 00_original, 01_mesh_overlay, 02_mesh_mask, 03_mesh_bbox
         # ──────────────────────────────────────
         container_in = av.open(seg_video)
         stream_in = container_in.streams.video[0]
@@ -355,7 +469,7 @@ def process_segment(seg_info, task_manifest, models, args):
         prev_visible = set()
         frames_bgr = []
 
-        w01 = w02 = w03 = None  # writers init on first frame
+        w00 = w01 = w02 = w03 = None  # writers init on first frame
 
         for seq_idx_f, av_frame in enumerate(container_in.decode(stream_in)):
             if seq_idx_f >= n_frames:
@@ -378,9 +492,11 @@ def process_segment(seg_info, task_manifest, models, args):
                 img, mesh_cache, transforms, cam_params, h, w, cam_const)
 
             if w01 is None:
+                w00 = open_video_writer(out00_original, w, h, fps)
                 w01 = open_video_writer(out01_overlay, w, h, fps)
                 w02 = open_video_writer(out02_mask, w, h, fps)
                 w03 = open_video_writer(out03_bbox, w, h, fps)
+            write_frame(*w00, img)
             write_frame(*w01, fk_overlay)
             write_frame(*w02, cv2.cvtColor(fk_mask, cv2.COLOR_GRAY2BGR))
 
@@ -426,6 +542,7 @@ def process_segment(seg_info, task_manifest, models, args):
 
         container_in.close()
         processed = len(frames_bgr)
+        if w00: close_video(*w00)
         if w01: close_video(*w01)
         if w02: close_video(*w02)
         if w03: close_video(*w03)
@@ -473,7 +590,8 @@ def process_segment(seg_info, task_manifest, models, args):
 
         # ──────────────────────────────────────
         # Phase C: Mask postprocess + inpaint
-        #   Writes: 04_sam2_mask, 05_sam2_postproc, 06_sam2_overlay, 07_inpaint
+        #   Writes: 04_sam2_mask, 05_sam2_postproc, 06_sam2_overlay,
+        #           07_inpaint, 08_blur_r2r_control
         # ──────────────────────────────────────
         mask_png_dir = os.path.join(tmp_dir, "masks")
         os.makedirs(mask_png_dir, exist_ok=True)
@@ -481,6 +599,7 @@ def process_segment(seg_info, task_manifest, models, args):
         w04 = open_video_writer(out04_sam2, w, h, fps)
         w05 = open_video_writer(out05_postproc, w, h, fps)
         w06 = open_video_writer(out06_overlay, w, h, fps)
+        w08 = open_video_writer(out08_blur, w, h, fps)
 
         for i in range(processed):
             img = frames_bgr[i]
@@ -509,12 +628,15 @@ def process_segment(seg_info, task_manifest, models, args):
             write_frame(*w04, sam2_mask_img)
             write_frame(*w05, cv2.cvtColor(mask_binary, cv2.COLOR_GRAY2BGR))
             write_frame(*w06, sam2_overlay_img)
+            soft_mask = soften_blur_mask(mask_binary, args.blur_pixel_expand)
+            write_frame(*w08, blur_frame_in_mask(img, soft_mask, args.blur_ksize))
 
             cv2.imwrite(os.path.join(mask_png_dir, f"{i:05d}.png"), mask_binary)
 
         close_video(*w04)
         close_video(*w05)
         close_video(*w06)
+        close_video(*w08)
         del frame_part_masks
 
         # 07: inpaint
@@ -586,7 +708,8 @@ def process_segment(seg_info, task_manifest, models, args):
     # ──────────────────────────────────────
     # Phase D: SMPLH human overlay
     # ──────────────────────────────────────
-    if not args.skip_human and "smplh" in models:
+    if not args.skip_human and "smplh" in models and \
+            not (args.resume and human_done):
         smplh = models["smplh"]
         J_shaped = models["J_shaped"]
         v_shaped = models["v_shaped"]
@@ -732,11 +855,16 @@ def parse_args():
     p.add_argument("--negative-point-margin", type=int, default=16,
                    help="Pixel distance from bbox edge for SAM2 negative point prompts")
     p.add_argument("--min-visible-area", type=int, default=50)
+    p.add_argument("--blur-ksize", type=int, default=DEFAULT_BLUR_R2R_KSIZE,
+                   help="Odd Gaussian kernel size for 08_blur_r2r_control.mp4")
+    p.add_argument("--blur-pixel-expand", type=int,
+                   default=DEFAULT_BLUR_R2R_PIXEL_EXPAND,
+                   help="Pixel mask expansion before blur_r2r feathering")
     p.add_argument("--intermediate-root", type=str,
                    default=DEFAULT_INTERMEDIATE_ROOT,
-                   help="Output root for stages 1-7 (default: output/segment_pipeline)")
+                   help="Output root for stages 0-8 (default: output/segment_pipeline)")
     p.add_argument("--final-root", type=str, default=DEFAULT_FINAL_ROOT,
-                   help="Output root for stage 8 human render (default: training_data/overlay/4s)")
+                   help="Output root for final human render (default: training_data/overlay/4s)")
     p.add_argument("--resume", action="store_true")
     p.add_argument("--skip-human", action="store_true",
                    help="Only run inpaint, skip human overlay")
@@ -745,12 +873,18 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.blur_ksize <= 0 or args.blur_ksize % 2 == 0:
+        raise ValueError(f"--blur-ksize must be a positive odd integer: {args.blur_ksize}")
+    if args.blur_pixel_expand < 0:
+        raise ValueError(
+            f"--blur-pixel-expand must be non-negative: {args.blur_pixel_expand}")
 
     print("Segment Pipeline: Inpaint + Human Overlay")
     print(f"  Manifest: {args.manifest}")
     print(f"  Device: {args.device}")
     print(f"  Inpaint: {args.inpaint_method}")
     print(f"  SAM2: {args.sam2_model}")
+    print(f"  Blur R2R: ksize={args.blur_ksize}, pixel_expand={args.blur_pixel_expand}")
     print(f"  Intermediate: {args.intermediate_root}")
     print(f"  Final: {args.final_root}")
     if args.offset:

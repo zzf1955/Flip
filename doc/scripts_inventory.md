@@ -72,7 +72,7 @@ eval_metrics.py    ← torch, skimage, transformers (CLIP)
 
 | 脚本 | 功能 | 输入 | 输出 |
 |------|------|------|------|
-| `segment_pipeline.py` | **主 pipeline**：FK→SAM2→inpaint→SMPLH retarget→overlay | segment 视频 | `training_data/overlay/4s/` |
+| `segment_pipeline.py` | **主 pipeline**：FK→SAM2→inpaint→SMPLH retarget→overlay，并在中间目录展示原视频与 SAM2 mask blur_r2r control 视频 | segment 视频 | `output/segment_pipeline/`、`training_data/overlay/4s/` |
 | `body_fit_search.py` | 搜索 SMPLH body/hand scale 与 root offset，用 G1 mesh mask 量化贴合 | segment 视频 + joints parquet | `output/body_fit_search*/` |
 | `human_overlay.py` | SMPLH mesh 叠加到修复背景 | 修复视频 + retarget 数据 | overlay MP4 |
 | `retarget_video.py` | 3-panel 对比视频 [原始\|G1\|SMPLH] | episode 视频 | `output/human/retarget_video/` |
@@ -87,6 +87,7 @@ eval_metrics.py    ← torch, skimage, transformers (CLIP)
 | `run_r2h_synthesize_queue.py` | 按全局 `_syn` 目标总量计算每个 source task 的目标数，生成单 task `r2h_synthesize` 命令队列，并按用户提供的 CUDA 列表调度；每张卡一次跑一个任务，结束后取队列下一项 | segment + r2h checkpoint + CUDA 列表 | `training_data/pair/h2r/<duration>/<task>_syn/`、`training_data/log/r2h_synthesize_queue/<timestamp>/` |
 | `run_syn_error_analysis.py` | 独立分析脚本：默认取 in-task + OOD 的 `ep000`-`ep003`，从 4s segment 切成 1s 非重叠 robot clip，再用 r2h checkpoint 生成 syn human，结果不写入训练 pair | segment + r2h checkpoint | `output/syn_error_analysis/{robot,syn,compare}/1s/<task>/<episode>/`、`manifest.jsonl` |
 | `robot_patch.py` | 全身降质数据（FK mesh 或 SAM2 mask → blur/noise/mean） | segment + parquet/sam2_mask | `training_data/pair/1s_patch/` |
+| `scripts/backfill_segment_pipeline_blur.py` | 只用已有 `segment_pipeline` postprocess mask 补 `00_original.mp4` 与 `08_blur_r2r_control.mp4`，不重跑 FK/SAM2/inpaint/human | `output/segment_pipeline/` + `training_data/segment/` | `output/segment_pipeline/<task>/ep*/seg*/00_original.mp4`、`08_blur_r2r_control.mp4` |
 
 ### LoRA 训练
 
@@ -259,7 +260,7 @@ output/                          # per-worktree 实验产物
 │   ├── retarget_video/
 │   ├── cosmos_prepare/
 │   └── cosmos_regen/
-├── segment_pipeline/            # 主 pipeline 中间产物
+├── segment_pipeline/            # 主 pipeline 中间产物，含 00_original 与 08_blur_r2r_control
 └── human/                       # 人体重绘 / 中间可视化输出
 
 training_data/                   # per-worktree 训练数据

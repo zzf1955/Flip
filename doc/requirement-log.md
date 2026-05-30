@@ -976,6 +976,52 @@
 - `.gitignore`：加入 `cmd.sh` 与 `draft.md`，并从 Git 索引移除这两个已跟踪的本地草稿文件，保留工作区文件。
 - `.gitignore`：加入 `.env` / `.env.*`，避免本地 token 配置被误提交，同时保留 `.env.example` 可被跟踪。
 
+## 2026-05-17 — segment pipeline 展示 blur_r2r 构造
+
+**用户原始需求：**
+> `output/segment_pipeline` 里面已有 Mask，需要加上原视频，以及用这个 Mask 模糊过的视频，在 pipeline 中展示 blur r2r 数据构造过程。
+
+**直接修改：**
+- `src/pipeline/segment_pipeline.py`：中间产物新增 `00_original.mp4` 和 `08_blur_r2r_control.mp4`；后者使用 postprocess 后的 SAM2 mask，按正式 `blur_r2r` 默认参数 `blur_ksize=51`、`blur_pixel_expand=16` 做局部 Gaussian blur。
+- `src/pipeline/segment_pipeline.py`：`--resume` 会检查并补齐新增原视频/模糊视频，旧目录缺少这两个产物时不再只因 human/inpaint 已存在而跳过。
+- `doc/scripts_inventory.md`：同步记录 `segment_pipeline` 的新增中间产物。
+
+## 2026-05-17 — 单独补齐 segment_pipeline 原视频与 blur 视频
+
+**用户原始需求：**
+> 写一个单独的脚本，只补 blur 和原视频即可，其他不用重跑。
+
+**直接修改：**
+- 新增 `scripts/backfill_segment_pipeline_blur.py`：枚举已有 `output/segment_pipeline/<task>/ep*/seg*/05_sam2_postproc.mp4`，读取对应 `training_data/segment/<task>/ep*/seg*_video.mp4`，只生成 `00_original.mp4` 和 `08_blur_r2r_control.mp4`。
+- 脚本默认跳过已存在产物，支持 `--dry-run`、`--overwrite`、`--tasks`、`--episodes`、`--limit`，不调用 FK/SAM2/inpaint/human overlay。
+- `doc/scripts_inventory.md`：补充 backfill 脚本用途与输出路径。
+
+## 2026-05-29
+
+**用户原始需求：**
+> 用 Wan VAE 做 arm-hand IDM：输入视频输出手部+胳膊 action，接入离线 action consistency 指标，并跑小规模训练确认 action loss 是否下降。
+
+**创建的任务：**
+- [047] Wan VAE arm-hand IDM 动作一致性指标
+
+**进展更新：**
+- `t047` worktree 中新增 `src.pipeline.wan_vae_idm`，冻结 Wan VAE 训练 arm-hand Video2Action head，输出 `action.ee_action` 12 维 + `action.hand_cmd` 12 维。
+- 训练输出包含 `eval_loss.csv`、`loss_curve.png`、`best_checkpoint.pt`、`best_val_predictions.csv`，并新增 `validate` 子命令复算 checkpoint 的 held-out 指标。
+- 当前最好设置为 `clip_stride=0.5`、small head、`arm_loss_weight=2.0`、cosine LR、4000 step；全量 784 held-out clip 上 `total_mse=0.01109`、`arm_mse=0.02061`、`hand_mse=0.00156`，mean baseline `total_mse=0.07020`。
+
+## 2026-05-30 — IDM 可见关节 mask 与三任务 H2R action 复算
+
+**用户原始需求：**
+> task47 做了从视频重建 action 的实验，是为了验证我们生成的视频对下游的 action 相关任务有帮助。后续需要改进：当前视频不一定有胳膊和腿部，画面外 action 预测差；第二阶段机器人 blur 使用 Mesh，可初步判断哪些关节在画面中；新的策略是每帧计算画面中关节，loss 仅计算画面中的关节，并保存 action 部分 mask。还需要用 IDM 模型评估 H2R 外观编辑 Baseline/Ours 在生成视频上是否真的学到 action，比较真实视频提取 action、生成视频提取 action 和 GT 的差距。发布 task 时只在 pick up pillow、wash machine、pick up cloth 三个任务上跑，不做其它任务。
+
+**创建的任务：**
+- [049] Wan VAE IDM 可见关节 action mask 训练
+- [050] 三任务 H2R 生成视频 IDM action 复算实验
+
+**范围约束：**
+- 仅覆盖 `Inspire_Collect_Clothes_MainCamOnly`、`Inspire_Put_Clothes_into_Washing_Machine` / `Inspire_Put_Clothes_into_Washing_Machine_MainCamOnly`、`Inspire_Pickup_Pillow_MainCamOnly`。
+- H2R action 复算只比较用户指定的 Baseline 与 Ours 两个 run，不扩大到其它 checkpoint 或任务。
+
 ## 2026-05-30 — 三任务 H2R 生成视频 IDM action 复算
 
 **用户原始需求：**
