@@ -706,15 +706,17 @@ RGB 帧。H1 版本不再拆成旧 WBT 的 `ee_action` / `hand_cmd` 两个 12 �
 - 这次 H1 sweep 里，`d=1` 在 `1/2/4/8/16` 中最好，`best action_mse=0.107009`，
   比 mean baseline `0.110856` 略好；`d>1` 没有带来稳定提升，所以默认仍保持
   `frame_delta=1`。
-- 本地 smoke / sweep 使用了一个临时 symlink 数据根 `tmp/h1_t052_valid_200_v2`，
-  因为 `data/humanoid-everyday-h1-chunks0-6-8-200` 里有 13 个不可读 parquet 文件。
+- 当前仓库里的 `data/humanoid-everyday-h1-chunks0-6-8-200` 已重新复核：
+  所有 1600 个 parquet 都能按 `action/frame_index/next.done` 口径读取，且对应视频文件都存在。
+  task052 当时使用的临时 symlink 根 `tmp/h1_t052_valid_200_v2` 现在只作为历史记录保留，
+  不再是当前必需的替代数据根。
 
 H1 smoke 示例：
 
 ```bash
 scripts/flip_run.sh humanoid_pair_idm --cuda 2 -- train \
   --device cuda:0 \
-  --data-root /disk_n/zzf/flip/tmp/h1_t052_valid_200_v2 \
+  --data-root /disk_n/zzf/flip/data/humanoid-everyday-h1-chunks0-6-8-200 \
   --output-dir tmp/humanoid_pair_idm_h1_smoke \
   --max-samples 128 \
   --max-pairs-per-episode 4 \
@@ -732,7 +734,7 @@ H1 700 训练 / 100 eval / 1000 step 示例：
 ```bash
 scripts/flip_run.sh humanoid_pair_idm --cuda 2 -- train \
   --device cuda:0 \
-  --data-root /disk_n/zzf/flip/tmp/h1_t052_valid_200_v2 \
+  --data-root /disk_n/zzf/flip/data/humanoid-everyday-h1-chunks0-6-8-200 \
   --output-dir tmp/humanoid_pair_idm_h1_700train_100eval_s1000 \
   --max-samples 0 \
   --frame-stride 4 \
@@ -751,7 +753,7 @@ H1 interval sweep 示例：
 for d in 1 2 4 8 16; do
   scripts/flip_run.sh humanoid_pair_idm --cuda 2 -- train \
     --device cuda:0 \
-    --data-root /disk_n/zzf/flip/tmp/h1_t052_valid_200_v2 \
+    --data-root /disk_n/zzf/flip/data/humanoid-everyday-h1-chunks0-6-8-200 \
     --output-dir tmp/humanoid_pair_idm_h1_sweep_d${d} \
     --max-samples 512 \
     --max-pairs-per-episode 16 \
@@ -794,7 +796,7 @@ H1 action encoder smoke 示例：
 ```bash
 scripts/flip_run.sh adaworld_action_encoder --cuda 2 -- extract \
   --device cuda:0 \
-  --data-root /disk_n/zzf/flip/tmp/h1_t052_valid_200_v2 \
+  --data-root /disk_n/zzf/flip/data/humanoid-everyday-h1-chunks0-6-8-200 \
   --output-dir tmp/adaworld_action_encoder_h1_smoke \
   --max-samples 8 \
   --max-pairs-per-episode 1 \
@@ -802,8 +804,8 @@ scripts/flip_run.sh adaworld_action_encoder --cuda 2 -- extract \
   --dtype fp16
 ```
 
-如果使用原始 `data/humanoid-everyday-h1-chunks0-6-8-200`，需要先处理 task052 已发现的
-坏 parquet；入口默认对不可读 parquet 直接失败，不做静默跳过。
+如果使用原始 `data/humanoid-everyday-h1-chunks0-6-8-200`，当前复核没有发现不可读 parquet；
+入口仍然对不可读 parquet 直接失败，不做静默跳过。
 
 ### AdaWorld Latent Action Decoder
 

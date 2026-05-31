@@ -35,6 +35,9 @@
   `frame_delta=1`。
 - 发现 `data/humanoid-everyday-h1-chunks0-6-8-200` 含 13 个不可读 parquet，实际 smoke /
   sweep 使用了临时 symlink 根 `tmp/h1_t052_valid_200_v2`，没有修改原始数据。
+- 2026-05-31 复核当前数据根时，1600 个 parquet 均可按 `action/frame_index/next.done`
+  读取，且对应 `videos/chunk-*/egocentric/episode_*.mp4` 全部存在；当前无需删除坏数据或
+  从外网补源。
 - 同步更新 `doc/step_5_training_infra.md`、`doc/scripts_inventory.md`，把区间预测语义、
   sweep 结论和数据注意事项写回文档。
 
