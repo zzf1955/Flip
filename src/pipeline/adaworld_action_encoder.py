@@ -9,12 +9,20 @@ Humanoid Everyday H1 LeRobot layout:
 
   - data/chunk-*/episode_*.parquet provides frame indices and episode ends.
   - videos/chunk-*/egocentric/episode_*.mp4 provides RGB frames.
+
+The extractor streams outputs to disk as it runs:
+
+  - latent_actions.npy stores the latent matrix incrementally via memmap.
+  - manifest.jsonl is appended sample-by-sample.
+  - latent_actions.npz is written at the end for downstream consumers.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
+import os
 import random
 import subprocess
 import sys
@@ -26,6 +34,7 @@ import cv2
 import numpy as np
 import pandas as pd
 import torch
+from tqdm.auto import tqdm
 
 from src.core.config import MAIN_ROOT
 from src.pipeline.wan_pair_idm import write_json
@@ -341,13 +350,6 @@ def encode_batch(
     return z_mu.detach().float().cpu().numpy()
 
 
-def write_jsonl(rows: list[dict[str, Any]], path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        for row in rows:
-            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
-
-
 def extract_latents(args: argparse.Namespace) -> None:
     seed = int(args.seed)
     random.seed(seed)
@@ -389,22 +391,70 @@ def extract_latents(args: argparse.Namespace) -> None:
         pin_memory=device.type == "cuda",
     )
 
-    latent_chunks: list[np.ndarray] = []
-    manifest_rows: list[dict[str, Any]] = []
-    for batch in loader:
-        latents = encode_batch(model, batch["videos"], device=device, dtype=dtype)
-        latent_chunks.append(latents)
-        for local_idx, sample_idx in enumerate(batch["sample_index"]):
-            sample = samples[int(sample_idx)]
-            manifest_rows.append(
+    latent_npy_path = out_dir / "latent_actions.npy"
+    latent_memmap = np.lib.format.open_memmap(
+        latent_npy_path,
+        mode="w+",
+        dtype=np.float32,
+        shape=(len(samples), LATENT_DIM),
+    )
+    manifest_path = out_dir / "manifest.jsonl"
+    latent_value_count = float(len(samples) * LATENT_DIM)
+    latent_sum = 0.0
+    latent_sq_sum = 0.0
+    latent_min = float("inf")
+    latent_max = float("-inf")
+    with manifest_path.open("w", encoding="utf-8") as manifest_handle, tqdm(
+        total=len(samples),
+        desc="extracting latents",
+        unit="sample",
+        dynamic_ncols=True,
+    ) as progress:
+        for batch_idx, batch in enumerate(loader):
+            batch_size = len(batch["sample_index"])
+            latents = encode_batch(model, batch["videos"], device=device, dtype=dtype)
+            if latents.shape != (batch_size, LATENT_DIM):
+                raise ValueError(
+                    f"Expected latent batch shape {(batch_size, LATENT_DIM)}, got {latents.shape}"
+                )
+            if not np.isfinite(latents).all():
+                raise ValueError("AdaWorld latent action output contains non-finite values")
+            for local_idx, sample_idx in enumerate(batch["sample_index"]):
+                sample = samples[int(sample_idx)]
+                latent_row = latents[local_idx]
+                latent_row64 = latent_row.astype(np.float64, copy=False)
+                latent_memmap[int(sample_idx)] = latent_row
+                latent_sum += float(latent_row64.sum())
+                latent_sq_sum += float(np.square(latent_row64).sum())
+                latent_min = min(latent_min, float(latent_row.min()))
+                latent_max = max(latent_max, float(latent_row.max()))
+                manifest_handle.write(
+                    json.dumps(
+                        {
+                            **asdict(sample),
+                            "sample_index": int(sample_idx),
+                            "latent": [float(v) for v in latent_row.tolist()],
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+            manifest_handle.flush()
+            if (batch_idx + 1) % 32 == 0:
+                os.fsync(manifest_handle.fileno())
+            latent_memmap.flush()
+            progress.update(batch_size)
+            progress.set_postfix(
                 {
-                    **asdict(sample),
-                    "sample_index": int(sample_idx),
-                    "latent": [float(v) for v in latents[local_idx].tolist()],
+                    "batch": batch_idx + 1,
+                    "samples": progress.n,
                 }
             )
+        manifest_handle.flush()
+        os.fsync(manifest_handle.fileno())
+        latent_memmap.flush()
 
-    latent_actions = np.concatenate(latent_chunks, axis=0).astype(np.float32)
+    latent_actions = np.array(latent_memmap, copy=True)
     if latent_actions.shape != (len(samples), LATENT_DIM):
         raise ValueError(
             f"Expected latent array {(len(samples), LATENT_DIM)}, got {latent_actions.shape}"
@@ -420,15 +470,22 @@ def extract_latents(args: argparse.Namespace) -> None:
         rel_frame_t=np.asarray([sample.rel_frame_t for sample in samples], dtype=np.int64),
         rel_frame_tp1=np.asarray([sample.rel_frame_tp1 for sample in samples], dtype=np.int64),
     )
-    write_jsonl(manifest_rows, out_dir / "manifest.jsonl")
     summary = {
         "alignment": "(frame_t, frame_t+1) -> 32d_continuous_latent_action_z_t",
         "n_samples": int(latent_actions.shape[0]),
         "latent_dim": int(latent_actions.shape[1]),
-        "latent_mean": float(latent_actions.mean()),
-        "latent_std": float(latent_actions.std()),
-        "latent_min": float(latent_actions.min()),
-        "latent_max": float(latent_actions.max()),
+        "latent_mean": float(latent_sum / max(latent_value_count, 1.0)),
+        "latent_std": float(
+            math.sqrt(
+                max(
+                    latent_sq_sum / max(latent_value_count, 1.0)
+                    - (latent_sum / max(latent_value_count, 1.0)) ** 2,
+                    0.0,
+                )
+            )
+        ),
+        "latent_min": float(latent_min),
+        "latent_max": float(latent_max),
         "data_root": str(data_root),
         "adaworld_root": str(adaworld_root),
         "adaworld_revision": revision,
@@ -436,6 +493,7 @@ def extract_latents(args: argparse.Namespace) -> None:
         "resolution": int(args.resolution),
         "dtype": args.dtype,
         "device": str(device),
+        "latent_npy": str(latent_npy_path),
     }
     write_json(out_dir / "summary.json", summary)
     print(json.dumps({"summary": summary, "out_dir": str(out_dir)}, indent=2), flush=True)

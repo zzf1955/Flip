@@ -128,6 +128,10 @@
 **用户原始需求：**
 > 好的,你发布一个新的 task,在 1600 条 h1 的数据上,跑这个基于 Ada World 的 IDM.
 
+**用户追加需求：**
+> 在 H1 完整 1600 条数据上跑 AdaWorld latent decoder；全量 latent 提取需要进度条，
+> 并且数据要实时落盘，避免长时间无反馈和中途失败后完全丢失产物。
+
 **创建的任务：**
 - [057] AdaWorld latent action decoder H1 全量 1600 条训练
 
