@@ -22,6 +22,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from src.core.config import MAIN_ROOT
@@ -316,6 +317,179 @@ def collate_humanoid_pair_batch(items: list[dict]) -> dict:
     }
 
 
+def build_1d_sincos_embedding(positions: torch.Tensor, dim: int) -> torch.Tensor:
+    if dim % 2 != 0:
+        raise ValueError(f"sincos embedding dim must be even, got {dim}")
+    if positions.ndim != 1:
+        raise ValueError(f"positions must be 1D, got {positions.shape}")
+    half = dim // 2
+    omega = torch.arange(half, device=positions.device, dtype=torch.float32)
+    omega = 1.0 / (10000 ** (omega / max(half, 1)))
+    angles = positions.to(dtype=torch.float32)[:, None] * omega[None, :]
+    return torch.cat([torch.sin(angles), torch.cos(angles)], dim=1)
+
+
+def build_2d_sincos_embedding(grid_h: int, grid_w: int, dim: int, device: torch.device) -> torch.Tensor:
+    if dim % 4 != 0:
+        raise ValueError(f"2D sincos embedding dim must be divisible by 4, got {dim}")
+    ys, xs = torch.meshgrid(
+        torch.arange(grid_h, device=device, dtype=torch.float32),
+        torch.arange(grid_w, device=device, dtype=torch.float32),
+        indexing="ij",
+    )
+    y_embed = build_1d_sincos_embedding(ys.reshape(-1), dim // 2)
+    x_embed = build_1d_sincos_embedding(xs.reshape(-1), dim // 2)
+    return torch.cat([y_embed, x_embed], dim=1)
+
+
+class HumanoidPairTransformer(nn.Module):
+    def __init__(
+        self,
+        action_dim: int,
+        *,
+        patch_size: int = 32,
+        embed_dim: int = 256,
+        depth: int = 4,
+        num_heads: int = 8,
+        mlp_ratio: float = 4.0,
+        hidden_dim: int = 256,
+        dropout: float = 0.1,
+        attn_dropout: float = 0.0,
+    ):
+        super().__init__()
+        if action_dim <= 0:
+            raise ValueError(f"action_dim must be positive, got {action_dim}")
+        if patch_size <= 0:
+            raise ValueError(f"patch_size must be positive, got {patch_size}")
+        if embed_dim <= 0:
+            raise ValueError(f"embed_dim must be positive, got {embed_dim}")
+        if depth <= 0:
+            raise ValueError(f"depth must be positive, got {depth}")
+        if num_heads <= 0:
+            raise ValueError(f"num_heads must be positive, got {num_heads}")
+        if embed_dim % num_heads != 0:
+            raise ValueError(
+                f"embed_dim must be divisible by num_heads, got {embed_dim} / {num_heads}"
+            )
+        if mlp_ratio <= 0.0:
+            raise ValueError(f"mlp_ratio must be positive, got {mlp_ratio}")
+        if hidden_dim <= 0:
+            raise ValueError(f"hidden_dim must be positive, got {hidden_dim}")
+        if dropout < 0.0:
+            raise ValueError(f"dropout must be non-negative, got {dropout}")
+        if attn_dropout < 0.0:
+            raise ValueError(f"attn_dropout must be non-negative, got {attn_dropout}")
+        self.action_dim = int(action_dim)
+        self.patch_size = int(patch_size)
+        self.embed_dim = int(embed_dim)
+        self.depth = int(depth)
+        self.num_heads = int(num_heads)
+        self.mlp_ratio = float(mlp_ratio)
+        self.hidden_dim = int(hidden_dim)
+        self.dropout = float(dropout)
+        self.attn_dropout = float(attn_dropout)
+
+        self.patch_embed = nn.Conv2d(3, embed_dim, kernel_size=patch_size, stride=patch_size)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.frame_embed = nn.Parameter(torch.zeros(1, 2, 1, embed_dim))
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=num_heads,
+            dim_feedforward=int(embed_dim * mlp_ratio),
+            dropout=max(dropout, attn_dropout),
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=depth)
+        self.norm = nn.LayerNorm(embed_dim)
+        self.head = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, action_dim),
+        )
+        self.dropout_layer = nn.Dropout(dropout)
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+        nn.init.trunc_normal_(self.frame_embed, std=0.02)
+
+    def forward(self, frames: torch.Tensor) -> torch.Tensor:
+        if frames.ndim != 4 or frames.shape[1] != 6:
+            raise ValueError(f"Expected [B,6,H,W] frame pairs, got {frames.shape}")
+        b, _, h, w = frames.shape
+        if h % self.patch_size != 0 or w % self.patch_size != 0:
+            raise ValueError(
+                f"Input spatial size {h}x{w} must be divisible by patch_size={self.patch_size}"
+            )
+        pair = frames.float().view(b, 2, 3, h, w)
+        x = pair.reshape(b * 2, 3, h, w)
+        x = self.patch_embed(x)
+        ph, pw = x.shape[2], x.shape[3]
+        x = x.flatten(2).transpose(1, 2).contiguous()
+        x = x.view(b, 2, ph * pw, self.embed_dim)
+        pos = build_2d_sincos_embedding(ph, pw, self.embed_dim, x.device).to(dtype=x.dtype)
+        x = x + pos.unsqueeze(0).unsqueeze(0)
+        x = x + self.frame_embed[:, :2, :, :].to(dtype=x.dtype, device=x.device)
+        x = x.view(b, 2 * ph * pw, self.embed_dim)
+        cls = self.cls_token.to(dtype=x.dtype, device=x.device).expand(b, -1, -1)
+        x = torch.cat([cls, x], dim=1)
+        x = self.dropout_layer(x)
+        x = self.encoder(x)
+        x = self.norm(x[:, 0])
+        return self.head(x)
+
+
+def make_humanoid_model(args: argparse.Namespace) -> nn.Module:
+    if args.model_arch == "small_cnn":
+        return SmallPairCnn(
+            int(args.action_dim),
+            base_channels=args.base_channels,
+            hidden_dim=args.hidden_dim,
+            dropout=args.dropout,
+        )
+    if args.model_arch == "transformer":
+        return HumanoidPairTransformer(
+            int(args.action_dim),
+            patch_size=args.transformer_patch_size,
+            embed_dim=args.transformer_embed_dim,
+            depth=args.transformer_depth,
+            num_heads=args.transformer_num_heads,
+            mlp_ratio=args.transformer_mlp_ratio,
+            hidden_dim=args.hidden_dim,
+            dropout=args.transformer_dropout,
+            attn_dropout=args.transformer_attn_dropout,
+        )
+    raise ValueError(f"Unsupported model_arch={args.model_arch!r}")
+
+
+def humanoid_model_payload(args: argparse.Namespace) -> dict:
+    if args.model_arch == "small_cnn":
+        return {
+            "model_arch": "small_cnn",
+            "input_channels": 6,
+            "base_channels": args.base_channels,
+            "hidden_dim": args.hidden_dim,
+            "dropout": args.dropout,
+            "action_dim": args.action_dim,
+            "alignment": "humanoid_frame_pair_t_to_t_plus_d_predict_mean_action_t_to_t_plus_d",
+        }
+    if args.model_arch == "transformer":
+        return {
+            "model_arch": "transformer",
+            "action_dim": args.action_dim,
+            "patch_size": args.transformer_patch_size,
+            "embed_dim": args.transformer_embed_dim,
+            "depth": args.transformer_depth,
+            "num_heads": args.transformer_num_heads,
+            "mlp_ratio": args.transformer_mlp_ratio,
+            "hidden_dim": args.hidden_dim,
+            "dropout": args.transformer_dropout,
+            "attn_dropout": args.transformer_attn_dropout,
+            "alignment": "humanoid_frame_pair_t_to_t_plus_d_predict_mean_action_t_to_t_plus_d",
+        }
+    raise ValueError(f"Unsupported model_arch={args.model_arch!r}")
+
+
 def humanoid_target_stats(samples: list[HumanoidPairSample]) -> tuple[torch.Tensor, torch.Tensor]:
     action_arr = np.asarray([sample.action_target for sample in samples], dtype=np.float32)
     action_mean = action_arr.mean(axis=0)
@@ -325,7 +499,7 @@ def humanoid_target_stats(samples: list[HumanoidPairSample]) -> tuple[torch.Tens
 
 @torch.no_grad()
 def validate_humanoid_samples(
-    model: SmallPairCnn,
+    model: nn.Module,
     samples: list[HumanoidPairSample],
     resize: tuple[int, int] | None,
     action_mean: torch.Tensor,
@@ -412,7 +586,7 @@ def validate_humanoid_samples(
 
 
 def save_humanoid_checkpoint(
-    model: SmallPairCnn,
+    model: nn.Module,
     action_mean: torch.Tensor,
     action_std: torch.Tensor,
     args: argparse.Namespace,
@@ -425,20 +599,14 @@ def save_humanoid_checkpoint(
         "model_state": model.state_dict(),
         "action_mean": action_mean,
         "action_std": action_std,
-        "model": {
-            "input_channels": 6,
-            "base_channels": args.base_channels,
-            "hidden_dim": args.hidden_dim,
-            "dropout": args.dropout,
-            "action_dim": args.action_dim,
-            "alignment": "humanoid_frame_pair_t_to_t_plus_d_predict_mean_action_t_to_t_plus_d",
-        },
+        "model": humanoid_model_payload(args),
         "config": {
             "data_root": args.data_root,
             "resize": args.resize,
             "max_samples": args.max_samples,
             "seed": args.seed,
             "action_dim": args.action_dim,
+            "model_arch": args.model_arch,
             "split_by": args.split_by,
             "train_ratio": args.train_ratio,
             "train_samples": args.train_samples,
@@ -457,15 +625,31 @@ def save_humanoid_checkpoint(
     torch.save(payload, out_dir / filename)
 
 
-def load_humanoid_pair_idm(checkpoint: Path, device: str) -> tuple[SmallPairCnn, torch.Tensor, torch.Tensor, dict]:
+def load_humanoid_pair_idm(checkpoint: Path, device: str) -> tuple[nn.Module, torch.Tensor, torch.Tensor, dict]:
     ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
     model_cfg = ckpt["model"]
-    model = SmallPairCnn(
-        int(model_cfg["action_dim"]),
-        base_channels=int(model_cfg["base_channels"]),
-        hidden_dim=int(model_cfg["hidden_dim"]),
-        dropout=float(model_cfg["dropout"]),
-    ).to(device)
+    model_arch = str(model_cfg.get("model_arch", "small_cnn"))
+    if model_arch == "small_cnn":
+        model = SmallPairCnn(
+            int(model_cfg["action_dim"]),
+            base_channels=int(model_cfg["base_channels"]),
+            hidden_dim=int(model_cfg["hidden_dim"]),
+            dropout=float(model_cfg["dropout"]),
+        ).to(device)
+    elif model_arch == "transformer":
+        model = HumanoidPairTransformer(
+            int(model_cfg["action_dim"]),
+            patch_size=int(model_cfg["patch_size"]),
+            embed_dim=int(model_cfg["embed_dim"]),
+            depth=int(model_cfg["depth"]),
+            num_heads=int(model_cfg["num_heads"]),
+            mlp_ratio=float(model_cfg["mlp_ratio"]),
+            hidden_dim=int(model_cfg["hidden_dim"]),
+            dropout=float(model_cfg["dropout"]),
+            attn_dropout=float(model_cfg["attn_dropout"]),
+        ).to(device)
+    else:
+        raise ValueError(f"Unsupported checkpoint model_arch={model_arch!r}: {checkpoint}")
     model.load_state_dict(ckpt["model_state"], strict=True)
     model.eval()
     return model, ckpt["action_mean"].to(device), ckpt["action_std"].to(device), ckpt
@@ -567,6 +751,7 @@ def train_humanoid(args: argparse.Namespace) -> None:
     print(
         f"alignment=(frame_t,frame_t+{args.frame_delta})->mean(action_t:t+{args.frame_delta}) "
         f"dataset=humanoid_everyday_h1 "
+        f"model_arch={args.model_arch} "
         f"split_by={args.split_by} train_samples={len(train_samples)} "
         f"val_samples={len(val_samples)} train_episodes={len({s.episode for s in train_samples})} "
         f"val_episodes={len({s.episode for s in val_samples})}",
@@ -574,12 +759,7 @@ def train_humanoid(args: argparse.Namespace) -> None:
     )
 
     device = args.device
-    model = SmallPairCnn(
-        int(args.action_dim),
-        base_channels=args.base_channels,
-        hidden_dim=args.hidden_dim,
-        dropout=args.dropout,
-    ).to(device)
+    model = make_humanoid_model(args).to(device)
     print(
         f"trainable_params={count_trainable_parameters(model)} action_dim={args.action_dim}",
         flush=True,
@@ -782,6 +962,7 @@ def add_humanoid_data_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--data-root", default=None)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--resize", default="256x256")
+    parser.add_argument("--model-arch", choices=["small_cnn", "transformer"], default="transformer")
     parser.add_argument("--max-samples", type=int, default=0,
                         help="maximum discovered interval frame pairs; 0 keeps all")
     parser.add_argument("--seed", type=int, default=42)
@@ -792,6 +973,13 @@ def add_humanoid_data_args(parser: argparse.ArgumentParser) -> None:
                         help="frame interval d for (frame_t, frame_t+d) and mean action[t:t+d]")
     parser.add_argument("--max-pairs-per-episode", type=int, default=0,
                         help="maximum pair samples to keep per episode; 0 keeps all")
+    parser.add_argument("--transformer-patch-size", type=int, default=32)
+    parser.add_argument("--transformer-embed-dim", type=int, default=256)
+    parser.add_argument("--transformer-depth", type=int, default=4)
+    parser.add_argument("--transformer-num-heads", type=int, default=8)
+    parser.add_argument("--transformer-mlp-ratio", type=float, default=4.0)
+    parser.add_argument("--transformer-dropout", type=float, default=0.1)
+    parser.add_argument("--transformer-attn-dropout", type=float, default=0.0)
 
 
 def add_humanoid_split_args(parser: argparse.ArgumentParser) -> None:

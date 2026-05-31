@@ -726,7 +726,8 @@ episode 中 `frame_index=t` 的 action。该脚本固定使用
 Humanoid Everyday H1 子集使用独立 `src.pipeline.humanoid_pair_idm` 入口。该路径直接读取 LeRobot 目录：
 `data/chunk-*/*.parquet` 提供 `action`，`videos/chunk-*/egocentric/*.mp4` 提供
 RGB 帧。H1 版本不再拆成旧 WBT 的 `ee_action` / `hand_cmd` 两个 12 维头，而是
-训练一个单独小 CNN 输出完整 26 维 `action`：
+训练一个单独模型输出完整 26 维 `action`。当前默认 `--model-arch transformer`，
+也可以显式传 `--model-arch small_cnn` 复现实验对照：
 
 - 输入：`frame_t` 与 `frame_{t+d}` resize 后拼成 6 通道 RGB。
 - 输出：半开区间 `action[t:t+d]` 的均值，默认 `d=1`，`frame_delta` 记录这个区间
@@ -739,9 +740,16 @@ RGB 帧。H1 版本不再拆成旧 WBT 的 `ee_action` / `hand_cmd` 两个 12 �
   `--allow-cli-split` 才能继续用 CLI 参数复算。
 - 指标同时包含原始 MSE、mean baseline、normalized MSE、per-dim R2 / correlation
   和预测方差比，方便判断模型是否只是回归均值。
+- Transformer 架构把两帧 RGB 分别做 patch embedding，加入 CLS token、frame embedding
+  和 2D sin/cos 位置编码，再用 `TransformerEncoder` 聚合后回归 26 维 action。
+- task 太碎，当前架构对照不再默认按 task 切训练；使用 sample / episode split，并只把
+  task 作为数据背景和后续审计维度。
 - 这次 H1 sweep 里，`d=1` 在 `1/2/4/8/16` 中最好，`best action_mse=0.107009`，
   比 mean baseline `0.110856` 略好；`d>1` 没有带来稳定提升，所以默认仍保持
   `frame_delta=1`。
+- 同口径 `split-by sample`、`frame_stride=4`、`1000 step` 对照中，Transformer 明显优于
+  small CNN：normalized RMSE 为 `0.760`，small CNN 为 `0.980`，mean baseline 为
+  `1.001`；26 个 action 维度上 Transformer 均优于 CNN 和 mean baseline。
 - 当前仓库里的 `data/humanoid-everyday-h1-chunks0-6-8-200` 已重新复核：
   所有 1600 个 parquet 都能按 `action/frame_index/next.done` 口径读取，且对应视频文件都存在。
   task052 当时使用的临时 symlink 根 `tmp/h1_t052_valid_200_v2` 现在只作为历史记录保留，
@@ -762,7 +770,11 @@ scripts/flip_run.sh humanoid_pair_idm --cuda 2 -- train \
   --eval-every 5 \
   --val-max-samples 32 \
   --resize 256x256 \
-  --split-by episode
+  --split-by episode \
+  --model-arch transformer \
+  --transformer-embed-dim 128 \
+  --transformer-depth 2 \
+  --transformer-num-heads 4
 ```
 
 H1 700 训练 / 100 eval / 1000 step 示例：
@@ -780,7 +792,8 @@ scripts/flip_run.sh humanoid_pair_idm --cuda 2 -- train \
   --steps 1000 \
   --batch-size 16 \
   --eval-every 100 \
-  --resize 256x256
+  --resize 256x256 \
+  --model-arch transformer
 ```
 
 H1 interval sweep 示例：

@@ -70,6 +70,22 @@
 **创建的任务：**
 - [053] H1 全量 task 分组训练与 Transformer 架构探索
 
+**追加要求：**
+> task 太碎，之后训练不再区分 task；先尝试 Transformer。
+
+**直接修改：**
+- `src.pipeline.humanoid_pair_idm` 在主线已有 interval mean action 语义上新增
+  `--model-arch {transformer,small_cnn}`，默认使用 Transformer，保留 small CNN 作为
+  对照 baseline。
+- Transformer 入口使用两帧 RGB patch embedding、CLS token、frame embedding 和
+  `TransformerEncoder` 聚合后回归 26 维 action；checkpoint 保存完整架构配置，
+  `validate` / `eval` 可复用 Transformer checkpoint。
+- 后续架构对照不再默认按 task 切训练，沿用 sample / episode split；task 信息只作为数据审计
+  背景，不作为当前训练主轴。
+- 已完成同口径 sample split 对照：Transformer `1000 step` 的 normalized RMSE 为
+  `0.760`，small CNN 为 `0.980`，mean baseline 为 `1.001`；26 个 action 维度上
+  Transformer 均优于 CNN 和 mean baseline。
+
 **用户原始需求：**
 > 复现 `https://huggingface.co/Little-Podi/AdaWorld`，参考 task051；当前 IDM
 > 效果不好，希望从纯视觉输入中提取 action，先用 latent 空间表示 action，再接一个小
