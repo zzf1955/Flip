@@ -685,11 +685,24 @@ episode 中 `frame_index=t` 的 action。该脚本固定使用
 Humanoid Everyday H1 子集使用独立 `src.pipeline.humanoid_pair_idm` 入口。该路径直接读取 LeRobot 目录：
 `data/chunk-*/*.parquet` 提供 `action[t]`，`videos/chunk-*/egocentric/*.mp4` 提供
 相邻 RGB 帧。H1 版本不再拆成旧 WBT 的 `ee_action` / `hand_cmd` 两个 12 维头，而是
-训练一个单独小 CNN 输出完整 26 维 `action`：
+训练一个单独动作回归模型，当前默认架构改为 **Transformer**，同时保留 `small_cnn`
+作为对照 baseline：
 
 - 输入：`frame_t` 与 `frame_{t+1}` resize 后拼成 6 通道 RGB。
 - 输出：同一 episode/parquet 中 `frame_index=t` 的 `action`，默认 26 维。
 - 对齐口径仍为 `(s_t, s_{t+1}) -> a_t`；最后一帧不构成 pair。
+- 默认训练不再按 task 切分；如果只是做架构对照，优先使用 `--split-by sample`
+  或 `--split-by episode`。`--task-indexes` / `--tasks` / `--categories` 仍保留为
+  显式过滤工具，但不再是默认实验主线。
+- task 元信息仍来自同一数据根下的 `meta/tasks.jsonl` 和 `meta/episodes.jsonl`，
+  样本会记录 `task_index`、`task` 和 `category`，但这些信息现在主要用于审计、
+  统计和 per-task 指标，而不是训练切分主轴。缺少 metadata、episode 长度不一致、
+  parquet 内 `episode_index` / `task_index` 与 metadata 不一致都会直接报错。
+- `train` 会写 `split_manifest.json`，记录 filters、split 参数以及 train / val
+  的 task 分布；最终验证会额外写 `val_task_metrics.csv` 和
+  `best_val_task_metrics.csv`，包含每个 task 的 `action_mse`、mean baseline、
+  `variance_ratio`、relative L2 和预测/目标标准差。`validate` / `eval` 也会输出
+  task 级指标表，方便后续比较 Transformer 与 CNN。
 
 H1 smoke 示例：
 
@@ -725,6 +738,45 @@ scripts/flip_run.sh humanoid_pair_idm --cuda 2 -- train \
   --batch-size 16 \
   --eval-every 100 \
   --resize 256x256
+```
+
+H1 当前 Transformer baseline 的大数据训练示例。该命令先保持统一的样本级切分，
+用 Transformer 比对现有 CNN 基线：
+
+```bash
+scripts/flip_run.sh humanoid_pair_idm --cuda 2 -- train \
+  --device cuda:0 \
+  --data-root /disk_n/zzf/flip/data/humanoid-everyday-h1-chunks0-6-8-200 \
+  --output-dir output/humanoid_pair_idm/h1_transformer_baseline \
+  --max-samples 0 \
+  --frame-stride 4 \
+  --split-by sample \
+  --steps 1000 \
+  --batch-size 16 \
+  --eval-every 100 \
+  --val-max-samples 4096 \
+  --resize 256x256 \
+  --model-arch transformer \
+  --transformer-patch-size 32 \
+  --transformer-embed-dim 256 \
+  --transformer-depth 4 \
+  --transformer-num-heads 8
+```
+
+如果要做显式对照，可以临时切回小 CNN：
+
+```bash
+scripts/flip_run.sh humanoid_pair_idm --cuda 2 -- train \
+  --device cuda:0 \
+  --data-root /disk_n/zzf/flip/data/humanoid-everyday-h1-chunks0-6-8-200 \
+  --output-dir output/humanoid_pair_idm/h1_small_cnn_baseline \
+  --frame-stride 4 \
+  --split-by sample \
+  --steps 1000 \
+  --batch-size 16 \
+  --eval-every 100 \
+  --resize 256x256 \
+  --model-arch small_cnn
 ```
 
 小规模 smoke 示例：

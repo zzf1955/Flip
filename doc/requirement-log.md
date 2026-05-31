@@ -11,6 +11,24 @@
 **创建的任务：**
 - [053] H1 全量 task 分组训练与 Transformer 架构探索
 
+**追加要求：**
+> 先用当前架构在大数据集上训练，看效果再改架构。
+> 之后的训练不再区分 task，task 太碎了，先尝试 Transformer。
+
+**阶段改动：**
+- `src.pipeline.humanoid_pair_idm` 先保持当前 `SmallPairCnn` 架构不变，补齐
+  Humanoid Everyday H1 的 task-aware 数据路径：读取 `meta/tasks.jsonl` /
+  `meta/episodes.jsonl`，样本显式携带 `task_index`、`task`、`category`。
+- 训练入口新增 `--task-indexes`、`--tasks`、`--categories` 过滤，
+  `--split-by task|category` 和 `--val-task-indexes`，用于单 task、task group、
+  全量联合训练和跨 task holdout。
+- `train` 输出 `split_manifest.json`，最终验证输出 `val_task_metrics.csv` /
+  `best_val_task_metrics.csv`；`validate` / `eval` 同步输出 task 级 metrics，便于先看
+  当前小 CNN baseline 在大数据集上的 task 分布表现，再决定是否改 Transformer 架构。
+- 当前实验主线已经切换为 Transformer baseline：训练默认 `--model-arch transformer`，
+  默认 split 回到 sample/episode 级，不再把 task 作为主切分轴；task 信息仅用于审计
+  和 per-task 指标。
+
 ## 2026-05-30
 
 **用户原始需求：**
