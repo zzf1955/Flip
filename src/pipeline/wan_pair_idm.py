@@ -158,9 +158,16 @@ def discover_segment_pairs(
         if len(episode_values) != 1:
             raise ValueError(f"Segment parquet spans multiple episodes: {joints_path}")
         episode = int(episode_values[0])
-        frame_start = int(seg_df["frame_index"].min())
-        frame_end = int(seg_df["frame_index"].max())
+        frame_indices = np.sort(seg_df["frame_index"].to_numpy(dtype=np.int64))
+        frame_start = int(frame_indices[0])
+        frame_end = int(frame_indices[-1])
         frame_count = frame_end - frame_start + 1
+        expected_indices = np.arange(frame_start, frame_end + 1, dtype=np.int64)
+        if not np.array_equal(frame_indices, expected_indices):
+            raise ValueError(
+                f"Segment frame_index must be contiguous for video/action alignment: "
+                f"{joints_path}"
+            )
         if frame_count < 2:
             continue
         video_path = joints_path.with_name(
@@ -199,16 +206,24 @@ def read_video_pair_frames(
     path: str | Path,
     rel_frame_t: int,
     resize: tuple[int, int] | None,
+    rel_frame_tp1: int | None = None,
 ) -> np.ndarray:
     if rel_frame_t < 0:
         raise ValueError(f"rel_frame_t must be non-negative, got {rel_frame_t}")
+    if rel_frame_tp1 is None:
+        rel_frame_tp1 = rel_frame_t + 1
+    if rel_frame_tp1 <= rel_frame_t:
+        raise ValueError(
+            f"rel_frame_tp1 must be greater than rel_frame_t, got "
+            f"{rel_frame_tp1} <= {rel_frame_t}"
+        )
     video_path = str(path)
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"Failed to open video: {video_path}")
-    cap.set(cv2.CAP_PROP_POS_FRAMES, rel_frame_t)
     frames = []
-    for expected in (rel_frame_t, rel_frame_t + 1):
+    for expected in (rel_frame_t, rel_frame_tp1):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, expected)
         ok, frame_bgr = cap.read()
         if not ok:
             cap.release()
@@ -424,6 +439,88 @@ def mse_np(pred: np.ndarray, target: np.ndarray) -> float:
     return float(np.mean((pred - target) ** 2))
 
 
+def _valid_mean(values: np.ndarray, valid: np.ndarray) -> float:
+    if values.shape != valid.shape:
+        raise ValueError(f"valid mask shape {valid.shape} does not match values {values.shape}")
+    if int(valid.sum()) == 0:
+        return 0.0
+    return float(values[valid].mean())
+
+
+def action_regression_metrics(
+    pred: np.ndarray,
+    target: np.ndarray,
+    mean: np.ndarray,
+    std: np.ndarray,
+    *,
+    prefix: str,
+    dim_prefix: str | None = None,
+) -> dict[str, float]:
+    if pred.shape != target.shape:
+        raise ValueError(f"prediction shape {pred.shape} does not match target {target.shape}")
+    if pred.ndim != 2:
+        raise ValueError(f"Expected [N,D] predictions, got {pred.shape}")
+    if mean.shape != (pred.shape[1],) or std.shape != (pred.shape[1],):
+        raise ValueError(
+            f"Bad normalization shape for {prefix}: mean={mean.shape} std={std.shape} "
+            f"expected {(pred.shape[1],)}"
+        )
+    if np.any(std <= 0.0):
+        raise ValueError(f"{prefix} normalization std must be positive")
+
+    err = pred - target
+    norm_err = err / std[None, :]
+    dim_mse = np.mean(np.square(err), axis=0)
+    dim_norm_mse = np.mean(np.square(norm_err), axis=0)
+    pred_std = pred.std(axis=0)
+    target_std = target.std(axis=0)
+
+    target_centered = target - target.mean(axis=0, keepdims=True)
+    pred_centered = pred - pred.mean(axis=0, keepdims=True)
+    target_var_sse = np.square(target_centered).sum(axis=0)
+    pred_var_sse = np.square(pred_centered).sum(axis=0)
+    model_sse = np.square(err).sum(axis=0)
+
+    eps = 1e-12
+    r2_valid = target_var_sse > eps
+    r2 = np.zeros_like(dim_mse, dtype=np.float64)
+    r2[r2_valid] = 1.0 - model_sse[r2_valid] / target_var_sse[r2_valid]
+
+    corr_denom = np.sqrt(pred_var_sse * target_var_sse)
+    corr_valid = corr_denom > eps
+    corr = np.zeros_like(dim_mse, dtype=np.float64)
+    corr[corr_valid] = (pred_centered * target_centered).sum(axis=0)[corr_valid] / corr_denom[corr_valid]
+
+    std_ratio_valid = target_std > eps
+    std_ratio = np.zeros_like(dim_mse, dtype=np.float64)
+    std_ratio[std_ratio_valid] = pred_std[std_ratio_valid] / target_std[std_ratio_valid]
+
+    metrics: dict[str, float] = {
+        f"{prefix}_norm_mse": float(np.mean(np.square(norm_err))),
+        f"{prefix}_mean_dim_norm_mse": float(dim_norm_mse.mean()),
+        f"{prefix}_mean_dim_r2": _valid_mean(r2, r2_valid),
+        f"{prefix}_r2_valid_dims": float(r2_valid.sum()),
+        f"{prefix}_mean_dim_corr": _valid_mean(corr, corr_valid),
+        f"{prefix}_corr_valid_dims": float(corr_valid.sum()),
+        f"{prefix}_pred_std_ratio_mean": _valid_mean(std_ratio, std_ratio_valid),
+        f"{prefix}_pred_std_ratio_valid_dims": float(std_ratio_valid.sum()),
+    }
+    if dim_prefix is not None:
+        for dim in range(pred.shape[1]):
+            key = f"{dim_prefix}_{dim:02d}"
+            metrics[f"{key}_mse"] = float(dim_mse[dim])
+            metrics[f"{key}_norm_mse"] = float(dim_norm_mse[dim])
+            metrics[f"{key}_pred_std"] = float(pred_std[dim])
+            metrics[f"{key}_target_std"] = float(target_std[dim])
+            if std_ratio_valid[dim]:
+                metrics[f"{key}_pred_std_ratio"] = float(std_ratio[dim])
+            if r2_valid[dim]:
+                metrics[f"{key}_r2"] = float(r2[dim])
+            if corr_valid[dim]:
+                metrics[f"{key}_corr"] = float(corr[dim])
+    return metrics
+
+
 @torch.no_grad()
 def validate_samples(
     bundle: PairIdmBundle,
@@ -501,8 +598,12 @@ def validate_samples(
     hand_pred_all = np.concatenate(hand_pred_chunks, axis=0)
     arm_target_all = np.concatenate(arm_target_chunks, axis=0)
     hand_target_all = np.concatenate(hand_target_chunks, axis=0)
-    arm_baseline = arm_mean.detach().cpu().numpy()[None, :]
-    hand_baseline = hand_mean.detach().cpu().numpy()[None, :]
+    arm_mean_np = arm_mean.detach().cpu().numpy()
+    hand_mean_np = hand_mean.detach().cpu().numpy()
+    arm_std_np = arm_std.detach().cpu().numpy()
+    hand_std_np = hand_std.detach().cpu().numpy()
+    arm_baseline = arm_mean_np[None, :]
+    hand_baseline = hand_mean_np[None, :]
     arm_mse = mse_np(arm_pred_all, arm_target_all)
     hand_mse = mse_np(hand_pred_all, hand_target_all)
     baseline_arm_mse = mse_np(np.broadcast_to(arm_baseline, arm_target_all.shape), arm_target_all)
@@ -533,6 +634,35 @@ def validate_samples(
         "hand_pred_std_mean": float(hand_pred_all.std(axis=0).mean()),
         "hand_target_std_mean": float(hand_target_all.std(axis=0).mean()),
     }
+    metrics.update(
+        action_regression_metrics(
+            arm_pred_all,
+            arm_target_all,
+            arm_mean_np,
+            arm_std_np,
+            prefix="arm",
+            dim_prefix="arm_dim",
+        )
+    )
+    metrics.update(
+        action_regression_metrics(
+            hand_pred_all,
+            hand_target_all,
+            hand_mean_np,
+            hand_std_np,
+            prefix="hand",
+            dim_prefix="hand_dim",
+        )
+    )
+    metrics.update(
+        action_regression_metrics(
+            np.concatenate([arm_pred_all, hand_pred_all], axis=1),
+            np.concatenate([arm_target_all, hand_target_all], axis=1),
+            np.concatenate([arm_mean_np, hand_mean_np], axis=0),
+            np.concatenate([arm_std_np, hand_std_np], axis=0),
+            prefix="total",
+        )
+    )
     if prediction_path is not None:
         write_rows(pred_rows, prediction_path)
     return metrics
@@ -572,6 +702,8 @@ def save_checkpoint(
             "data_root": args.data_root,
             "segment_root": args.segment_root,
             "resize": args.resize,
+            "max_samples": args.max_samples,
+            "seed": args.seed,
             "split_by": args.split_by,
             "train_ratio": args.train_ratio,
             "arm_loss_weight": args.arm_loss_weight,
@@ -613,6 +745,51 @@ def load_pair_idm(checkpoint: Path, device: str) -> tuple[PairIdmBundle, torch.T
         ckpt["hand_std"].to(device),
         ckpt,
     )
+
+
+def require_checkpoint_config(
+    ckpt: dict,
+    required: dict[str, object | None],
+    *,
+    allow_cli_split: bool,
+) -> dict[str, object]:
+    config = ckpt.get("config")
+    if not isinstance(config, dict):
+        raise ValueError("Checkpoint does not contain a config dict for validation split replay")
+    missing = [key for key, value in required.items() if value is None]
+    if missing:
+        if allow_cli_split:
+            return {key: value for key, value in required.items() if value is not None}
+        raise ValueError(
+            "Checkpoint is missing validation split config fields "
+            f"{missing}. Re-train with the updated pair IDM code, or pass "
+            "--allow-cli-split to explicitly use CLI split arguments for this legacy checkpoint."
+        )
+    return {key: value for key, value in required.items() if value is not None}
+
+
+def apply_pair_checkpoint_split_config(args: argparse.Namespace, ckpt: dict) -> None:
+    config = ckpt.get("config")
+    if not isinstance(config, dict):
+        raise ValueError("Checkpoint does not contain a config dict")
+    task_full = config.get("task_full", config.get("task"))
+    values = require_checkpoint_config(
+        ckpt,
+        {
+            "task_short": config.get("task_short"),
+            "task_full": task_full,
+            "data_root": config.get("data_root"),
+            "segment_root": config.get("segment_root"),
+            "resize": config.get("resize"),
+            "max_samples": config.get("max_samples"),
+            "seed": config.get("seed"),
+            "split_by": config.get("split_by"),
+            "train_ratio": config.get("train_ratio"),
+        },
+        allow_cli_split=bool(getattr(args, "allow_cli_split", False)),
+    )
+    for key, value in values.items():
+        setattr(args, key, value)
 
 
 def plot_loss_curves(out_dir: Path) -> None:
@@ -885,6 +1062,12 @@ def train(args: argparse.Namespace) -> None:
 
 @torch.no_grad()
 def validate_checkpoint(args: argparse.Namespace) -> None:
+    device = args.device
+    bundle, arm_mean, arm_std, hand_mean, hand_std, ckpt = load_pair_idm(
+        Path(args.checkpoint),
+        device,
+    )
+    apply_pair_checkpoint_split_config(args, ckpt)
     resolve_task_args(args)
     seed = int(args.seed)
     random.seed(seed)
@@ -893,11 +1076,6 @@ def validate_checkpoint(args: argparse.Namespace) -> None:
     resize = parse_resize(args.resize)
     samples = prepare_samples(args)
     _, val_samples = split_samples(samples, args.train_ratio, args.split_by, seed)
-    device = args.device
-    bundle, arm_mean, arm_std, hand_mean, hand_std, ckpt = load_pair_idm(
-        Path(args.checkpoint),
-        device,
-    )
     _ = ckpt
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -919,6 +1097,12 @@ def validate_checkpoint(args: argparse.Namespace) -> None:
 
 @torch.no_grad()
 def eval_all_pairs(args: argparse.Namespace) -> None:
+    device = args.device
+    bundle, arm_mean, arm_std, hand_mean, hand_std, ckpt = load_pair_idm(
+        Path(args.checkpoint),
+        device,
+    )
+    apply_pair_checkpoint_split_config(args, ckpt)
     resolve_task_args(args)
     seed = int(args.seed)
     random.seed(seed)
@@ -926,11 +1110,6 @@ def eval_all_pairs(args: argparse.Namespace) -> None:
     torch.manual_seed(seed)
     resize = parse_resize(args.resize)
     samples = prepare_samples(args)
-    device = args.device
-    bundle, arm_mean, arm_std, hand_mean, hand_std, ckpt = load_pair_idm(
-        Path(args.checkpoint),
-        device,
-    )
     _ = ckpt
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1000,12 +1179,16 @@ def build_parser() -> argparse.ArgumentParser:
     add_eval_split_args(val_p)
     val_p.add_argument("--checkpoint", required=True)
     val_p.add_argument("--output-dir", required=True)
+    val_p.add_argument("--allow-cli-split", action="store_true",
+                       help="explicitly use CLI split args for legacy checkpoints missing split config")
     val_p.set_defaults(func=validate_checkpoint)
 
     eval_p = sub.add_parser("eval", help="evaluate a checkpoint on discovered pairs")
     add_common_data_args(eval_p)
     eval_p.add_argument("--checkpoint", required=True)
     eval_p.add_argument("--output-dir", required=True)
+    eval_p.add_argument("--allow-cli-split", action="store_true",
+                        help="explicitly use CLI data args for legacy checkpoints missing split config")
     eval_p.add_argument("--batch-size", type=int, default=16)
     eval_p.add_argument("--workers", type=int, default=2)
     eval_p.add_argument("--val-max-samples", type=int, default=0,

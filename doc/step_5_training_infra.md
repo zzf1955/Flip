@@ -676,6 +676,11 @@ episode 中 `frame_index=t` 的 action。该脚本固定使用
 - arm 网络预测 `action.ee_action` 12 维。
 - hand 网络预测 `action.hand_cmd` 12 维。
 - arm / hand 是两套独立小 CNN，在同一训练入口中同时训练和保存，不共享参数。
+- `validate` / `eval` 默认复用 checkpoint 中保存的数据 root、resize、split 和
+  seed，避免训练与复算使用不同划分；需要旧 checkpoint 回退到 CLI split 时，
+  必须显式传 `--allow-cli-split`。
+- 指标同时包含原始 MSE、normalized MSE、per-dim R2 / correlation 和预测方差比，
+  用于判断模型是否只是回归均值。
 
 训练输出包括 `train_loss.csv`、`eval_loss.csv`、`checkpoint.pt`、
 `best_checkpoint.pt`、`val_predictions.csv`、`best_val_predictions.csv` 和
@@ -683,30 +688,43 @@ episode 中 `frame_index=t` 的 action。该脚本固定使用
 `hand_model_state`，并保存两类 action 各自的 mean/std。
 
 Humanoid Everyday H1 子集使用独立 `src.pipeline.humanoid_pair_idm` 入口。该路径直接读取 LeRobot 目录：
-`data/chunk-*/*.parquet` 提供 `action[t]`，`videos/chunk-*/egocentric/*.mp4` 提供
-相邻 RGB 帧。H1 版本不再拆成旧 WBT 的 `ee_action` / `hand_cmd` 两个 12 维头，而是
+`data/chunk-*/*.parquet` 提供 `action`，`videos/chunk-*/egocentric/*.mp4` 提供
+RGB 帧。H1 版本不再拆成旧 WBT 的 `ee_action` / `hand_cmd` 两个 12 维头，而是
 训练一个单独小 CNN 输出完整 26 维 `action`：
 
-- 输入：`frame_t` 与 `frame_{t+1}` resize 后拼成 6 通道 RGB。
-- 输出：同一 episode/parquet 中 `frame_index=t` 的 `action`，默认 26 维。
-- 对齐口径仍为 `(s_t, s_{t+1}) -> a_t`；最后一帧不构成 pair。
+- 输入：`frame_t` 与 `frame_{t+d}` resize 后拼成 6 通道 RGB。
+- 输出：半开区间 `action[t:t+d]` 的均值，默认 `d=1`，`frame_delta` 记录这个区间
+  长度。
+- `frame_stride` 只表示候选起点采样步长；`frame_delta` 表示动作平均窗口和第二帧间隔。
+- 默认 split 为 `episode`，避免同一 episode 的 pair 同时落入 train / eval；
+  显式 `--train-samples` / `--eval-samples` 也会按 episode 顺序截取，保证
+  train/eval 来自不重叠 episode。
+- 旧 checkpoint 若缺少 replay 所需的 split/config 字段，需要显式传
+  `--allow-cli-split` 才能继续用 CLI 参数复算。
+- 指标同时包含原始 MSE、mean baseline、normalized MSE、per-dim R2 / correlation
+  和预测方差比，方便判断模型是否只是回归均值。
+- 这次 H1 sweep 里，`d=1` 在 `1/2/4/8/16` 中最好，`best action_mse=0.107009`，
+  比 mean baseline `0.110856` 略好；`d>1` 没有带来稳定提升，所以默认仍保持
+  `frame_delta=1`。
+- 本地 smoke / sweep 使用了一个临时 symlink 数据根 `tmp/h1_t052_valid_200_v2`，
+  因为 `data/humanoid-everyday-h1-chunks0-6-8-200` 里有 13 个不可读 parquet 文件。
 
 H1 smoke 示例：
 
 ```bash
 scripts/flip_run.sh humanoid_pair_idm --cuda 2 -- train \
   --device cuda:0 \
-  --data-root /disk_n/zzf/flip/data/humanoid-everyday-h1-chunks0-6-8-200 \
+  --data-root /disk_n/zzf/flip/tmp/h1_t052_valid_200_v2 \
   --output-dir tmp/humanoid_pair_idm_h1_smoke \
   --max-samples 128 \
-  --max-pairs-per-episode 1 \
-  --frame-stride 8 \
+  --max-pairs-per-episode 4 \
+  --frame-delta 4 \
   --steps 10 \
   --batch-size 8 \
   --eval-every 5 \
   --val-max-samples 32 \
   --resize 256x256 \
-  --split-by sample
+  --split-by episode
 ```
 
 H1 700 训练 / 100 eval / 1000 step 示例：
@@ -714,17 +732,37 @@ H1 700 训练 / 100 eval / 1000 step 示例：
 ```bash
 scripts/flip_run.sh humanoid_pair_idm --cuda 2 -- train \
   --device cuda:0 \
-  --data-root /disk_n/zzf/flip/data/humanoid-everyday-h1-chunks0-6-8-200 \
+  --data-root /disk_n/zzf/flip/tmp/h1_t052_valid_200_v2 \
   --output-dir tmp/humanoid_pair_idm_h1_700train_100eval_s1000 \
   --max-samples 0 \
   --frame-stride 4 \
-  --split-by sample \
+  --split-by episode \
   --train-samples 700 \
   --eval-samples 100 \
   --steps 1000 \
   --batch-size 16 \
   --eval-every 100 \
   --resize 256x256
+```
+
+H1 interval sweep 示例：
+
+```bash
+for d in 1 2 4 8 16; do
+  scripts/flip_run.sh humanoid_pair_idm --cuda 2 -- train \
+    --device cuda:0 \
+    --data-root /disk_n/zzf/flip/tmp/h1_t052_valid_200_v2 \
+    --output-dir tmp/humanoid_pair_idm_h1_sweep_d${d} \
+    --max-samples 512 \
+    --max-pairs-per-episode 16 \
+    --frame-delta "${d}" \
+    --split-by episode \
+    --steps 200 \
+    --batch-size 32 \
+    --eval-every 50 \
+    --val-max-samples 128 \
+    --resize 256x256
+done
 ```
 
 小规模 smoke 示例：
