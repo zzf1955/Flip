@@ -5,7 +5,7 @@
 ```
 src/
 ├── core/          9 个基础库模块（不可直接运行）
-├── pipeline/     18 个可执行 pipeline 入口
+├── pipeline/     19 个可执行 pipeline 入口
 └── tools/        17 个实验/调试/可视化工具
 ```
 
@@ -86,6 +86,7 @@ eval_metrics.py    ← torch, skimage, transformers (CLIP)
 | `r2h_synthesize.py` | 用训练好的 r2h Mitty LoRA 从 `training_data/segment` 枚举 robot clip，排除 Seedance 已覆盖来源后生成 h2r `_syn` pair；支持按 task 可用量比例分配固定生成总量 | segment + r2h checkpoint | `training_data/pair/h2r/<duration>/<task>_syn/` |
 | `run_r2h_synthesize_queue.py` | 按全局 `_syn` 目标总量计算每个 source task 的目标数，生成单 task `r2h_synthesize` 命令队列，并按用户提供的 CUDA 列表调度；每张卡一次跑一个任务，结束后取队列下一项 | segment + r2h checkpoint + CUDA 列表 | `training_data/pair/h2r/<duration>/<task>_syn/`、`training_data/log/r2h_synthesize_queue/<timestamp>/` |
 | `run_syn_error_analysis.py` | 独立分析脚本：默认取 in-task + OOD 的 `ep000`-`ep003`，从 4s segment 切成 1s 非重叠 robot clip，再用 r2h checkpoint 生成 syn human，结果不写入训练 pair | segment + r2h checkpoint | `output/syn_error_analysis/{robot,syn,compare}/1s/<task>/<episode>/`、`manifest.jsonl` |
+| `masquerade_baseline.py` | Masquerade-style h2r 直接渲染 baseline：从 `training_data/pair/h2r/1s/<task>/manifest.jsonl` 读取 human/robot pair，自动估计 human foreground mask、左右半边 bbox 和 trajectory，用 mask 对 control frame 做 inpaint 背景重绘，再用 `training_data/segment/<task>/<episode>/<seg>_joints.parquet` + G1 URDF/mesh + 标定相机渲染不透明 robot mesh，并写出 baseline / background / human overlay / compare / annotation 产物 | h2r pair manifest + segment joints parquet + robot video | `output/masquerade_baseline/h2r/1s/<task>/` |
 | `robot_patch.py` | 全身降质数据（FK mesh 或 SAM2 mask → blur/noise/mean） | segment + parquet/sam2_mask | `training_data/pair/1s_patch/` |
 | `scripts/backfill_segment_pipeline_blur.py` | 只用已有 `segment_pipeline` postprocess mask 补 `00_original.mp4` 与 `08_blur_r2r_control.mp4`，不重跑 FK/SAM2/inpaint/human | `output/segment_pipeline/` + `training_data/segment/` | `output/segment_pipeline/<task>/ep*/seg*/00_original.mp4`、`08_blur_r2r_control.mp4` |
 

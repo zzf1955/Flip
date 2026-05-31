@@ -323,7 +323,43 @@ training_data/pair/h2r/1s/Inspire_Collect_Clothes_MainCamOnly_syn/
 └── pair_order.jsonl
 ```
 
-随后按普通 h2r pair 运行 VAE/T5 cache：
+### Masquerade 风格 h2r 直接渲染 baseline
+
+`src.pipeline.masquerade_baseline` 读取现有 `training_data/pair/h2r/1s/<task>/manifest.jsonl`，
+按 task 选择 pair，再从 `training_data/segment/<task>/<episode>/<seg>_joints.parquet`
+和对应 `seg*_video.mp4` 重新渲染 robot baseline。human 侧不依赖人工标注，而是直接从
+`control_video/pair_XXXX.mp4` 自动估计 foreground mask、左右半边 bbox、trajectory
+和逐帧 annotation JSONL，然后用 mask 对 control frame 做 inpaint 背景重绘，再在
+该背景上合成不透明机器人 mesh。
+这是一版可跑通的复现骨架，human 分割和背景重绘仍是启发式实现，后续需要继续提升
+mask 稳定性、inpaint 质量和机器人遮挡边界。
+
+默认输出：
+
+```text
+output/masquerade_baseline/h2r/1s/<task>/
+├── video/pair_NNNN.mp4            (baseline robot render)
+├── control_video/pair_NNNN.mp4    (原 human control clip)
+├── background/pair_NNNN.mp4       (human mask inpaint 背景重绘)
+├── gt_video/pair_NNNN.mp4         (原 robot GT clip)
+├── human_overlay/pair_NNNN.mp4    (human mask/bbox overlay)
+├── human_annotations/pair_NNNN.jsonl
+├── human_annotations/pair_NNNN.npz
+├── compare/pair_NNNN.mp4          (human | baseline | GT)
+├── manifest.jsonl
+└── summary.json
+```
+
+典型运行：
+
+```bash
+scripts/flip_run.sh masquerade_baseline -- \
+  --task Inspire_Pickup_Pillow_MainCamOnly \
+  --head 1 \
+  --output-root tmp/masquerade_baseline_smoke
+```
+
+对于 `_syn` 数据，随后按普通 h2r pair 运行 VAE/T5 cache：
 
 ```bash
 CUDA_VISIBLE_DEVICES=2 python -m src.pipeline.mitty_cache \
