@@ -87,6 +87,19 @@
 - `scripts/flip_run.sh` 新增 `adaworld_action_decoder` 子命令，并更新
   `doc/scripts_inventory.md`、`doc/step_5_training_infra.md`。
 
+**后续全量运行需求：**
+> 在 H1 完整 1600 条数据上跑 AdaWorld latent decoder；全量 latent 提取需要进度条，
+> 并且数据要实时落盘，避免长时间无反馈和中途失败后完全丢失产物。
+
+**创建的任务：**
+- [057] AdaWorld latent action decoder H1 全量 1600 条训练
+
+**直接修改：**
+- `src.pipeline.adaworld_action_encoder` 的全量提取改为 tqdm 进度条；
+  `latent_actions.npy` 通过 memmap 按 batch 实时写盘，`manifest.jsonl` 逐 batch flush，
+  结束后仍生成 decoder 兼容的 `latent_actions.npz`。
+- 更新 `doc/scripts_inventory.md`、`doc/step_5_training_infra.md`，记录流式输出语义。
+
 ## 2026-05-30
 
 **用户原始需求：**

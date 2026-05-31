@@ -772,7 +772,7 @@ done
 `src.pipeline.adaworld_action_encoder` 只接入 AdaWorld 的 LAM action encoder，不运行
 AdaWorld 后续 world model。该入口从 Humanoid Everyday H1 LeRobot 数据读取相邻两帧
 egocentric RGB，按 AdaWorld LAM 训练口径中心裁方、resize 到 256、归一化到 `[0,1]`，
-然后输出 32 维连续 latent action：
+并在提取过程中实时落盘 latent：
 
 - 输入：`(frame_t, frame_{t+1})`，来自
   `videos/chunk-*/egocentric/episode_*.mp4`。
@@ -786,10 +786,12 @@ egocentric RGB，按 AdaWorld LAM 训练口径中心裁方、resize 到 256、�
 
 输出目录包含：
 
-- `latent_actions.npz`：`latent_actions [N,32]`，以及 episode / chunk /
+- `latent_actions.npy`：提取过程中实时写入的 memmap latent 矩阵。
+- `latent_actions.npz`：最终封装的 `latent_actions [N,32]`，以及 episode / chunk /
   `rel_frame_t` / `rel_frame_tp1` 数组。
 - `manifest.jsonl`：逐样本视频路径、parquet 路径、帧号和 latent list。
-- `summary.json`：AdaWorld revision、checkpoint、预处理配置、latent mean/std/min/max。
+- `summary.json`：AdaWorld revision、checkpoint、预处理配置、latent mean/std/min/max，
+  以及 `latent_actions.npy` 路径。
 
 H1 action encoder smoke 示例：
 
