@@ -765,6 +765,46 @@ for d in 1 2 4 8 16; do
 done
 ```
 
+### AdaWorld Action Encoder
+
+`src.pipeline.adaworld_action_encoder` 只接入 AdaWorld 的 LAM action encoder，不运行
+AdaWorld 后续 world model。该入口从 Humanoid Everyday H1 LeRobot 数据读取相邻两帧
+egocentric RGB，按 AdaWorld LAM 训练口径中心裁方、resize 到 256、归一化到 `[0,1]`，
+然后输出 32 维连续 latent action：
+
+- 输入：`(frame_t, frame_{t+1})`，来自
+  `videos/chunk-*/egocentric/episode_*.mp4`。
+- 输出：`z_t`，shape 为 `[N, 32]` 的 continuous latent action。
+- 该入口不读取真实 action label，也不训练下游 action head。
+- 参考代码仓库为 `ref-AdaWorld`；LAM checkpoint 只使用
+  `ref-AdaWorld-hf/lam.ckpt`，不下载或加载 `adaworld.safetensors` world model。
+- world model checkpoint 的 HF LFS 指针大小约 `11.46 GB`，对应一个明显重于 LAM 的
+  video diffusion 模型；当前 FLIP 目标只保留 action encoder，不建议把 world model 作为
+  小规模复现目标。
+
+输出目录包含：
+
+- `latent_actions.npz`：`latent_actions [N,32]`，以及 episode / chunk /
+  `rel_frame_t` / `rel_frame_tp1` 数组。
+- `manifest.jsonl`：逐样本视频路径、parquet 路径、帧号和 latent list。
+- `summary.json`：AdaWorld revision、checkpoint、预处理配置、latent mean/std/min/max。
+
+H1 action encoder smoke 示例：
+
+```bash
+scripts/flip_run.sh adaworld_action_encoder --cuda 2 -- extract \
+  --device cuda:0 \
+  --data-root /disk_n/zzf/flip/tmp/h1_t052_valid_200_v2 \
+  --output-dir tmp/adaworld_action_encoder_h1_smoke \
+  --max-samples 8 \
+  --max-pairs-per-episode 1 \
+  --batch-size 1 \
+  --dtype fp16
+```
+
+如果使用原始 `data/humanoid-everyday-h1-chunks0-6-8-200`，需要先处理 task052 已发现的
+坏 parquet；入口默认对不可读 parquet 直接失败，不做静默跳过。
+
 小规模 smoke 示例：
 
 ```bash

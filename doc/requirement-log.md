@@ -50,7 +50,7 @@
 **用户原始需求：**
 > 复现 `https://huggingface.co/Little-Podi/AdaWorld`，参考 task051；当前 IDM
 > 效果不好，希望从纯视觉输入中提取 action，先用 latent 空间表示 action，再接一个小
-> action head 输出具体 action。仓库 clone 为 `ref-xxx`。
+> action head 输出具体 action。
 > 澄清：仓库 clone 名称应为 `ref-<repo_name>`，这里是 `ref-AdaWorld`；AdaWorld
 > 有 action encoder 和 world model 两部分，本次只做 `(f_t, f_{t+1}) -> 32`
 > 维连续 latent action 的 action encoder；world model 先不管。当前需要跑通的是
@@ -58,6 +58,11 @@
 
 **创建的任务：**
 - [054] AdaWorld H1 两帧 action encoder latent 提取
+
+**补充结论：**
+- AdaWorld HF 权重仓库中 `lam.ckpt` 约 1.8GB，已用于 action encoder smoke。
+- `adaworld.safetensors` 的 LFS 指针大小约 11.46GB，是下游 SVD/Vista 风格 video
+  diffusion world model；当前目标只复现 action encoder，不把 world model 纳入本阶段。
 
 ## 2026-05-30
 

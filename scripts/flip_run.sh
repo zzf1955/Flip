@@ -23,6 +23,8 @@ Subcommands:
   wan_pair_idm     Run python -m src.pipeline.wan_pair_idm.
   humanoid_pair_idm
                    Run python -m src.pipeline.humanoid_pair_idm.
+  adaworld_action_encoder
+                   Run python -m src.pipeline.adaworld_action_encoder.
   train            Run python -m torch.distributed.run -m src.pipeline.train.
   train_mitty_mixed_h2r
                    Run python -m torch.distributed.run -m src.pipeline.train_mitty_mixed_h2r.
@@ -42,6 +44,7 @@ Examples:
   scripts/flip_run.sh wan_vae_idm --cuda 2 -- train --device cuda:0 --max-samples 32
   scripts/flip_run.sh wan_pair_idm --cuda 2 -- train --device cuda:0 --max-samples 32
   scripts/flip_run.sh humanoid_pair_idm --cuda 2 -- train --device cuda:0 --data-root /disk_n/zzf/flip/data/humanoid-everyday-h1-chunks0-6-8-200 --train-samples 700 --eval-samples 100 --steps 1000
+  scripts/flip_run.sh adaworld_action_encoder --cuda 2 -- extract --device cuda:0 --output-dir tmp/adaworld_action_encoder_h1_smoke --max-samples 8
   scripts/flip_run.sh train --cuda 2,3 --nproc 2 -- --task-name pair_1s --max-steps 1000
   scripts/flip_run.sh train_mitty_mixed_h2r --cuda 2,3 --nproc 2 -- --task-name mixed_h2r --original-train-tasks Task_A --syn-train-tasks Task_A_syn --ood-eval-tasks Task_C --original-train-size 400 --syn-train-size 400 --max-steps 1000
   scripts/flip_run.sh eval_mitty --cuda 2 -- --device cuda:0 --eval-tail-percent 10
@@ -78,7 +81,7 @@ case "$subcommand" in
   nvidia-smi)
     exec nvidia-smi "$@"
     ;;
-  mitty_cache|sam2_precompute|r2h_synthesize|syn_error_analysis|wan_vae_idm|wan_pair_idm|humanoid_pair_idm|train|train_mitty_mixed_h2r|eval_mitty)
+  mitty_cache|sam2_precompute|r2h_synthesize|syn_error_analysis|wan_vae_idm|wan_pair_idm|humanoid_pair_idm|adaworld_action_encoder|train|train_mitty_mixed_h2r|eval_mitty)
     ;;
   *)
     usage >&2
@@ -153,6 +156,9 @@ case "$subcommand" in
     ;;
   humanoid_pair_idm)
     exec "$PYTHON_BIN" -m src.pipeline.humanoid_pair_idm "${script_args[@]}"
+    ;;
+  adaworld_action_encoder)
+    exec "$PYTHON_BIN" -m src.pipeline.adaworld_action_encoder "${script_args[@]}"
     ;;
   train)
     if [[ -z "$nproc" ]]; then
