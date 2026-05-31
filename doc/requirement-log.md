@@ -3,6 +3,42 @@
 ## 2026-05-31
 
 **用户原始需求：**
+> 先改别的 2. 加指标 3. 解决数据的问题, 现在是不是 eval 划分的不太对, 如果不对的话修正过来
+
+**直接修改：**
+- 为 `src.pipeline.wan_pair_idm` 和 `src.pipeline.humanoid_pair_idm` 新增
+  normalized MSE、per-dim R2、per-dim correlation、预测方差比等诊断指标；
+  validation 现在会输出更多能判断“是否只是在回归均值”的统计量。
+- 两个入口的 `validate` / `eval` 现在默认复用 checkpoint 中保存的数据 root、
+  resize、split 和 seed，避免训练和复算使用不同的样本划分。
+- Humanoid H1 默认 split 改为 `episode`，并让显式 `--train-samples` /
+  `--eval-samples` 在 episode 不重叠的前提下截取样本，修正原先 sample split 的
+  episode 泄漏问题。
+- 更新 `doc/step_5_training_infra.md`、`doc/scripts_inventory.md`，同步记录新的指标
+  和 split 语义。
+
+**用户原始需求：**
+> 发布一个新的 task,做区间的预测
+
+**创建的任务：**
+- [052] 两帧区间平均动作 IDM
+
+**直接修改（task 052 完成）：**
+- `src.pipeline.humanoid_pair_idm` 新增 `--frame-delta`，把输入改成
+  `(frame_t, frame_{t+d})`，标签改成 `mean(action[t:t+d])`；checkpoint 和验证回放
+  都保存并复用 `frame_delta` / `target_semantics` / split 配置。
+- `validate` / `eval` / `train --help` 全部确认接到 `--frame-delta`，并继续使用
+  episode-level split；旧 checkpoint 需要显式 `--allow-cli-split`。
+- 完成 H1 smoke：`frame_delta=4, steps=10, max_samples=128`，训练与验证都无 NaN。
+- 完成 H1 sweep：`d=1/2/4/8/16`，结果是 `d=1` 最好，`best action_mse=0.107009`，
+  `mean baseline=0.110856`；`d>1` 没有稳定优于默认 baseline，因此默认仍保持
+  `frame_delta=1`。
+- 发现 `data/humanoid-everyday-h1-chunks0-6-8-200` 含 13 个不可读 parquet，实际 smoke /
+  sweep 使用了临时 symlink 根 `tmp/h1_t052_valid_200_v2`，没有修改原始数据。
+- 同步更新 `doc/step_5_training_infra.md`、`doc/scripts_inventory.md`，把区间预测语义、
+  sweep 结论和数据注意事项写回文档。
+
+**用户原始需求：**
 > 新建一个 task,做如下事情
 > 1. 在 flip/data/humanoid-everyday-h1-chunks0-6-8-200 上训练,这个数据多
 > 2. 分 task 训练
@@ -10,6 +46,18 @@
 
 **创建的任务：**
 - [053] H1 全量 task 分组训练与 Transformer 架构探索
+
+**用户原始需求：**
+> 复现 `https://huggingface.co/Little-Podi/AdaWorld`，参考 task051；当前 IDM
+> 效果不好，希望从纯视觉输入中提取 action，先用 latent 空间表示 action，再接一个小
+> action head 输出具体 action。仓库 clone 为 `ref-xxx`。
+> 澄清：仓库 clone 名称应为 `ref-<repo_name>`，这里是 `ref-AdaWorld`；AdaWorld
+> 有 action encoder 和 world model 两部分，本次只做 `(f_t, f_{t+1}) -> 32`
+> 维连续 latent action 的 action encoder；world model 先不管。当前需要跑通的是
+> H1 两帧图像输入 action encoder，并输出 latent action。
+
+**创建的任务：**
+- [054] AdaWorld H1 两帧 action encoder latent 提取
 
 ## 2026-05-30
 

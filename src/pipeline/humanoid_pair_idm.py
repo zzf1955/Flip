@@ -5,8 +5,8 @@ This module reads the Humanoid Everyday LeRobot layout directly:
   - ``data/chunk-*/episode_*.parquet`` stores the 26-dim H1 ``action`` label.
   - ``videos/chunk-*/egocentric/episode_*.mp4`` stores the RGB frames.
 
-Each sample uses adjacent RGB frames ``(frame_t, frame_{t+1})`` and predicts
-the action recorded in the parquet row with ``frame_index=t``.
+Each sample uses RGB frames ``(frame_t, frame_{t+d})`` and predicts the mean
+action over the half-open interval ``action[t:t+d]``.
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ import torch.nn.functional as F
 
 from src.core.config import MAIN_ROOT
 from src.pipeline.wan_pair_idm import (
+    action_regression_metrics,
     SmallPairCnn,
     count_trainable_parameters,
     mse_np,
@@ -46,7 +47,7 @@ class HumanoidPairSample:
     episode: int
     chunk: int
     rel_frame_t: int
-    rel_frame_tp1: int
+    rel_frame_tpd: int
     action_target: tuple[float, ...]
 
 
@@ -57,10 +58,13 @@ def discover_humanoid_pairs(
     seed: int,
     action_dim: int,
     frame_stride: int,
+    frame_delta: int,
     max_pairs_per_episode: int,
 ) -> list[HumanoidPairSample]:
     if frame_stride <= 0:
         raise ValueError(f"frame_stride must be positive, got {frame_stride}")
+    if frame_delta <= 0:
+        raise ValueError(f"frame_delta must be positive, got {frame_delta}")
     if max_pairs_per_episode < 0:
         raise ValueError(
             f"max_pairs_per_episode must be non-negative, got {max_pairs_per_episode}"
@@ -73,7 +77,11 @@ def discover_humanoid_pairs(
         raise FileNotFoundError(f"Humanoid LeRobot video directory not found: {video_dir}")
 
     samples: list[HumanoidPairSample] = []
-    for parquet_path in sorted(data_dir.glob("chunk-*/episode_*.parquet")):
+    parquet_paths = sorted(data_dir.glob("chunk-*/episode_*.parquet"))
+    early_stop = max_samples > 0 and max_pairs_per_episode > 0
+    if early_stop:
+        random.Random(seed).shuffle(parquet_paths)
+    for parquet_path in parquet_paths:
         chunk_name = parquet_path.parent.name
         if not chunk_name.startswith("chunk-"):
             raise ValueError(f"Unexpected chunk directory name: {parquet_path.parent}")
@@ -99,15 +107,20 @@ def discover_humanoid_pairs(
             )
 
         episode_pair_count = 0
-        for row_idx in range(0, len(df) - 1, frame_stride):
-            if bool(df.iloc[row_idx]["next.done"]):
+        for row_idx in range(0, len(df) - frame_delta, frame_stride):
+            window = df.iloc[row_idx:row_idx + frame_delta]
+            if bool(window["next.done"].any()):
                 continue
-            action = np.asarray(df.iloc[row_idx]["action"], dtype=np.float32)
-            if action.shape != (action_dim,):
-                raise ValueError(
-                    f"Bad Humanoid action shape at episode={episode} frame={row_idx}: "
-                    f"{action.shape}, expected {(action_dim,)}"
-                )
+            action_window = [
+                np.asarray(value, dtype=np.float32) for value in window["action"].tolist()
+            ]
+            for offset, action in enumerate(action_window):
+                if action.shape != (action_dim,):
+                    raise ValueError(
+                        f"Bad Humanoid action shape at episode={episode} frame={row_idx + offset}: "
+                        f"{action.shape}, expected {(action_dim,)}"
+                    )
+            action = np.stack(action_window, axis=0).mean(axis=0)
             samples.append(
                 HumanoidPairSample(
                     video_path=str(video_path),
@@ -115,19 +128,23 @@ def discover_humanoid_pairs(
                     episode=episode,
                     chunk=chunk,
                     rel_frame_t=row_idx,
-                    rel_frame_tp1=row_idx + 1,
+                    rel_frame_tpd=row_idx + frame_delta,
                     action_target=tuple(float(v) for v in action.tolist()),
                 )
             )
             episode_pair_count += 1
+            if early_stop and len(samples) >= max_samples:
+                break
             if max_pairs_per_episode > 0 and episode_pair_count >= max_pairs_per_episode:
                 break
+        if early_stop and len(samples) >= max_samples:
+            break
 
     random.Random(seed).shuffle(samples)
     if max_samples > 0:
         samples = samples[:max_samples]
     if not samples:
-        raise ValueError(f"No Humanoid adjacent frame pairs discovered under {data_root}")
+        raise ValueError(f"No Humanoid interval frame pairs discovered under {data_root}")
     return samples
 
 
@@ -140,26 +157,71 @@ def split_humanoid_samples(
     train_samples_count: int = 0,
     val_samples_count: int = 0,
 ) -> tuple[list[HumanoidPairSample], list[HumanoidPairSample]]:
+    if split_by not in {"sample", "episode"}:
+        raise ValueError(f"Unsupported split_by={split_by!r}")
     if train_samples_count > 0 or val_samples_count > 0:
         if train_samples_count <= 0 or val_samples_count <= 0:
             raise ValueError(
                 "train_samples_count and val_samples_count must be both positive "
                 "when explicit sample counts are used"
             )
-        if split_by != "sample":
-            raise ValueError(
-                "explicit train/val sample counts require split_by=sample"
+        if split_by == "sample":
+            total = train_samples_count + val_samples_count
+            if total > len(samples):
+                raise ValueError(
+                    f"Requested train/val counts exceed available samples: "
+                    f"{total} > {len(samples)}"
+                )
+            return (
+                samples[:train_samples_count],
+                samples[train_samples_count:train_samples_count + val_samples_count],
             )
-        total = train_samples_count + val_samples_count
-        if total > len(samples):
+        episode_groups: dict[int, list[HumanoidPairSample]] = {}
+        for sample in samples:
+            episode_groups.setdefault(sample.episode, []).append(sample)
+        ordered_episodes = sorted(episode_groups)
+        random.Random(seed).shuffle(ordered_episodes)
+        train_samples: list[HumanoidPairSample] = []
+        val_samples: list[HumanoidPairSample] = []
+        train_episode_boundary = len(ordered_episodes)
+        for episode_idx, episode in enumerate(ordered_episodes):
+            episode_samples = episode_groups[episode]
+            if len(train_samples) < train_samples_count:
+                remaining = train_samples_count - len(train_samples)
+                take = min(remaining, len(episode_samples))
+                train_samples.extend(episode_samples[:take])
+                if take < len(episode_samples):
+                    train_episode_boundary = episode_idx + 1
+                    break
+                train_episode_boundary = episode_idx + 1
+                continue
+            break
+        if len(train_samples) < train_samples_count:
             raise ValueError(
-                f"Requested train/val counts exceed available samples: "
-                f"{total} > {len(samples)}"
+                f"Requested train sample count exceeds available samples: "
+                f"{train_samples_count} > {len(train_samples)}"
             )
-        return (
-            samples[:train_samples_count],
-            samples[train_samples_count:train_samples_count + val_samples_count],
-        )
+        for episode in ordered_episodes[train_episode_boundary:]:
+            episode_samples = episode_groups[episode]
+            if len(val_samples) < val_samples_count:
+                remaining = val_samples_count - len(val_samples)
+                take = min(remaining, len(episode_samples))
+                val_samples.extend(episode_samples[:take])
+                if take < len(episode_samples):
+                    break
+                continue
+            break
+        if len(val_samples) < val_samples_count:
+            raise ValueError(
+                f"Requested eval sample count exceeds available samples: "
+                f"{val_samples_count} > {len(val_samples)}"
+            )
+        if not train_samples or not val_samples:
+            raise ValueError(
+                f"Invalid episode split with explicit counts: train={len(train_samples)} "
+                f"val={len(val_samples)}"
+            )
+        return train_samples, val_samples
 
     if not 0.0 < train_ratio < 1.0:
         raise ValueError(f"train_ratio must be in (0,1), got {train_ratio}")
@@ -183,6 +245,37 @@ def split_humanoid_samples(
     return train_samples, val_samples
 
 
+def apply_humanoid_checkpoint_config(args: argparse.Namespace, ckpt: dict) -> None:
+    config = ckpt.get("config")
+    if not isinstance(config, dict):
+        raise ValueError("Checkpoint does not contain a config dict")
+    required = {
+        "data_root": config.get("data_root"),
+        "resize": config.get("resize"),
+        "split_by": config.get("split_by"),
+        "train_ratio": config.get("train_ratio"),
+        "max_samples": config.get("max_samples"),
+        "seed": config.get("seed"),
+        "action_dim": config.get("action_dim"),
+        "frame_stride": config.get("frame_stride"),
+        "frame_delta": config.get("frame_delta"),
+        "max_pairs_per_episode": config.get("max_pairs_per_episode"),
+        "train_samples": config.get("train_samples"),
+        "eval_samples": config.get("eval_samples"),
+    }
+    missing = [key for key, value in required.items() if value is None]
+    if missing and not bool(getattr(args, "allow_cli_split", False)):
+        raise ValueError(
+            "Checkpoint is missing humanoid validation config fields "
+            f"{missing}. Re-train with the updated humanoid pair IDM code, or "
+            "pass --allow-cli-split to explicitly use the CLI split arguments "
+            "for this legacy checkpoint."
+        )
+    for key, value in required.items():
+        if value is not None:
+            setattr(args, key, value)
+
+
 class HumanoidPairDataset(torch.utils.data.Dataset):
     def __init__(self, samples: list[HumanoidPairSample], resize: tuple[int, int] | None):
         self.samples = samples
@@ -197,6 +290,7 @@ class HumanoidPairDataset(torch.utils.data.Dataset):
             sample.video_path,
             sample.rel_frame_t,
             self.resize,
+            sample.rel_frame_tpd,
         )
         return {
             "frames": frames,
@@ -272,7 +366,7 @@ def validate_humanoid_samples(
                 "episode": sample.episode,
                 "chunk": sample.chunk,
                 "rel_frame_t": sample.rel_frame_t,
-                "rel_frame_tp1": sample.rel_frame_tp1,
+                "rel_frame_tpd": sample.rel_frame_tpd,
                 "video_path": sample.video_path,
                 "parquet_path": sample.parquet_path,
             }
@@ -287,7 +381,9 @@ def validate_humanoid_samples(
     model.train()
     pred_all = np.concatenate(pred_chunks, axis=0)
     target_all = np.concatenate(target_chunks, axis=0)
-    baseline = action_mean.detach().cpu().numpy()[None, :]
+    action_mean_np = action_mean.detach().cpu().numpy()
+    action_std_np = action_std.detach().cpu().numpy()
+    baseline = action_mean_np[None, :]
     action_mse = mse_np(pred_all, target_all)
     baseline_mse = mse_np(np.broadcast_to(baseline, target_all.shape), target_all)
     total_sse = float(np.square(pred_all - target_all).sum())
@@ -300,6 +396,16 @@ def validate_humanoid_samples(
         "pred_std_mean": float(pred_all.std(axis=0).mean()),
         "target_std_mean": float(target_all.std(axis=0).mean()),
     }
+    metrics.update(
+        action_regression_metrics(
+            pred_all,
+            target_all,
+            action_mean_np,
+            action_std_np,
+            prefix="action",
+            dim_prefix="action_dim",
+        )
+    )
     if prediction_path is not None:
         write_rows(pred_rows, prediction_path)
     return metrics
@@ -325,19 +431,26 @@ def save_humanoid_checkpoint(
             "hidden_dim": args.hidden_dim,
             "dropout": args.dropout,
             "action_dim": args.action_dim,
-            "alignment": "humanoid_frame_pair_t_to_t_plus_1_predict_action_t",
+            "alignment": "humanoid_frame_pair_t_to_t_plus_d_predict_mean_action_t_to_t_plus_d",
         },
         "config": {
             "data_root": args.data_root,
             "resize": args.resize,
+            "max_samples": args.max_samples,
+            "seed": args.seed,
+            "action_dim": args.action_dim,
             "split_by": args.split_by,
             "train_ratio": args.train_ratio,
+            "train_samples": args.train_samples,
+            "eval_samples": args.eval_samples,
             "lr_scheduler": args.lr_scheduler,
             "min_lr_ratio": args.min_lr_ratio,
             "dataset": "humanoid_everyday_lerobot",
             "robot_type": "h1",
             "frame_stride": args.frame_stride,
+            "frame_delta": args.frame_delta,
             "max_pairs_per_episode": args.max_pairs_per_episode,
+            "target_semantics": "mean(action[t:t+frame_delta])",
         },
         "val_metrics": val_metrics,
     }
@@ -410,12 +523,15 @@ def plot_humanoid_loss_curves(out_dir: Path) -> None:
 
 
 def prepare_humanoid_samples(args: argparse.Namespace) -> list[HumanoidPairSample]:
+    if args.data_root is None:
+        raise ValueError("--data-root is required unless it is replayed from checkpoint config")
     return discover_humanoid_pairs(
         Path(args.data_root),
         max_samples=args.max_samples,
         seed=int(args.seed),
         action_dim=int(args.action_dim),
         frame_stride=int(args.frame_stride),
+        frame_delta=int(args.frame_delta),
         max_pairs_per_episode=int(args.max_pairs_per_episode),
     )
 
@@ -449,7 +565,8 @@ def train_humanoid(args: argparse.Namespace) -> None:
         write_json(out_dir / "val_samples.json", [asdict(sample) for sample in val_samples])
 
     print(
-        f"alignment=(frame_t,frame_t+1)->action_t dataset=humanoid_everyday_h1 "
+        f"alignment=(frame_t,frame_t+{args.frame_delta})->mean(action_t:t+{args.frame_delta}) "
+        f"dataset=humanoid_everyday_h1 "
         f"split_by={args.split_by} train_samples={len(train_samples)} "
         f"val_samples={len(val_samples)} train_episodes={len({s.episode for s in train_samples})} "
         f"val_episodes={len({s.episode for s in val_samples})}",
@@ -593,6 +710,12 @@ def train_humanoid(args: argparse.Namespace) -> None:
 
 @torch.no_grad()
 def validate_humanoid_checkpoint(args: argparse.Namespace) -> None:
+    device = args.device
+    model, action_mean, action_std, ckpt = load_humanoid_pair_idm(
+        Path(args.checkpoint),
+        device,
+    )
+    apply_humanoid_checkpoint_config(args, ckpt)
     seed = int(args.seed)
     random.seed(seed)
     np.random.seed(seed)
@@ -606,11 +729,6 @@ def validate_humanoid_checkpoint(args: argparse.Namespace) -> None:
         seed,
         train_samples_count=int(args.train_samples),
         val_samples_count=int(args.eval_samples),
-    )
-    device = args.device
-    model, action_mean, action_std, ckpt = load_humanoid_pair_idm(
-        Path(args.checkpoint),
-        device,
     )
     _ = ckpt
     out_dir = Path(args.output_dir)
@@ -631,17 +749,18 @@ def validate_humanoid_checkpoint(args: argparse.Namespace) -> None:
 
 @torch.no_grad()
 def eval_humanoid_pairs(args: argparse.Namespace) -> None:
+    device = args.device
+    model, action_mean, action_std, ckpt = load_humanoid_pair_idm(
+        Path(args.checkpoint),
+        device,
+    )
+    apply_humanoid_checkpoint_config(args, ckpt)
     seed = int(args.seed)
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     resize = parse_resize(args.resize)
     samples = prepare_humanoid_samples(args)
-    device = args.device
-    model, action_mean, action_std, ckpt = load_humanoid_pair_idm(
-        Path(args.checkpoint),
-        device,
-    )
     _ = ckpt
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -660,15 +779,17 @@ def eval_humanoid_pairs(args: argparse.Namespace) -> None:
 
 
 def add_humanoid_data_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--data-root", required=True)
+    parser.add_argument("--data-root", default=None)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--resize", default="256x256")
     parser.add_argument("--max-samples", type=int, default=0,
-                        help="maximum discovered adjacent frame pairs; 0 keeps all")
+                        help="maximum discovered interval frame pairs; 0 keeps all")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--action-dim", type=int, default=HUMANOID_H1_ACTION_DIM)
     parser.add_argument("--frame-stride", type=int, default=1,
-                        help="use every Nth adjacent frame pair within each episode")
+                        help="sample every Nth candidate start frame within each episode")
+    parser.add_argument("--frame-delta", type=int, default=1,
+                        help="frame interval d for (frame_t, frame_t+d) and mean action[t:t+d]")
     parser.add_argument("--max-pairs-per-episode", type=int, default=0,
                         help="maximum pair samples to keep per episode; 0 keeps all")
 
@@ -679,7 +800,7 @@ def add_humanoid_split_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--eval-samples", type=int, default=0,
                         help="explicit eval sample count; 0 uses train-ratio")
     parser.add_argument("--train-ratio", type=float, default=0.875)
-    parser.add_argument("--split-by", choices=["sample", "episode"], default="sample")
+    parser.add_argument("--split-by", choices=["sample", "episode"], default="episode")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -719,6 +840,8 @@ def build_parser() -> argparse.ArgumentParser:
     add_humanoid_split_args(val_p)
     val_p.add_argument("--checkpoint", required=True)
     val_p.add_argument("--output-dir", required=True)
+    val_p.add_argument("--allow-cli-split", action="store_true",
+                       help="explicitly use CLI split args for legacy checkpoints missing split config")
     val_p.add_argument("--batch-size", type=int, default=16)
     val_p.add_argument("--workers", type=int, default=2)
     val_p.add_argument("--val-max-samples", type=int, default=0,
@@ -732,6 +855,8 @@ def build_parser() -> argparse.ArgumentParser:
     add_humanoid_data_args(eval_p)
     eval_p.add_argument("--checkpoint", required=True)
     eval_p.add_argument("--output-dir", required=True)
+    eval_p.add_argument("--allow-cli-split", action="store_true",
+                       help="explicitly use CLI data args for legacy checkpoints missing config")
     eval_p.add_argument("--batch-size", type=int, default=16)
     eval_p.add_argument("--workers", type=int, default=2)
     eval_p.add_argument("--val-max-samples", type=int, default=0,
