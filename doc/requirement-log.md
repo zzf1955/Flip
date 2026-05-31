@@ -64,6 +64,26 @@
 - `adaworld.safetensors` 的 LFS 指针大小约 11.46GB，是下游 SVD/Vista 风格 video
   diffusion world model；当前目标只复现 action encoder，不把 world model 纳入本阶段。
 
+**用户原始需求：**
+> 现在要基于 AdaWorld 做 IDM；已经复现 AdaWorld 的 action Encoder，需要从 latent
+> action 中把机器人具体的 action 解码出来。数据在
+> `flip/data/humanoid-everyday-h1-chunks0-6-8-200`，数据流是两帧图像
+> `--AdaWorld--> latent action --action decoder--> action`；需要确定 decoder
+> 架构并实现整个训练 pipeline。
+
+**创建的任务：**
+- [056] AdaWorld latent action decoder IDM
+
+**直接修改：**
+- 新增 `src.pipeline.adaworld_action_decoder`：读取 task054 的 `latent_actions.npz`，
+  按 `episode/chunk/rel_frame_t` 回查 H1 `action` 标签，训练
+  `(frame_t, frame_{t+1}) -> z_t -> action_t` 的下游 action decoder。
+- decoder 架构采用小 MLP baseline，默认 `32 -> 128 -> 128 -> 26`；因为 AdaWorld LAM
+  已经把两帧图像压成低维 action latent，第一版不再使用 CNN。后续只有需要多步时序
+  上下文或 task 条件时才考虑 Transformer / RNN。
+- `scripts/flip_run.sh` 新增 `adaworld_action_decoder` 子命令，并更新
+  `doc/scripts_inventory.md`、`doc/step_5_training_infra.md`。
+
 ## 2026-05-30
 
 **用户原始需求：**

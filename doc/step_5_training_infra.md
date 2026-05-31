@@ -805,6 +805,43 @@ scripts/flip_run.sh adaworld_action_encoder --cuda 2 -- extract \
 如果使用原始 `data/humanoid-everyday-h1-chunks0-6-8-200`，需要先处理 task052 已发现的
 坏 parquet；入口默认对不可读 parquet 直接失败，不做静默跳过。
 
+### AdaWorld Latent Action Decoder
+
+`src.pipeline.adaworld_action_decoder` 只训练 AdaWorld latent action 的下游解码器，不再
+回到图像端。它读取 task054 产出的 `latent_actions.npz`，其中每一行对应
+`(frame_t, frame_{t+1}) -> z_t`，并通过 `episode/chunk/rel_frame_t` 回查 H1 LeRobot
+parquet 中同一帧的 `action` 标签，形成监督对：
+
+- 输入：`z_t`，shape 为 `[N, 32]` 的 AdaWorld continuous latent action。
+- 输出：H1 `action_t`，当前实现按 26 维 `action` 向量训练。
+- 模型：小 MLP baseline，默认 `32 -> 128 -> 128 -> 26`，使用 latent / action 双边标准化。
+- 训练目标：标准化后的 action MSE；验证时回到原始 action 空间，输出 MSE、R2、
+  correlation、方差比等指标。
+
+输出目录包含：
+
+- `checkpoint.pt` / `best_checkpoint.pt`：decoder 权重、latent 统计量、action 统计量和
+  训练配置。
+- `train_loss.csv` / `eval_loss.csv`：训练与验证损失。
+- `val_predictions.csv` / `best_val_predictions.csv`：逐样本预测表。
+- `metrics.json` / `val_metrics.json` / `best_val_metrics.json`：评估摘要。
+- `loss_curve.png`：训练 / 验证损失曲线。
+
+训练示例：
+
+```bash
+scripts/flip_run.sh adaworld_action_decoder --cuda 2 -- train \
+  --device cuda:0 \
+  --data-root /disk_n/zzf/flip/data/humanoid-everyday-h1-chunks0-6-8-200 \
+  --latent-path tmp/adaworld_action_encoder_h1_smoke/latent_actions.npz \
+  --output-dir tmp/adaworld_action_decoder_h1_smoke \
+  --max-samples 8 \
+  --steps 100 \
+  --batch-size 8 \
+  --eval-every 50 \
+  --val-max-samples 4
+```
+
 小规模 smoke 示例：
 
 ```bash
