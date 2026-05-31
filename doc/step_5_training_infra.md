@@ -821,7 +821,7 @@ done
 `src.pipeline.adaworld_action_encoder` 只接入 AdaWorld 的 LAM action encoder，不运行
 AdaWorld 后续 world model。该入口从 Humanoid Everyday H1 LeRobot 数据读取相邻两帧
 egocentric RGB，按 AdaWorld LAM 训练口径中心裁方、resize 到 256、归一化到 `[0,1]`，
-然后输出 32 维连续 latent action：
+并在提取过程中实时落盘 latent：
 
 - 输入：`(frame_t, frame_{t+1})`，来自
   `videos/chunk-*/egocentric/episode_*.mp4`。
@@ -835,10 +835,12 @@ egocentric RGB，按 AdaWorld LAM 训练口径中心裁方、resize 到 256、�
 
 输出目录包含：
 
-- `latent_actions.npz`：`latent_actions [N,32]`，以及 episode / chunk /
+- `latent_actions.npy`：提取过程中实时写入的 memmap latent 矩阵。
+- `latent_actions.npz`：最终封装的 `latent_actions [N,32]`，以及 episode / chunk /
   `rel_frame_t` / `rel_frame_tp1` 数组。
 - `manifest.jsonl`：逐样本视频路径、parquet 路径、帧号和 latent list。
-- `summary.json`：AdaWorld revision、checkpoint、预处理配置、latent mean/std/min/max。
+- `summary.json`：AdaWorld revision、checkpoint、预处理配置、latent mean/std/min/max，
+  以及 `latent_actions.npy` 路径。
 
 H1 action encoder smoke 示例：
 
@@ -892,6 +894,54 @@ scripts/flip_run.sh adaworld_action_decoder --cuda 2 -- train \
   --eval-every 50 \
   --val-max-samples 4
 ```
+
+H1 全量 1600 episode 训练记录：
+
+```bash
+scripts/flip_run.sh adaworld_action_decoder --cuda 1 -- train \
+  --device cuda:0 \
+  --data-root /disk_n/zzf/flip/data/humanoid-everyday-h1-chunks0-6-8-200 \
+  --latent-path /disk_n/zzf/flip/.worktrees/t057/tmp/adaworld_action_encoder_h1_full_t057/latent_actions.npz \
+  --output-dir tmp/adaworld_action_decoder_h1_full_t057 \
+  --split-by episode \
+  --steps 2000 \
+  --batch-size 1024 \
+  --eval-every 500 \
+  --log-every 100 \
+  --workers 0
+```
+
+本次全量 artifact 来自 `tmp/adaworld_action_encoder_h1_full_t057/latent_actions.npz`：
+
+- H1 episode：`1600`
+- 相邻帧 latent/action 样本：`560422`
+- train split：`488936` samples / `1400` episodes
+- val split：`71486` samples / `200` episodes
+- split 口径：episode-level，train/val episode 不重叠
+
+Held-out best checkpoint 结果：
+
+- `action_mse = 0.07853357493877411`
+- `mean_baseline_action_mse = 0.15635326504707336`
+- `action_mean_dim_r2 = 0.504274274294193`
+- `action_mean_dim_corr = 0.7063991037698892`
+- `action_pred_std_ratio_mean = 0.7120954027542701`
+
+全量 eval 结果：
+
+- checkpoint：`tmp/adaworld_action_decoder_h1_full_t057/best_checkpoint.pt`
+- 输出：`tmp/adaworld_action_decoder_h1_full_t057_eval_best/metrics.json`
+- 样本数：`560422`
+- `action_mse = 0.07298979163169861`
+- `mean_baseline_action_mse = 0.15620023012161255`
+- `action_mean_dim_r2 = 0.5340813008638529`
+- `action_mean_dim_corr = 0.7275451834385211`
+- `action_pred_std_ratio_mean = 0.7190383053742923`
+
+`validate` 复算 `best_checkpoint.pt` 与训练保存的 `best_val_metrics.json` 一致。
+与同 split mean baseline 相比，held-out action MSE 约降低 `49.8%`；与全量 eval mean
+baseline 相比，action MSE 约降低 `53.3%`。历史两帧 RGB H1 IDM 结果使用不同样本量、
+split 或 target 语义，只作为参考，不作为严格同 split 对照。
 
 小规模 smoke 示例：
 

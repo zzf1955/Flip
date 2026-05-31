@@ -3,26 +3,6 @@
 ## 2026-05-31
 
 **用户原始需求：**
-> 现有 h2r pair 的 Masquerade 渲染 baseline
-
-**创建的任务：**
-- [058] 现有 h2r pair 的 Masquerade 渲染 baseline
-
-**直接修改：**
-- 新增 `src.pipeline.masquerade_baseline`：读取现有
-  `training_data/pair/h2r/1s/<task>/manifest.jsonl`，按 `pair_id` / task 选择样本，
-  从 `control_video` 自动估计 human foreground mask、左右半边 bbox、trajectory 和
-  annotation JSONL，并用 mask 对 control frame 做 inpaint 背景重绘。
-- baseline robot 由 `training_data/segment/<task>/<episode>/<seg>_joints.parquet`
-  + `seg*_video.mp4` + G1 URDF/mesh + `BEST_PARAMS` 相机标定重渲染为不透明 mesh，输出
-  `video/`、`control_video/`、`background/`、`gt_video/`、`human_overlay/`、`compare/`、
-  `human_annotations/`、`manifest.jsonl` 和 `summary.json`。
-- `scripts/flip_run.sh` 新增 `masquerade_baseline` 子命令；同步更新
-  `doc/step_5_training_infra.md` 和 `doc/scripts_inventory.md`。
-- 当前实现是可运行的第一版复现骨架，human 分割和背景重绘仍是启发式，
-  复现质量后续还需要继续改进。
-
-**用户原始需求：**
 > 先改别的 2. 加指标 3. 解决数据的问题, 现在是不是 eval 划分的不太对, 如果不对的话修正过来
 
 **直接修改：**
@@ -36,6 +16,28 @@
   episode 泄漏问题。
 - 更新 `doc/step_5_training_infra.md`、`doc/scripts_inventory.md`，同步记录新的指标
   和 split 语义。
+
+**用户原始需求：**
+> 详细调查一下情况，然后发布一个新的 task，在哪已有的 pair 数据上跑 Masquerade
+
+**创建的任务：**
+- [058] 现有 h2r pair 的 Masquerade 渲染 baseline
+
+**补充结论：**
+- 当前实现已经能跑通现有 h2r pair 的 baseline 生成，但 human 分割、背景 inpaint 和
+  机器人遮挡边界仍是第一版启发式复现，后续还需要继续改进复现质量。
+
+**用户原始需求：**
+> 发布一个新的 task：提升渲染精度，渲染真实的 Mesh，现在是快速渲染的 proxy；并回答现在
+> human 检测 / 分割 / inpaint 都是什么模型做的。
+
+**创建的任务：**
+- [059] Masquerade baseline 真实 Mesh 高精度渲染
+
+**补充结论：**
+- 当前 Masquerade baseline 的 human 检测 / 分割不是专门模型，而是 OpenCV 启发式
+  foreground / skin mask；背景重绘使用 OpenCV Telea inpaint，不是 LaMa、ProPainter
+  或扩散式视频 inpaint。
 
 **用户原始需求：**
 > 发布一个新的 task,做区间的预测
@@ -122,6 +124,48 @@
   上下文或 task 条件时才考虑 Transformer / RNN。
 - `scripts/flip_run.sh` 新增 `adaworld_action_decoder` 子命令，并更新
   `doc/scripts_inventory.md`、`doc/step_5_training_infra.md`。
+
+**用户原始需求：**
+> 好的,你发布一个新的 task,在 1600 条 h1 的数据上,跑这个基于 Ada World 的 IDM.
+
+**创建的任务：**
+- [057] AdaWorld latent action decoder H1 全量 1600 条训练
+
+**目标摘要：**
+- 基于 task056 的 AdaWorld latent action decoder，在完整
+  `data/humanoid-everyday-h1-chunks0-6-8-200` 上跑全量训练与复算。
+- 必要时先用 task054 的 action encoder 对完整 H1 数据提取 latent artifact，再训练
+  `(frame_t, frame_{t+1}) -> z_t -> action_t` decoder。
+- 重点输出全量训练 checkpoint、验证指标和与 mean baseline / 旧两帧 RGB IDM 的对比。
+
+**直接修改与全量结果（task 057 完成）：**
+- `src.pipeline.adaworld_action_encoder` 的全量提取改为 tqdm 进度条；
+  `latent_actions.npy` 通过 memmap 按 batch 实时写盘，`manifest.jsonl` 逐 batch flush，
+  结束后仍生成 decoder 兼容的 `latent_actions.npz`。
+- 更新 `doc/scripts_inventory.md`、`doc/step_5_training_infra.md`，记录流式输出语义和
+  H1 全量训练结果。
+- 完整 H1 数据根：`data/humanoid-everyday-h1-chunks0-6-8-200`
+- 全量 AdaWorld latent artifact：`tmp/adaworld_action_encoder_h1_full_t057/latent_actions.npz`
+- latent/action 样本数：`560422`，episode 数：`1600`
+- decoder 训练输出：`tmp/adaworld_action_decoder_h1_full_t057`
+- split：episode-level，`488936` train samples / `1400` train episodes，
+  `71486` val samples / `200` val episodes
+- decoder 配置：默认 MLP baseline，`32 -> 128 -> 128 -> 26`，`steps=2000`，
+  `batch_size=1024`
+- held-out best checkpoint：
+  - `action_mse = 0.07853357493877411`
+  - `mean_baseline_action_mse = 0.15635326504707336`
+  - `action_mean_dim_r2 = 0.504274274294193`
+  - `action_mean_dim_corr = 0.7063991037698892`
+- 全量 eval：
+  - `action_mse = 0.07298979163169861`
+  - `mean_baseline_action_mse = 0.15620023012161255`
+  - `action_mean_dim_r2 = 0.5340813008638529`
+  - `action_mean_dim_corr = 0.7275451834385211`
+- `validate` 复算 `best_checkpoint.pt` 与训练保存的 `best_val_metrics.json` 一致。
+- 与同 split mean baseline 相比，held-out action MSE 约降低 `49.8%`；与全量 eval mean
+  baseline 相比，action MSE 约降低 `53.3%`。历史两帧 RGB H1 IDM 结果使用不同样本量、
+  split 或 target 语义，只作为参考，不作为严格同 split 对照。
 
 ## 2026-05-30
 
