@@ -3,6 +3,26 @@
 ## 2026-05-31
 
 **用户原始需求：**
+> 现有 h2r pair 的 Masquerade 渲染 baseline
+
+**创建的任务：**
+- [058] 现有 h2r pair 的 Masquerade 渲染 baseline
+
+**直接修改：**
+- 新增 `src.pipeline.masquerade_baseline`：读取现有
+  `training_data/pair/h2r/1s/<task>/manifest.jsonl`，按 `pair_id` / task 选择样本，
+  从 `control_video` 自动估计 human foreground mask、左右半边 bbox、trajectory 和
+  annotation JSONL，并用 mask 对 control frame 做 inpaint 背景重绘。
+- baseline robot 由 `training_data/segment/<task>/<episode>/<seg>_joints.parquet`
+  + `seg*_video.mp4` + G1 URDF/mesh + `BEST_PARAMS` 相机标定重渲染为不透明 mesh，输出
+  `video/`、`control_video/`、`background/`、`gt_video/`、`human_overlay/`、`compare/`、
+  `human_annotations/`、`manifest.jsonl` 和 `summary.json`。
+- `scripts/flip_run.sh` 新增 `masquerade_baseline` 子命令；同步更新
+  `doc/step_5_training_infra.md` 和 `doc/scripts_inventory.md`。
+- 当前实现是可运行的第一版复现骨架，human 分割和背景重绘仍是启发式，
+  复现质量后续还需要继续改进。
+
+**用户原始需求：**
 > 先改别的 2. 加指标 3. 解决数据的问题, 现在是不是 eval 划分的不太对, 如果不对的话修正过来
 
 **直接修改：**
