@@ -17,12 +17,18 @@ Subcommands:
   mitty_cache      Run python -m src.pipeline.mitty_cache.
   sam2_precompute  Run python -m src.pipeline.sam2_precompute.
   r2h_synthesize   Run python -m src.pipeline.r2h_synthesize.
+  masquerade_baseline
+                   Run python -m src.pipeline.masquerade_baseline.
   syn_error_analysis
                    Run scripts/run_syn_error_analysis.py.
   wan_vae_idm      Run python -m src.pipeline.wan_vae_idm.
   wan_pair_idm     Run python -m src.pipeline.wan_pair_idm.
   humanoid_pair_idm
                    Run python -m src.pipeline.humanoid_pair_idm.
+  adaworld_action_encoder
+                   Run python -m src.pipeline.adaworld_action_encoder.
+  adaworld_action_decoder
+                   Run python -m src.pipeline.adaworld_action_decoder.
   train            Run python -m torch.distributed.run -m src.pipeline.train.
   train_mitty_mixed_h2r
                    Run python -m torch.distributed.run -m src.pipeline.train_mitty_mixed_h2r.
@@ -38,10 +44,13 @@ Examples:
   scripts/flip_run.sh mitty_cache --cuda 0 -- --pair-dir training_data/pair/1s/train --output training_data/cache/1s/train --device cuda:0 --no-frames
   scripts/flip_run.sh sam2_precompute --cuda 0 -- --task all --device cuda:0 --resume
   scripts/flip_run.sh r2h_synthesize --cuda 0 -- --source-task Inspire_Collect_Clothes_MainCamOnly --duration 1s --run RUN --checkpoint latest --num-samples 1000 --resume-existing
+  scripts/flip_run.sh masquerade_baseline -- --task Inspire_Pickup_Pillow_MainCamOnly --head 1
   scripts/flip_run.sh syn_error_analysis --cuda 0 -- --run RUN --checkpoint latest
   scripts/flip_run.sh wan_vae_idm --cuda 2 -- train --device cuda:0 --max-samples 32
   scripts/flip_run.sh wan_pair_idm --cuda 2 -- train --device cuda:0 --max-samples 32
   scripts/flip_run.sh humanoid_pair_idm --cuda 2 -- train --device cuda:0 --data-root /disk_n/zzf/flip/data/humanoid-everyday-h1-chunks0-6-8-200 --train-samples 700 --eval-samples 100 --steps 1000
+  scripts/flip_run.sh adaworld_action_encoder --cuda 2 -- extract --device cuda:0 --output-dir tmp/adaworld_action_encoder_h1_smoke --max-samples 8
+  scripts/flip_run.sh adaworld_action_decoder --cuda 2 -- train --device cuda:0 --latent-path tmp/adaworld_action_encoder_h1_smoke --steps 100
   scripts/flip_run.sh train --cuda 2,3 --nproc 2 -- --task-name pair_1s --max-steps 1000
   scripts/flip_run.sh train_mitty_mixed_h2r --cuda 2,3 --nproc 2 -- --task-name mixed_h2r --original-train-tasks Task_A --syn-train-tasks Task_A_syn --ood-eval-tasks Task_C --original-train-size 400 --syn-train-size 400 --max-steps 1000
   scripts/flip_run.sh eval_mitty --cuda 2 -- --device cuda:0 --eval-tail-percent 10
@@ -78,7 +87,7 @@ case "$subcommand" in
   nvidia-smi)
     exec nvidia-smi "$@"
     ;;
-  mitty_cache|sam2_precompute|r2h_synthesize|syn_error_analysis|wan_vae_idm|wan_pair_idm|humanoid_pair_idm|train|train_mitty_mixed_h2r|eval_mitty)
+  mitty_cache|sam2_precompute|r2h_synthesize|masquerade_baseline|syn_error_analysis|wan_vae_idm|wan_pair_idm|humanoid_pair_idm|adaworld_action_encoder|adaworld_action_decoder|train|train_mitty_mixed_h2r|eval_mitty)
     ;;
   *)
     usage >&2
@@ -142,6 +151,9 @@ case "$subcommand" in
   r2h_synthesize)
     exec "$PYTHON_BIN" -m src.pipeline.r2h_synthesize "${script_args[@]}"
     ;;
+  masquerade_baseline)
+    exec "$PYTHON_BIN" -m src.pipeline.masquerade_baseline "${script_args[@]}"
+    ;;
   syn_error_analysis)
     exec "$PYTHON_BIN" scripts/run_syn_error_analysis.py "${script_args[@]}"
     ;;
@@ -153,6 +165,12 @@ case "$subcommand" in
     ;;
   humanoid_pair_idm)
     exec "$PYTHON_BIN" -m src.pipeline.humanoid_pair_idm "${script_args[@]}"
+    ;;
+  adaworld_action_encoder)
+    exec "$PYTHON_BIN" -m src.pipeline.adaworld_action_encoder "${script_args[@]}"
+    ;;
+  adaworld_action_decoder)
+    exec "$PYTHON_BIN" -m src.pipeline.adaworld_action_decoder "${script_args[@]}"
     ;;
   train)
     if [[ -z "$nproc" ]]; then

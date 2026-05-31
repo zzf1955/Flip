@@ -3,6 +3,65 @@
 ## 2026-05-31
 
 **用户原始需求：**
+> 现有 h2r pair 的 Masquerade 渲染 baseline
+
+**创建的任务：**
+- [058] 现有 h2r pair 的 Masquerade 渲染 baseline
+
+**直接修改：**
+- 新增 `src.pipeline.masquerade_baseline`：读取现有
+  `training_data/pair/h2r/1s/<task>/manifest.jsonl`，按 `pair_id` / task 选择样本，
+  从 `control_video` 自动估计 human foreground mask、左右半边 bbox、trajectory 和
+  annotation JSONL，并用 mask 对 control frame 做 inpaint 背景重绘。
+- baseline robot 由 `training_data/segment/<task>/<episode>/<seg>_joints.parquet`
+  + `seg*_video.mp4` + G1 URDF/mesh + `BEST_PARAMS` 相机标定重渲染为不透明 mesh，输出
+  `video/`、`control_video/`、`background/`、`gt_video/`、`human_overlay/`、`compare/`、
+  `human_annotations/`、`manifest.jsonl` 和 `summary.json`。
+- `scripts/flip_run.sh` 新增 `masquerade_baseline` 子命令；同步更新
+  `doc/step_5_training_infra.md` 和 `doc/scripts_inventory.md`。
+- 当前实现是可运行的第一版复现骨架，human 分割和背景重绘仍是启发式，
+  复现质量后续还需要继续改进。
+
+**用户原始需求：**
+> 先改别的 2. 加指标 3. 解决数据的问题, 现在是不是 eval 划分的不太对, 如果不对的话修正过来
+
+**直接修改：**
+- 为 `src.pipeline.wan_pair_idm` 和 `src.pipeline.humanoid_pair_idm` 新增
+  normalized MSE、per-dim R2、per-dim correlation、预测方差比等诊断指标；
+  validation 现在会输出更多能判断“是否只是在回归均值”的统计量。
+- 两个入口的 `validate` / `eval` 现在默认复用 checkpoint 中保存的数据 root、
+  resize、split 和 seed，避免训练和复算使用不同的样本划分。
+- Humanoid H1 默认 split 改为 `episode`，并让显式 `--train-samples` /
+  `--eval-samples` 在 episode 不重叠的前提下截取样本，修正原先 sample split 的
+  episode 泄漏问题。
+- 更新 `doc/step_5_training_infra.md`、`doc/scripts_inventory.md`，同步记录新的指标
+  和 split 语义。
+
+**用户原始需求：**
+> 发布一个新的 task,做区间的预测
+
+**创建的任务：**
+- [052] 两帧区间平均动作 IDM
+
+**直接修改（task 052 完成）：**
+- `src.pipeline.humanoid_pair_idm` 新增 `--frame-delta`，把输入改成
+  `(frame_t, frame_{t+d})`，标签改成 `mean(action[t:t+d])`；checkpoint 和验证回放
+  都保存并复用 `frame_delta` / `target_semantics` / split 配置。
+- `validate` / `eval` / `train --help` 全部确认接到 `--frame-delta`，并继续使用
+  episode-level split；旧 checkpoint 需要显式 `--allow-cli-split`。
+- 完成 H1 smoke：`frame_delta=4, steps=10, max_samples=128`，训练与验证都无 NaN。
+- 完成 H1 sweep：`d=1/2/4/8/16`，结果是 `d=1` 最好，`best action_mse=0.107009`，
+  `mean baseline=0.110856`；`d>1` 没有稳定优于默认 baseline，因此默认仍保持
+  `frame_delta=1`。
+- 发现 `data/humanoid-everyday-h1-chunks0-6-8-200` 含 13 个不可读 parquet，实际 smoke /
+  sweep 使用了临时 symlink 根 `tmp/h1_t052_valid_200_v2`，没有修改原始数据。
+- 2026-05-31 复核当前数据根时，1600 个 parquet 均可按 `action/frame_index/next.done`
+  读取，且对应 `videos/chunk-*/egocentric/episode_*.mp4` 全部存在；当前无需删除坏数据或
+  从外网补源。
+- 同步更新 `doc/step_5_training_infra.md`、`doc/scripts_inventory.md`，把区间预测语义、
+  sweep 结论和数据注意事项写回文档。
+
+**用户原始需求：**
 > 新建一个 task,做如下事情
 > 1. 在 flip/data/humanoid-everyday-h1-chunks0-6-8-200 上训练,这个数据多
 > 2. 分 task 训练
@@ -12,22 +71,57 @@
 - [053] H1 全量 task 分组训练与 Transformer 架构探索
 
 **追加要求：**
-> 先用当前架构在大数据集上训练，看效果再改架构。
-> 之后的训练不再区分 task，task 太碎了，先尝试 Transformer。
+> task 太碎，之后训练不再区分 task；先尝试 Transformer。
 
-**阶段改动：**
-- `src.pipeline.humanoid_pair_idm` 先保持当前 `SmallPairCnn` 架构不变，补齐
-  Humanoid Everyday H1 的 task-aware 数据路径：读取 `meta/tasks.jsonl` /
-  `meta/episodes.jsonl`，样本显式携带 `task_index`、`task`、`category`。
-- 训练入口新增 `--task-indexes`、`--tasks`、`--categories` 过滤，
-  `--split-by task|category` 和 `--val-task-indexes`，用于单 task、task group、
-  全量联合训练和跨 task holdout。
-- `train` 输出 `split_manifest.json`，最终验证输出 `val_task_metrics.csv` /
-  `best_val_task_metrics.csv`；`validate` / `eval` 同步输出 task 级 metrics，便于先看
-  当前小 CNN baseline 在大数据集上的 task 分布表现，再决定是否改 Transformer 架构。
-- 当前实验主线已经切换为 Transformer baseline：训练默认 `--model-arch transformer`，
-  默认 split 回到 sample/episode 级，不再把 task 作为主切分轴；task 信息仅用于审计
-  和 per-task 指标。
+**直接修改：**
+- `src.pipeline.humanoid_pair_idm` 在主线已有 interval mean action 语义上新增
+  `--model-arch {transformer,small_cnn}`，默认使用 Transformer，保留 small CNN 作为
+  对照 baseline。
+- Transformer 入口使用两帧 RGB patch embedding、CLS token、frame embedding 和
+  `TransformerEncoder` 聚合后回归 26 维 action；checkpoint 保存完整架构配置，
+  `validate` / `eval` 可复用 Transformer checkpoint。
+- 后续架构对照不再默认按 task 切训练，沿用 sample / episode split；task 信息只作为数据审计
+  背景，不作为当前训练主轴。
+- 已完成同口径 sample split 对照：Transformer `1000 step` 的 normalized RMSE 为
+  `0.760`，small CNN 为 `0.980`，mean baseline 为 `1.001`；26 个 action 维度上
+  Transformer 均优于 CNN 和 mean baseline。
+
+**用户原始需求：**
+> 复现 `https://huggingface.co/Little-Podi/AdaWorld`，参考 task051；当前 IDM
+> 效果不好，希望从纯视觉输入中提取 action，先用 latent 空间表示 action，再接一个小
+> action head 输出具体 action。
+> 澄清：仓库 clone 名称应为 `ref-<repo_name>`，这里是 `ref-AdaWorld`；AdaWorld
+> 有 action encoder 和 world model 两部分，本次只做 `(f_t, f_{t+1}) -> 32`
+> 维连续 latent action 的 action encoder；world model 先不管。当前需要跑通的是
+> H1 两帧图像输入 action encoder，并输出 latent action。
+
+**创建的任务：**
+- [054] AdaWorld H1 两帧 action encoder latent 提取
+
+**补充结论：**
+- AdaWorld HF 权重仓库中 `lam.ckpt` 约 1.8GB，已用于 action encoder smoke。
+- `adaworld.safetensors` 的 LFS 指针大小约 11.46GB，是下游 SVD/Vista 风格 video
+  diffusion world model；当前目标只复现 action encoder，不把 world model 纳入本阶段。
+
+**用户原始需求：**
+> 现在要基于 AdaWorld 做 IDM；已经复现 AdaWorld 的 action Encoder，需要从 latent
+> action 中把机器人具体的 action 解码出来。数据在
+> `flip/data/humanoid-everyday-h1-chunks0-6-8-200`，数据流是两帧图像
+> `--AdaWorld--> latent action --action decoder--> action`；需要确定 decoder
+> 架构并实现整个训练 pipeline。
+
+**创建的任务：**
+- [056] AdaWorld latent action decoder IDM
+
+**直接修改：**
+- 新增 `src.pipeline.adaworld_action_decoder`：读取 task054 的 `latent_actions.npz`，
+  按 `episode/chunk/rel_frame_t` 回查 H1 `action` 标签，训练
+  `(frame_t, frame_{t+1}) -> z_t -> action_t` 的下游 action decoder。
+- decoder 架构采用小 MLP baseline，默认 `32 -> 128 -> 128 -> 26`；因为 AdaWorld LAM
+  已经把两帧图像压成低维 action latent，第一版不再使用 CNN。后续只有需要多步时序
+  上下文或 task 条件时才考虑 Transformer / RNN。
+- `scripts/flip_run.sh` 新增 `adaworld_action_decoder` 子命令，并更新
+  `doc/scripts_inventory.md`、`doc/step_5_training_infra.md`。
 
 ## 2026-05-30
 

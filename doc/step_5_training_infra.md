@@ -323,7 +323,43 @@ training_data/pair/h2r/1s/Inspire_Collect_Clothes_MainCamOnly_syn/
 └── pair_order.jsonl
 ```
 
-随后按普通 h2r pair 运行 VAE/T5 cache：
+### Masquerade 风格 h2r 直接渲染 baseline
+
+`src.pipeline.masquerade_baseline` 读取现有 `training_data/pair/h2r/1s/<task>/manifest.jsonl`，
+按 task 选择 pair，再从 `training_data/segment/<task>/<episode>/<seg>_joints.parquet`
+和对应 `seg*_video.mp4` 重新渲染 robot baseline。human 侧不依赖人工标注，而是直接从
+`control_video/pair_XXXX.mp4` 自动估计 foreground mask、左右半边 bbox、trajectory
+和逐帧 annotation JSONL，然后用 mask 对 control frame 做 inpaint 背景重绘，再在
+该背景上合成不透明机器人 mesh。
+这是一版可跑通的复现骨架，human 分割和背景重绘仍是启发式实现，后续需要继续提升
+mask 稳定性、inpaint 质量和机器人遮挡边界。
+
+默认输出：
+
+```text
+output/masquerade_baseline/h2r/1s/<task>/
+├── video/pair_NNNN.mp4            (baseline robot render)
+├── control_video/pair_NNNN.mp4    (原 human control clip)
+├── background/pair_NNNN.mp4       (human mask inpaint 背景重绘)
+├── gt_video/pair_NNNN.mp4         (原 robot GT clip)
+├── human_overlay/pair_NNNN.mp4    (human mask/bbox overlay)
+├── human_annotations/pair_NNNN.jsonl
+├── human_annotations/pair_NNNN.npz
+├── compare/pair_NNNN.mp4          (human | baseline | GT)
+├── manifest.jsonl
+└── summary.json
+```
+
+典型运行：
+
+```bash
+scripts/flip_run.sh masquerade_baseline -- \
+  --task Inspire_Pickup_Pillow_MainCamOnly \
+  --head 1 \
+  --output-root tmp/masquerade_baseline_smoke
+```
+
+对于 `_syn` 数据，随后按普通 h2r pair 运行 VAE/T5 cache：
 
 ```bash
 CUDA_VISIBLE_DEVICES=2 python -m src.pipeline.mitty_cache \
@@ -676,6 +712,11 @@ episode 中 `frame_index=t` 的 action。该脚本固定使用
 - arm 网络预测 `action.ee_action` 12 维。
 - hand 网络预测 `action.hand_cmd` 12 维。
 - arm / hand 是两套独立小 CNN，在同一训练入口中同时训练和保存，不共享参数。
+- `validate` / `eval` 默认复用 checkpoint 中保存的数据 root、resize、split 和
+  seed，避免训练与复算使用不同划分；需要旧 checkpoint 回退到 CLI split 时，
+  必须显式传 `--allow-cli-split`。
+- 指标同时包含原始 MSE、normalized MSE、per-dim R2 / correlation 和预测方差比，
+  用于判断模型是否只是回归均值。
 
 训练输出包括 `train_loss.csv`、`eval_loss.csv`、`checkpoint.pt`、
 `best_checkpoint.pt`、`val_predictions.csv`、`best_val_predictions.csv` 和
@@ -683,26 +724,36 @@ episode 中 `frame_index=t` 的 action。该脚本固定使用
 `hand_model_state`，并保存两类 action 各自的 mean/std。
 
 Humanoid Everyday H1 子集使用独立 `src.pipeline.humanoid_pair_idm` 入口。该路径直接读取 LeRobot 目录：
-`data/chunk-*/*.parquet` 提供 `action[t]`，`videos/chunk-*/egocentric/*.mp4` 提供
-相邻 RGB 帧。H1 版本不再拆成旧 WBT 的 `ee_action` / `hand_cmd` 两个 12 维头，而是
-训练一个单独动作回归模型，当前默认架构改为 **Transformer**，同时保留 `small_cnn`
-作为对照 baseline：
+`data/chunk-*/*.parquet` 提供 `action`，`videos/chunk-*/egocentric/*.mp4` 提供
+RGB 帧。H1 版本不再拆成旧 WBT 的 `ee_action` / `hand_cmd` 两个 12 维头，而是
+训练一个单独模型输出完整 26 维 `action`。当前默认 `--model-arch transformer`，
+也可以显式传 `--model-arch small_cnn` 复现实验对照：
 
-- 输入：`frame_t` 与 `frame_{t+1}` resize 后拼成 6 通道 RGB。
-- 输出：同一 episode/parquet 中 `frame_index=t` 的 `action`，默认 26 维。
-- 对齐口径仍为 `(s_t, s_{t+1}) -> a_t`；最后一帧不构成 pair。
-- 默认训练不再按 task 切分；如果只是做架构对照，优先使用 `--split-by sample`
-  或 `--split-by episode`。`--task-indexes` / `--tasks` / `--categories` 仍保留为
-  显式过滤工具，但不再是默认实验主线。
-- task 元信息仍来自同一数据根下的 `meta/tasks.jsonl` 和 `meta/episodes.jsonl`，
-  样本会记录 `task_index`、`task` 和 `category`，但这些信息现在主要用于审计、
-  统计和 per-task 指标，而不是训练切分主轴。缺少 metadata、episode 长度不一致、
-  parquet 内 `episode_index` / `task_index` 与 metadata 不一致都会直接报错。
-- `train` 会写 `split_manifest.json`，记录 filters、split 参数以及 train / val
-  的 task 分布；最终验证会额外写 `val_task_metrics.csv` 和
-  `best_val_task_metrics.csv`，包含每个 task 的 `action_mse`、mean baseline、
-  `variance_ratio`、relative L2 和预测/目标标准差。`validate` / `eval` 也会输出
-  task 级指标表，方便后续比较 Transformer 与 CNN。
+- 输入：`frame_t` 与 `frame_{t+d}` resize 后拼成 6 通道 RGB。
+- 输出：半开区间 `action[t:t+d]` 的均值，默认 `d=1`，`frame_delta` 记录这个区间
+  长度。
+- `frame_stride` 只表示候选起点采样步长；`frame_delta` 表示动作平均窗口和第二帧间隔。
+- 默认 split 为 `episode`，避免同一 episode 的 pair 同时落入 train / eval；
+  显式 `--train-samples` / `--eval-samples` 也会按 episode 顺序截取，保证
+  train/eval 来自不重叠 episode。
+- 旧 checkpoint 若缺少 replay 所需的 split/config 字段，需要显式传
+  `--allow-cli-split` 才能继续用 CLI 参数复算。
+- 指标同时包含原始 MSE、mean baseline、normalized MSE、per-dim R2 / correlation
+  和预测方差比，方便判断模型是否只是回归均值。
+- Transformer 架构把两帧 RGB 分别做 patch embedding，加入 CLS token、frame embedding
+  和 2D sin/cos 位置编码，再用 `TransformerEncoder` 聚合后回归 26 维 action。
+- task 太碎，当前架构对照不再默认按 task 切训练；使用 sample / episode split，并只把
+  task 作为数据背景和后续审计维度。
+- 这次 H1 sweep 里，`d=1` 在 `1/2/4/8/16` 中最好，`best action_mse=0.107009`，
+  比 mean baseline `0.110856` 略好；`d>1` 没有带来稳定提升，所以默认仍保持
+  `frame_delta=1`。
+- 同口径 `split-by sample`、`frame_stride=4`、`1000 step` 对照中，Transformer 明显优于
+  small CNN：normalized RMSE 为 `0.760`，small CNN 为 `0.980`，mean baseline 为
+  `1.001`；26 个 action 维度上 Transformer 均优于 CNN 和 mean baseline。
+- 当前仓库里的 `data/humanoid-everyday-h1-chunks0-6-8-200` 已重新复核：
+  所有 1600 个 parquet 都能按 `action/frame_index/next.done` 口径读取，且对应视频文件都存在。
+  task052 当时使用的临时 symlink 根 `tmp/h1_t052_valid_200_v2` 现在只作为历史记录保留，
+  不再是当前必需的替代数据根。
 
 H1 smoke 示例：
 
@@ -712,14 +763,18 @@ scripts/flip_run.sh humanoid_pair_idm --cuda 2 -- train \
   --data-root /disk_n/zzf/flip/data/humanoid-everyday-h1-chunks0-6-8-200 \
   --output-dir tmp/humanoid_pair_idm_h1_smoke \
   --max-samples 128 \
-  --max-pairs-per-episode 1 \
-  --frame-stride 8 \
+  --max-pairs-per-episode 4 \
+  --frame-delta 4 \
   --steps 10 \
   --batch-size 8 \
   --eval-every 5 \
   --val-max-samples 32 \
   --resize 256x256 \
-  --split-by sample
+  --split-by episode \
+  --model-arch transformer \
+  --transformer-embed-dim 128 \
+  --transformer-depth 2 \
+  --transformer-num-heads 4
 ```
 
 H1 700 训练 / 100 eval / 1000 step 示例：
@@ -731,52 +786,111 @@ scripts/flip_run.sh humanoid_pair_idm --cuda 2 -- train \
   --output-dir tmp/humanoid_pair_idm_h1_700train_100eval_s1000 \
   --max-samples 0 \
   --frame-stride 4 \
-  --split-by sample \
+  --split-by episode \
   --train-samples 700 \
   --eval-samples 100 \
   --steps 1000 \
   --batch-size 16 \
   --eval-every 100 \
-  --resize 256x256
+  --resize 256x256 \
+  --model-arch transformer
 ```
 
-H1 当前 Transformer baseline 的大数据训练示例。该命令先保持统一的样本级切分，
-用 Transformer 比对现有 CNN 基线：
+H1 interval sweep 示例：
 
 ```bash
-scripts/flip_run.sh humanoid_pair_idm --cuda 2 -- train \
-  --device cuda:0 \
-  --data-root /disk_n/zzf/flip/data/humanoid-everyday-h1-chunks0-6-8-200 \
-  --output-dir output/humanoid_pair_idm/h1_transformer_baseline \
-  --max-samples 0 \
-  --frame-stride 4 \
-  --split-by sample \
-  --steps 1000 \
-  --batch-size 16 \
-  --eval-every 100 \
-  --val-max-samples 4096 \
-  --resize 256x256 \
-  --model-arch transformer \
-  --transformer-patch-size 32 \
-  --transformer-embed-dim 256 \
-  --transformer-depth 4 \
-  --transformer-num-heads 8
+for d in 1 2 4 8 16; do
+  scripts/flip_run.sh humanoid_pair_idm --cuda 2 -- train \
+    --device cuda:0 \
+    --data-root /disk_n/zzf/flip/data/humanoid-everyday-h1-chunks0-6-8-200 \
+    --output-dir tmp/humanoid_pair_idm_h1_sweep_d${d} \
+    --max-samples 512 \
+    --max-pairs-per-episode 16 \
+    --frame-delta "${d}" \
+    --split-by episode \
+    --steps 200 \
+    --batch-size 32 \
+    --eval-every 50 \
+    --val-max-samples 128 \
+    --resize 256x256
+done
 ```
 
-如果要做显式对照，可以临时切回小 CNN：
+### AdaWorld Action Encoder
+
+`src.pipeline.adaworld_action_encoder` 只接入 AdaWorld 的 LAM action encoder，不运行
+AdaWorld 后续 world model。该入口从 Humanoid Everyday H1 LeRobot 数据读取相邻两帧
+egocentric RGB，按 AdaWorld LAM 训练口径中心裁方、resize 到 256、归一化到 `[0,1]`，
+然后输出 32 维连续 latent action：
+
+- 输入：`(frame_t, frame_{t+1})`，来自
+  `videos/chunk-*/egocentric/episode_*.mp4`。
+- 输出：`z_t`，shape 为 `[N, 32]` 的 continuous latent action。
+- 该入口不读取真实 action label，也不训练下游 action head。
+- 参考代码仓库为 `ref-AdaWorld`；LAM checkpoint 只使用
+  `ref-AdaWorld-hf/lam.ckpt`，不下载或加载 `adaworld.safetensors` world model。
+- world model checkpoint 的 HF LFS 指针大小约 `11.46 GB`，对应一个明显重于 LAM 的
+  video diffusion 模型；当前 FLIP 目标只保留 action encoder，不建议把 world model 作为
+  小规模复现目标。
+
+输出目录包含：
+
+- `latent_actions.npz`：`latent_actions [N,32]`，以及 episode / chunk /
+  `rel_frame_t` / `rel_frame_tp1` 数组。
+- `manifest.jsonl`：逐样本视频路径、parquet 路径、帧号和 latent list。
+- `summary.json`：AdaWorld revision、checkpoint、预处理配置、latent mean/std/min/max。
+
+H1 action encoder smoke 示例：
 
 ```bash
-scripts/flip_run.sh humanoid_pair_idm --cuda 2 -- train \
+scripts/flip_run.sh adaworld_action_encoder --cuda 2 -- extract \
   --device cuda:0 \
   --data-root /disk_n/zzf/flip/data/humanoid-everyday-h1-chunks0-6-8-200 \
-  --output-dir output/humanoid_pair_idm/h1_small_cnn_baseline \
-  --frame-stride 4 \
-  --split-by sample \
-  --steps 1000 \
-  --batch-size 16 \
-  --eval-every 100 \
-  --resize 256x256 \
-  --model-arch small_cnn
+  --output-dir tmp/adaworld_action_encoder_h1_smoke \
+  --max-samples 8 \
+  --max-pairs-per-episode 1 \
+  --batch-size 1 \
+  --dtype fp16
+```
+
+如果使用原始 `data/humanoid-everyday-h1-chunks0-6-8-200`，当前复核没有发现不可读 parquet；
+入口仍然对不可读 parquet 直接失败，不做静默跳过。
+
+### AdaWorld Latent Action Decoder
+
+`src.pipeline.adaworld_action_decoder` 只训练 AdaWorld latent action 的下游解码器，不再
+回到图像端。它读取 task054 产出的 `latent_actions.npz`，其中每一行对应
+`(frame_t, frame_{t+1}) -> z_t`，并通过 `episode/chunk/rel_frame_t` 回查 H1 LeRobot
+parquet 中同一帧的 `action` 标签，形成监督对：
+
+- 输入：`z_t`，shape 为 `[N, 32]` 的 AdaWorld continuous latent action。
+- 输出：H1 `action_t`，当前实现按 26 维 `action` 向量训练。
+- 模型：小 MLP baseline，默认 `32 -> 128 -> 128 -> 26`，使用 latent / action 双边标准化。
+- 训练目标：标准化后的 action MSE；验证时回到原始 action 空间，输出 MSE、R2、
+  correlation、方差比等指标。
+
+输出目录包含：
+
+- `checkpoint.pt` / `best_checkpoint.pt`：decoder 权重、latent 统计量、action 统计量和
+  训练配置。
+- `train_loss.csv` / `eval_loss.csv`：训练与验证损失。
+- `val_predictions.csv` / `best_val_predictions.csv`：逐样本预测表。
+- `metrics.json` / `val_metrics.json` / `best_val_metrics.json`：评估摘要。
+- `loss_curve.png`：训练 / 验证损失曲线。
+
+训练示例：
+
+```bash
+scripts/flip_run.sh adaworld_action_decoder --cuda 2 -- train \
+  --device cuda:0 \
+  --data-root /disk_n/zzf/flip/data/humanoid-everyday-h1-chunks0-6-8-200 \
+  --latent-path tmp/adaworld_action_encoder_h1_smoke/latent_actions.npz \
+  --output-dir tmp/adaworld_action_decoder_h1_smoke \
+  --max-samples 8 \
+  --steps 100 \
+  --batch-size 8 \
+  --eval-every 50 \
+  --val-max-samples 4
 ```
 
 小规模 smoke 示例：
