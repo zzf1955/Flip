@@ -1,5 +1,45 @@
 # 需求日志
 
+## 2026-06-01
+
+**用户原始需求：**
+> 先看一下当前不同 task 中, Transformer 的做法/原 Ada World decoder 的效果. 然后跑一下这个改进后的 Ada World decoder.
+
+**上下文复核：**
+- task053 的 H1 RGB Transformer 是两帧 patch embedding + CLS / frame embedding +
+  `TransformerEncoder`，比 small CNN 更好，但仍是图像端 IDM。
+- task060 的 active worktree 已把 RGB IDM 推到 `motion_transformer`：额外构造
+  patch 级 motion token，使用 `cls + motion_cls + frame0_mean + frame1_mean +
+  motion_mean` 读出，并补上 AdamW betas、warmup + cosine、min lr 等训练细节。
+- task057 的 AdaWorld decoder baseline 是 `32 -> 128 -> 128 -> 26` 小 MLP，
+  held-out `action_mse=0.07853357493877411`，全量 eval `action_mse=0.07298979163169861`。
+
+**直接修改：**
+- `src.pipeline.adaworld_action_decoder` 新增 `--decoder-arch {mlp,residual_mlp,gated_mlp}`；
+  原 MLP baseline 保留，当前推荐默认切到 `residual_mlp`。
+- `residual_mlp` 使用 hidden projection + pre-norm residual MLP blocks + 2 层输出 head；
+  `gated_mlp` 在 residual block 内用 SiLU value 和 sigmoid gate 做 gated 变体。
+- 训练超参新增 AdamW `--adam-beta1/--adam-beta2`、`--lr-warmup-steps`、
+  `--lr-warmup-ratio`，scheduler 改为可表达 warmup + cosine 或 warmup + flat。
+- checkpoint 保存完整 decoder 架构、学习率、weight decay、betas、warmup 和 scheduler
+  配置，`validate` / `eval` 严格 replay。
+- 更新 `doc/step_5_training_infra.md`、`doc/scripts_inventory.md`，记录推荐配置、命令和
+  task061 对照指标。
+
+**task061 全量结果：**
+- 推荐训练配置：`residual_mlp`、`hidden_dim=256`、`depth=4`、`dropout=0.02`、
+  `lr=5e-4`、`weight_decay=1e-4`、`betas=(0.9,0.95)`、cosine scheduler、
+  `min_lr_ratio=0.02`、`lr_warmup_ratio=0.05`、`steps=3000`、`batch_size=1024`。
+- held-out best checkpoint：`action_mse=0.054645732045173645`，
+  `action_mean_dim_r2=0.6565681374990023`，`action_mean_dim_corr=0.809087702861199`，
+  `action_pred_std_ratio_mean=0.8399375424935267`。
+- 全量 eval：`action_mse=0.04235832020640373`，
+  `action_mean_dim_r2=0.72525387773147`，`action_mean_dim_corr=0.850245631658114`，
+  `action_pred_std_ratio_mean=0.8563885574157422`。
+- 相比 task057，held-out `action_mse` 约降低 `30.4%`；全量 eval `action_mse` 约降低
+  `42.0%`。剩余高 MSE 维度主要是 `action_dim_06/07/08/09/10/22/23`，但整体预测方差比
+  已从 task057 的约 `0.71` 提高到约 `0.84-0.86`。
+
 ## 2026-05-31
 
 **用户原始需求：**
