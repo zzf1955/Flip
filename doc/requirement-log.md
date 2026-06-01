@@ -3,6 +3,53 @@
 ## 2026-05-31
 
 **用户原始需求：**
+> 现在几个不同的方法：Baseline、Ada World decoder、Transformer。写一个文档，统一说明这个
+> IDM 的思路、实验、数据配置等；先仅写 H1 数据上的相关信息。
+
+**直接修改：**
+- 新增 `doc/h1_idm_methods.md`，只整理 Humanoid Everyday H1 数据上的 IDM 方法和实验。
+- 文档统一说明完整 H1 数据根、`560422` 相邻帧 pair、`1400/200` episode split、
+  mean baseline 定义、AdaWorld latent decoder 数据流和 RGB motion Transformer 数据流。
+- 汇总完整 held-out split 上三种方法的同口径指标，并把后续报告主指标固定为：
+  归一化空间 MSE、action relative L2、归一化空间预测方差。
+- 补充 task061 optimized AdaWorld decoder；完整 held-out split 上：
+  mean baseline normalized MSE `1.007003` / relative L2 `0.474226` / pred norm var `0.0`，
+  task061 AdaWorld normalized MSE `0.349901` / relative L2 `0.280356` / pred norm var `0.706071`，
+  RGB motion Transformer normalized MSE `0.320904` / relative L2 `0.272016` /
+  pred norm var `0.689259`。
+- 在 `doc/step_5_training_infra.md` 的 H1 IDM 段落加入该统一文档入口。
+
+**用户原始需求：**
+> 好的, 现在你想办法优化一下 tf 的这个 IDM, 包括模型架构, 学习率之类的细节
+
+**创建的任务：**
+- [060] H1 Transformer IDM 架构与训练超参优化
+
+**直接修改：**
+- `src.pipeline.humanoid_pair_idm` 新增默认 `motion_transformer` 骨干，保留旧
+  `transformer` 作为 legacy checkpoint / ablation 对照，并把两帧 patch 差异显式编码成
+  motion tokens，再用 `cls + motion_cls + frame0_mean + frame1_mean + motion_mean` 读出。
+- 训练默认改为 AdamW `lr=3e-4`、`weight_decay=1e-2`、`betas=(0.9,0.95)`，并使用
+  cosine scheduler + 5% warmup，`min_lr_ratio=0.02`；Transformer 默认 `hidden_dim=256`、
+  `transformer_depth=6`、`transformer_dropout=0.05`。
+- smoke、中等规模对照和完整 H1 数据口径训练都已跑通，`validate` 对 `best_checkpoint.pt`
+  的复算与训练内指标一致。
+- 按 AdaWorld task057 的完整数据口径运行：`data/humanoid-everyday-h1-chunks0-6-8-200`、
+  `max_samples=0`、`frame_stride=1`、episode-level split，得到 `488936` train samples /
+  `1400` train episodes 和 `71486` val samples / `200` val episodes。
+- 完整口径 run（`steps=2000`、`batch_size=32`，中途 eval 抽 `4096` held-out samples）
+  在子集上达到 `action_mse=0.052878`，mean baseline `0.157396`，`normalized MSE=0.328745`，
+  `pred_std_ratio_mean=0.827459`。
+- 对 `best_checkpoint.pt` 跑完整 held-out validate：`71486` val samples 上
+  `action_mse=0.051443`，mean baseline `0.156353`，`normalized MSE=0.320904`，
+  `action_mean_dim_r2=0.685052`，`action_mean_dim_corr=0.826011`，
+  `pred_std_ratio_mean=0.828955`。同 split task061 optimized AdaWorld latent decoder
+  held-out `action_mse=0.054646`，当前 RGB motion Transformer 低约 `5.9%`；task057
+  AdaWorld baseline decoder `action_mse=0.078534` 仅作为历史基础 MLP baseline。
+- 同步更新 `doc/step_5_training_infra.md`、`doc/scripts_inventory.md`、
+  `doc/requirement-log.md`，把新的默认架构、学习率和实验结果写回文档。
+
+**用户原始需求：**
 > 先改别的 2. 加指标 3. 解决数据的问题, 现在是不是 eval 划分的不太对, 如果不对的话修正过来
 
 **直接修改：**
