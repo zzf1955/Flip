@@ -401,7 +401,11 @@ class HumanoidPairTransformer(nn.Module):
             batch_first=True,
             norm_first=True,
         )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=depth)
+        self.encoder = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=depth,
+            enable_nested_tensor=False,
+        )
         self.norm = nn.LayerNorm(embed_dim)
         self.head = nn.Sequential(
             nn.Linear(embed_dim, hidden_dim),
@@ -439,6 +443,152 @@ class HumanoidPairTransformer(nn.Module):
         return self.head(x)
 
 
+class HumanoidPairMotionTransformer(nn.Module):
+    def __init__(
+        self,
+        action_dim: int,
+        *,
+        patch_size: int = 32,
+        embed_dim: int = 256,
+        depth: int = 6,
+        num_heads: int = 8,
+        mlp_ratio: float = 4.0,
+        hidden_dim: int = 256,
+        dropout: float = 0.05,
+        attn_dropout: float = 0.0,
+    ):
+        super().__init__()
+        if action_dim <= 0:
+            raise ValueError(f"action_dim must be positive, got {action_dim}")
+        if patch_size <= 0:
+            raise ValueError(f"patch_size must be positive, got {patch_size}")
+        if embed_dim <= 0:
+            raise ValueError(f"embed_dim must be positive, got {embed_dim}")
+        if depth <= 0:
+            raise ValueError(f"depth must be positive, got {depth}")
+        if num_heads <= 0:
+            raise ValueError(f"num_heads must be positive, got {num_heads}")
+        if embed_dim % num_heads != 0:
+            raise ValueError(
+                f"embed_dim must be divisible by num_heads, got {embed_dim} / {num_heads}"
+            )
+        if mlp_ratio <= 0.0:
+            raise ValueError(f"mlp_ratio must be positive, got {mlp_ratio}")
+        if hidden_dim <= 0:
+            raise ValueError(f"hidden_dim must be positive, got {hidden_dim}")
+        if dropout < 0.0:
+            raise ValueError(f"dropout must be non-negative, got {dropout}")
+        if attn_dropout < 0.0:
+            raise ValueError(f"attn_dropout must be non-negative, got {attn_dropout}")
+        self.action_dim = int(action_dim)
+        self.patch_size = int(patch_size)
+        self.embed_dim = int(embed_dim)
+        self.depth = int(depth)
+        self.num_heads = int(num_heads)
+        self.mlp_ratio = float(mlp_ratio)
+        self.hidden_dim = int(hidden_dim)
+        self.dropout = float(dropout)
+        self.attn_dropout = float(attn_dropout)
+
+        self.patch_embed = nn.Conv2d(3, embed_dim, kernel_size=patch_size, stride=patch_size)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.motion_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.frame_embed = nn.Parameter(torch.zeros(1, 2, 1, embed_dim))
+        self.motion_embed = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.motion_proj = nn.Sequential(
+            nn.LayerNorm(embed_dim * 4),
+            nn.Linear(embed_dim * 4, embed_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim, embed_dim),
+        )
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=num_heads,
+            dim_feedforward=int(embed_dim * mlp_ratio),
+            dropout=max(dropout, attn_dropout),
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=depth,
+            enable_nested_tensor=False,
+        )
+        self.norm = nn.LayerNorm(embed_dim)
+        self.readout_norm = nn.LayerNorm(embed_dim * 5)
+        self.head = nn.Sequential(
+            nn.Linear(embed_dim * 5, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, action_dim),
+        )
+        self.dropout_layer = nn.Dropout(dropout)
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+        nn.init.trunc_normal_(self.motion_token, std=0.02)
+        nn.init.trunc_normal_(self.frame_embed, std=0.02)
+        nn.init.trunc_normal_(self.motion_embed, std=0.02)
+
+    def forward(self, frames: torch.Tensor) -> torch.Tensor:
+        if frames.ndim != 4 or frames.shape[1] != 6:
+            raise ValueError(f"Expected [B,6,H,W] frame pairs, got {frames.shape}")
+        b, _, h, w = frames.shape
+        if h % self.patch_size != 0 or w % self.patch_size != 0:
+            raise ValueError(
+                f"Input spatial size {h}x{w} must be divisible by patch_size={self.patch_size}"
+            )
+        pair = frames.float().view(b, 2, 3, h, w)
+        x = pair.reshape(b * 2, 3, h, w)
+        x = self.patch_embed(x)
+        ph, pw = x.shape[2], x.shape[3]
+        x = x.flatten(2).transpose(1, 2).contiguous()
+        x = x.view(b, 2, ph * pw, self.embed_dim)
+
+        x0 = x[:, 0]
+        x1 = x[:, 1]
+        motion = self.motion_proj(torch.cat([x0, x1, x1 - x0, torch.abs(x1 - x0)], dim=-1))
+        pos = build_2d_sincos_embedding(ph, pw, self.embed_dim, x.device).to(dtype=x.dtype)
+        frame_tokens = x + pos.unsqueeze(0).unsqueeze(0)
+        frame_tokens = frame_tokens + self.frame_embed[:, :2, :, :].to(
+            dtype=x.dtype,
+            device=x.device,
+        )
+        motion_tokens = motion + pos.unsqueeze(0)
+        motion_tokens = motion_tokens + self.motion_embed.to(dtype=x.dtype, device=x.device)
+
+        cls = self.cls_token.to(dtype=x.dtype, device=x.device).expand(b, -1, -1)
+        motion_cls = self.motion_token.to(dtype=x.dtype, device=x.device).expand(b, -1, -1)
+        tokens = torch.cat(
+            [
+                cls,
+                motion_cls,
+                frame_tokens[:, 0],
+                frame_tokens[:, 1],
+                motion_tokens,
+            ],
+            dim=1,
+        )
+        tokens = self.dropout_layer(tokens)
+        tokens = self.encoder(tokens)
+        tokens = self.norm(tokens)
+
+        n = ph * pw
+        cls_out = tokens[:, 0]
+        motion_cls_out = tokens[:, 1]
+        frame0_pool = tokens[:, 2:2 + n].mean(dim=1)
+        frame1_pool = tokens[:, 2 + n:2 + 2 * n].mean(dim=1)
+        motion_pool = tokens[:, 2 + 2 * n:2 + 3 * n].mean(dim=1)
+        readout = torch.cat(
+            [cls_out, motion_cls_out, frame0_pool, frame1_pool, motion_pool],
+            dim=1,
+        )
+        return self.head(self.readout_norm(readout))
+
+
 def make_humanoid_model(args: argparse.Namespace) -> nn.Module:
     if args.model_arch == "small_cnn":
         return SmallPairCnn(
@@ -449,6 +599,18 @@ def make_humanoid_model(args: argparse.Namespace) -> nn.Module:
         )
     if args.model_arch == "transformer":
         return HumanoidPairTransformer(
+            int(args.action_dim),
+            patch_size=args.transformer_patch_size,
+            embed_dim=args.transformer_embed_dim,
+            depth=args.transformer_depth,
+            num_heads=args.transformer_num_heads,
+            mlp_ratio=args.transformer_mlp_ratio,
+            hidden_dim=args.hidden_dim,
+            dropout=args.transformer_dropout,
+            attn_dropout=args.transformer_attn_dropout,
+        )
+    if args.model_arch == "motion_transformer":
+        return HumanoidPairMotionTransformer(
             int(args.action_dim),
             patch_size=args.transformer_patch_size,
             embed_dim=args.transformer_embed_dim,
@@ -485,6 +647,22 @@ def humanoid_model_payload(args: argparse.Namespace) -> dict:
             "hidden_dim": args.hidden_dim,
             "dropout": args.transformer_dropout,
             "attn_dropout": args.transformer_attn_dropout,
+            "alignment": "humanoid_frame_pair_t_to_t_plus_d_predict_mean_action_t_to_t_plus_d",
+        }
+    if args.model_arch == "motion_transformer":
+        return {
+            "model_arch": "motion_transformer",
+            "action_dim": args.action_dim,
+            "patch_size": args.transformer_patch_size,
+            "embed_dim": args.transformer_embed_dim,
+            "depth": args.transformer_depth,
+            "num_heads": args.transformer_num_heads,
+            "mlp_ratio": args.transformer_mlp_ratio,
+            "hidden_dim": args.hidden_dim,
+            "dropout": args.transformer_dropout,
+            "attn_dropout": args.transformer_attn_dropout,
+            "readout": "cls_motion_cls_frame0_mean_frame1_mean_motion_mean",
+            "motion_tokens": "patch_feature_pair_concat_delta_abs_delta",
             "alignment": "humanoid_frame_pair_t_to_t_plus_d_predict_mean_action_t_to_t_plus_d",
         }
     raise ValueError(f"Unsupported model_arch={args.model_arch!r}")
@@ -611,8 +789,17 @@ def save_humanoid_checkpoint(
             "train_ratio": args.train_ratio,
             "train_samples": args.train_samples,
             "eval_samples": args.eval_samples,
+            "lr": args.lr,
+            "weight_decay": args.weight_decay,
+            "adam_beta1": args.adam_beta1,
+            "adam_beta2": args.adam_beta2,
             "lr_scheduler": args.lr_scheduler,
             "min_lr_ratio": args.min_lr_ratio,
+            "lr_warmup_steps": args.lr_warmup_steps,
+            "lr_warmup_steps_effective": int(
+                getattr(args, "effective_lr_warmup_steps", args.lr_warmup_steps)
+            ),
+            "lr_warmup_ratio": args.lr_warmup_ratio,
             "dataset": "humanoid_everyday_lerobot",
             "robot_type": "h1",
             "frame_stride": args.frame_stride,
@@ -638,6 +825,18 @@ def load_humanoid_pair_idm(checkpoint: Path, device: str) -> tuple[nn.Module, to
         ).to(device)
     elif model_arch == "transformer":
         model = HumanoidPairTransformer(
+            int(model_cfg["action_dim"]),
+            patch_size=int(model_cfg["patch_size"]),
+            embed_dim=int(model_cfg["embed_dim"]),
+            depth=int(model_cfg["depth"]),
+            num_heads=int(model_cfg["num_heads"]),
+            mlp_ratio=float(model_cfg["mlp_ratio"]),
+            hidden_dim=int(model_cfg["hidden_dim"]),
+            dropout=float(model_cfg["dropout"]),
+            attn_dropout=float(model_cfg["attn_dropout"]),
+        ).to(device)
+    elif model_arch == "motion_transformer":
+        model = HumanoidPairMotionTransformer(
             int(model_cfg["action_dim"]),
             patch_size=int(model_cfg["patch_size"]),
             embed_dim=int(model_cfg["embed_dim"]),
@@ -720,6 +919,71 @@ def prepare_humanoid_samples(args: argparse.Namespace) -> list[HumanoidPairSampl
     )
 
 
+def effective_lr_warmup_steps(args: argparse.Namespace) -> int:
+    if args.steps <= 0:
+        raise ValueError(f"steps must be positive, got {args.steps}")
+    if args.lr_warmup_steps < 0:
+        raise ValueError(f"lr_warmup_steps must be non-negative, got {args.lr_warmup_steps}")
+    if args.lr_warmup_ratio < 0.0:
+        raise ValueError(f"lr_warmup_ratio must be non-negative, got {args.lr_warmup_ratio}")
+    warmup_steps = int(args.lr_warmup_steps)
+    if warmup_steps == 0 and args.lr_warmup_ratio > 0.0:
+        warmup_steps = int(round(args.steps * args.lr_warmup_ratio))
+    if warmup_steps > args.steps:
+        raise ValueError(
+            f"lr warmup steps must not exceed total steps, got {warmup_steps} > {args.steps}"
+        )
+    return warmup_steps
+
+
+def build_humanoid_optimizer(model: nn.Module, args: argparse.Namespace) -> torch.optim.Optimizer:
+    if args.lr <= 0.0:
+        raise ValueError(f"lr must be positive, got {args.lr}")
+    if args.weight_decay < 0.0:
+        raise ValueError(f"weight_decay must be non-negative, got {args.weight_decay}")
+    if not 0.0 < args.adam_beta1 < 1.0:
+        raise ValueError(f"adam_beta1 must be in (0,1), got {args.adam_beta1}")
+    if not 0.0 < args.adam_beta2 < 1.0:
+        raise ValueError(f"adam_beta2 must be in (0,1), got {args.adam_beta2}")
+    if args.adam_beta1 >= args.adam_beta2:
+        raise ValueError(
+            f"adam_beta1 should be smaller than adam_beta2, got "
+            f"{args.adam_beta1} >= {args.adam_beta2}"
+        )
+    return torch.optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        betas=(args.adam_beta1, args.adam_beta2),
+        weight_decay=args.weight_decay,
+    )
+
+
+def build_humanoid_lr_scheduler(
+    optimizer: torch.optim.Optimizer,
+    args: argparse.Namespace,
+):
+    if not 0.0 <= args.min_lr_ratio <= 1.0:
+        raise ValueError(f"min_lr_ratio must be in [0,1], got {args.min_lr_ratio}")
+    warmup_steps = effective_lr_warmup_steps(args)
+    args.effective_lr_warmup_steps = warmup_steps
+    if args.lr_scheduler == "none" and warmup_steps == 0:
+        return None
+    if args.lr_scheduler not in {"none", "cosine"}:
+        raise ValueError(f"Unsupported lr_scheduler={args.lr_scheduler!r}")
+
+    def lr_lambda(step_index: int) -> float:
+        if warmup_steps > 0 and step_index < warmup_steps:
+            return float(step_index + 1) / float(warmup_steps)
+        if args.lr_scheduler == "none":
+            return 1.0
+        decay_steps = max(1, args.steps - warmup_steps)
+        progress = min(1.0, max(0.0, float(step_index - warmup_steps) / float(decay_steps)))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return args.min_lr_ratio + (1.0 - args.min_lr_ratio) * cosine
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+
 def train_humanoid(args: argparse.Namespace) -> None:
     seed = int(args.seed)
     random.seed(seed)
@@ -764,19 +1028,14 @@ def train_humanoid(args: argparse.Namespace) -> None:
         f"trainable_params={count_trainable_parameters(model)} action_dim={args.action_dim}",
         flush=True,
     )
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    if args.min_lr_ratio < 0.0:
-        raise ValueError(f"min_lr_ratio must be non-negative, got {args.min_lr_ratio}")
-    if args.lr_scheduler == "none":
-        scheduler = None
-    elif args.lr_scheduler == "cosine":
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=args.steps,
-            eta_min=args.lr * args.min_lr_ratio,
-        )
-    else:
-        raise ValueError(f"Unsupported lr_scheduler={args.lr_scheduler!r}")
+    optimizer = build_humanoid_optimizer(model, args)
+    scheduler = build_humanoid_lr_scheduler(optimizer, args)
+    print(
+        f"optimizer=AdamW lr={args.lr:g} betas=({args.adam_beta1:g},{args.adam_beta2:g}) "
+        f"weight_decay={args.weight_decay:g} lr_scheduler={args.lr_scheduler} "
+        f"warmup_steps={args.effective_lr_warmup_steps} min_lr_ratio={args.min_lr_ratio:g}",
+        flush=True,
+    )
 
     train_loader = torch.utils.data.DataLoader(
         HumanoidPairDataset(train_samples, resize),
@@ -962,7 +1221,11 @@ def add_humanoid_data_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--data-root", default=None)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--resize", default="256x256")
-    parser.add_argument("--model-arch", choices=["small_cnn", "transformer"], default="transformer")
+    parser.add_argument(
+        "--model-arch",
+        choices=["small_cnn", "transformer", "motion_transformer"],
+        default="motion_transformer",
+    )
     parser.add_argument("--max-samples", type=int, default=0,
                         help="maximum discovered interval frame pairs; 0 keeps all")
     parser.add_argument("--seed", type=int, default=42)
@@ -975,10 +1238,10 @@ def add_humanoid_data_args(parser: argparse.ArgumentParser) -> None:
                         help="maximum pair samples to keep per episode; 0 keeps all")
     parser.add_argument("--transformer-patch-size", type=int, default=32)
     parser.add_argument("--transformer-embed-dim", type=int, default=256)
-    parser.add_argument("--transformer-depth", type=int, default=4)
+    parser.add_argument("--transformer-depth", type=int, default=6)
     parser.add_argument("--transformer-num-heads", type=int, default=8)
     parser.add_argument("--transformer-mlp-ratio", type=float, default=4.0)
-    parser.add_argument("--transformer-dropout", type=float, default=0.1)
+    parser.add_argument("--transformer-dropout", type=float, default=0.05)
     parser.add_argument("--transformer-attn-dropout", type=float, default=0.0)
 
 
@@ -1006,12 +1269,18 @@ def build_parser() -> argparse.ArgumentParser:
     train_p.add_argument("--batch-size", type=int, default=16)
     train_p.add_argument("--workers", type=int, default=4)
     train_p.add_argument("--base-channels", type=int, default=32)
-    train_p.add_argument("--hidden-dim", type=int, default=128)
+    train_p.add_argument("--hidden-dim", type=int, default=256)
     train_p.add_argument("--dropout", type=float, default=0.0)
-    train_p.add_argument("--lr", type=float, default=1e-4)
-    train_p.add_argument("--weight-decay", type=float, default=1e-4)
+    train_p.add_argument("--lr", type=float, default=3e-4)
+    train_p.add_argument("--weight-decay", type=float, default=1e-2)
+    train_p.add_argument("--adam-beta1", type=float, default=0.9)
+    train_p.add_argument("--adam-beta2", type=float, default=0.95)
     train_p.add_argument("--lr-scheduler", choices=["none", "cosine"], default="cosine")
-    train_p.add_argument("--min-lr-ratio", type=float, default=0.05)
+    train_p.add_argument("--min-lr-ratio", type=float, default=0.02)
+    train_p.add_argument("--lr-warmup-steps", type=int, default=0,
+                         help="explicit warmup steps; 0 derives from lr-warmup-ratio")
+    train_p.add_argument("--lr-warmup-ratio", type=float, default=0.05,
+                         help="fraction of total steps used for linear warmup")
     train_p.add_argument("--grad-clip-norm", type=float, default=1.0)
     train_p.add_argument("--log-every", type=int, default=50)
     train_p.add_argument("--eval-every", type=int, default=100)
