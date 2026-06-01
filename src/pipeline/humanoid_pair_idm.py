@@ -16,6 +16,7 @@ import csv
 import json
 import math
 import random
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -39,6 +40,8 @@ from src.pipeline.wan_pair_idm import (
 )
 
 HUMANOID_H1_ACTION_DIM = 26
+READOUT_HEAD_ARCHES = {"mlp", "residual_mlp", "gated_mlp"}
+TRANSFORMER_HEAD_ARCHES = {"legacy_mlp", *READOUT_HEAD_ARCHES}
 
 
 @dataclass(frozen=True)
@@ -342,6 +345,101 @@ def build_2d_sincos_embedding(grid_h: int, grid_w: int, dim: int, device: torch.
     return torch.cat([y_embed, x_embed], dim=1)
 
 
+class ResidualReadoutBlock(nn.Module):
+    def __init__(self, dim: int, dropout: float, *, gated: bool) -> None:
+        super().__init__()
+        if dim <= 0:
+            raise ValueError(f"dim must be positive, got {dim}")
+        if dropout < 0.0:
+            raise ValueError(f"dropout must be non-negative, got {dropout}")
+        self.gated = bool(gated)
+        self.norm = nn.LayerNorm(dim)
+        self.fc = nn.Linear(dim, dim * 2 if gated else dim)
+        self.proj = nn.Linear(dim, dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.norm(x)
+        if self.gated:
+            value, gate = self.fc(h).chunk(2, dim=-1)
+            h = F.silu(value) * torch.sigmoid(gate)
+        else:
+            h = F.silu(self.fc(h))
+        h = self.dropout(self.proj(h))
+        return x + h
+
+
+class ReadoutHead(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        output_dim: int,
+        *,
+        depth: int,
+        dropout: float,
+        architecture: str,
+    ) -> None:
+        super().__init__()
+        if input_dim <= 0:
+            raise ValueError(f"input_dim must be positive, got {input_dim}")
+        if hidden_dim <= 0:
+            raise ValueError(f"hidden_dim must be positive, got {hidden_dim}")
+        if output_dim <= 0:
+            raise ValueError(f"output_dim must be positive, got {output_dim}")
+        if depth < 0:
+            raise ValueError(f"depth must be non-negative, got {depth}")
+        if dropout < 0.0:
+            raise ValueError(f"dropout must be non-negative, got {dropout}")
+        if architecture not in READOUT_HEAD_ARCHES:
+            raise ValueError(f"Unsupported readout architecture={architecture!r}")
+
+        self.input_dim = int(input_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.output_dim = int(output_dim)
+        self.depth = int(depth)
+        self.dropout = float(dropout)
+        self.architecture = str(architecture)
+
+        if self.architecture == "mlp":
+            layers: list[nn.Module] = []
+            current_dim = input_dim
+            for _ in range(depth):
+                layers.append(nn.Linear(current_dim, hidden_dim))
+                layers.append(nn.GELU())
+                if dropout > 0.0:
+                    layers.append(nn.Dropout(dropout))
+                current_dim = hidden_dim
+            layers.append(nn.Linear(current_dim, output_dim))
+            self.net = nn.Sequential(*layers)
+        else:
+            gated = self.architecture == "gated_mlp"
+            self.input_proj = nn.Linear(input_dim, hidden_dim)
+            self.input_norm = nn.LayerNorm(hidden_dim)
+            self.blocks = nn.ModuleList(
+                [ResidualReadoutBlock(hidden_dim, dropout, gated=gated) for _ in range(depth)]
+            )
+            self.output_norm = nn.LayerNorm(hidden_dim)
+            self.net = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, output_dim),
+            )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 2 or x.shape[1] != self.input_dim:
+            raise ValueError(f"Expected readout input [B,{self.input_dim}], got {tuple(x.shape)}")
+        if self.architecture == "mlp":
+            return self.net(x.float())
+        h = self.input_proj(x.float())
+        h = self.input_norm(h)
+        for block in self.blocks:
+            h = block(h)
+        h = self.output_norm(h)
+        return self.net(h)
+
+
 class HumanoidPairTransformer(nn.Module):
     def __init__(
         self,
@@ -355,6 +453,8 @@ class HumanoidPairTransformer(nn.Module):
         hidden_dim: int = 256,
         dropout: float = 0.1,
         attn_dropout: float = 0.0,
+        head_arch: str = "legacy_mlp",
+        head_depth: int = 2,
     ):
         super().__init__()
         if action_dim <= 0:
@@ -379,6 +479,10 @@ class HumanoidPairTransformer(nn.Module):
             raise ValueError(f"dropout must be non-negative, got {dropout}")
         if attn_dropout < 0.0:
             raise ValueError(f"attn_dropout must be non-negative, got {attn_dropout}")
+        if head_arch not in TRANSFORMER_HEAD_ARCHES:
+            raise ValueError(f"Unsupported head_arch={head_arch!r}")
+        if head_depth < 0:
+            raise ValueError(f"head_depth must be non-negative, got {head_depth}")
         self.action_dim = int(action_dim)
         self.patch_size = int(patch_size)
         self.embed_dim = int(embed_dim)
@@ -388,6 +492,8 @@ class HumanoidPairTransformer(nn.Module):
         self.hidden_dim = int(hidden_dim)
         self.dropout = float(dropout)
         self.attn_dropout = float(attn_dropout)
+        self.head_arch = str(head_arch)
+        self.head_depth = int(head_depth)
 
         self.patch_embed = nn.Conv2d(3, embed_dim, kernel_size=patch_size, stride=patch_size)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
@@ -407,13 +513,23 @@ class HumanoidPairTransformer(nn.Module):
             enable_nested_tensor=False,
         )
         self.norm = nn.LayerNorm(embed_dim)
-        self.head = nn.Sequential(
-            nn.Linear(embed_dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, action_dim),
-        )
         self.dropout_layer = nn.Dropout(dropout)
+        if head_arch == "legacy_mlp":
+            self.head = nn.Sequential(
+                nn.Linear(embed_dim, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, action_dim),
+            )
+        else:
+            self.head = ReadoutHead(
+                embed_dim,
+                hidden_dim,
+                action_dim,
+                depth=head_depth,
+                dropout=dropout,
+                architecture=head_arch,
+            )
         nn.init.trunc_normal_(self.cls_token, std=0.02)
         nn.init.trunc_normal_(self.frame_embed, std=0.02)
 
@@ -456,6 +572,9 @@ class HumanoidPairMotionTransformer(nn.Module):
         hidden_dim: int = 256,
         dropout: float = 0.05,
         attn_dropout: float = 0.0,
+        head_arch: str = "legacy_mlp",
+        head_depth: int = 2,
+        raw_motion_stem: bool = False,
     ):
         super().__init__()
         if action_dim <= 0:
@@ -480,6 +599,10 @@ class HumanoidPairMotionTransformer(nn.Module):
             raise ValueError(f"dropout must be non-negative, got {dropout}")
         if attn_dropout < 0.0:
             raise ValueError(f"attn_dropout must be non-negative, got {attn_dropout}")
+        if head_arch not in TRANSFORMER_HEAD_ARCHES:
+            raise ValueError(f"Unsupported head_arch={head_arch!r}")
+        if head_depth < 0:
+            raise ValueError(f"head_depth must be non-negative, got {head_depth}")
         self.action_dim = int(action_dim)
         self.patch_size = int(patch_size)
         self.embed_dim = int(embed_dim)
@@ -489,12 +612,18 @@ class HumanoidPairMotionTransformer(nn.Module):
         self.hidden_dim = int(hidden_dim)
         self.dropout = float(dropout)
         self.attn_dropout = float(attn_dropout)
+        self.head_arch = str(head_arch)
+        self.head_depth = int(head_depth)
+        self.raw_motion_stem = bool(raw_motion_stem)
 
         self.patch_embed = nn.Conv2d(3, embed_dim, kernel_size=patch_size, stride=patch_size)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.motion_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.frame_embed = nn.Parameter(torch.zeros(1, 2, 1, embed_dim))
         self.motion_embed = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        if self.raw_motion_stem:
+            self.raw_motion_embed = nn.Conv2d(6, embed_dim, kernel_size=patch_size, stride=patch_size)
+            self.raw_motion_norm = nn.LayerNorm(embed_dim)
         self.motion_proj = nn.Sequential(
             nn.LayerNorm(embed_dim * 4),
             nn.Linear(embed_dim * 4, embed_dim),
@@ -518,20 +647,34 @@ class HumanoidPairMotionTransformer(nn.Module):
         )
         self.norm = nn.LayerNorm(embed_dim)
         self.readout_norm = nn.LayerNorm(embed_dim * 5)
-        self.head = nn.Sequential(
-            nn.Linear(embed_dim * 5, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, action_dim),
-        )
+        if head_arch == "legacy_mlp":
+            self.head = nn.Sequential(
+                nn.Linear(embed_dim * 5, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, action_dim),
+            )
+        else:
+            self.head = ReadoutHead(
+                embed_dim * 5,
+                hidden_dim,
+                action_dim,
+                depth=head_depth,
+                dropout=dropout,
+                architecture=head_arch,
+            )
         self.dropout_layer = nn.Dropout(dropout)
         nn.init.trunc_normal_(self.cls_token, std=0.02)
         nn.init.trunc_normal_(self.motion_token, std=0.02)
         nn.init.trunc_normal_(self.frame_embed, std=0.02)
         nn.init.trunc_normal_(self.motion_embed, std=0.02)
+        if self.raw_motion_stem:
+            nn.init.trunc_normal_(self.raw_motion_embed.weight, std=0.02)
+            if self.raw_motion_embed.bias is not None:
+                nn.init.zeros_(self.raw_motion_embed.bias)
 
     def forward(self, frames: torch.Tensor) -> torch.Tensor:
         if frames.ndim != 4 or frames.shape[1] != 6:
@@ -551,6 +694,13 @@ class HumanoidPairMotionTransformer(nn.Module):
         x0 = x[:, 0]
         x1 = x[:, 1]
         motion = self.motion_proj(torch.cat([x0, x1, x1 - x0, torch.abs(x1 - x0)], dim=-1))
+        if self.raw_motion_stem:
+            raw_motion = pair[:, 1] - pair[:, 0]
+            raw_motion = torch.cat([raw_motion, torch.abs(raw_motion)], dim=1)
+            raw_motion = self.raw_motion_embed(raw_motion)
+            raw_motion = raw_motion.flatten(2).transpose(1, 2).contiguous()
+            raw_motion = self.raw_motion_norm(raw_motion)
+            motion = motion + raw_motion
         pos = build_2d_sincos_embedding(ph, pw, self.embed_dim, x.device).to(dtype=x.dtype)
         frame_tokens = x + pos.unsqueeze(0).unsqueeze(0)
         frame_tokens = frame_tokens + self.frame_embed[:, :2, :, :].to(
@@ -608,6 +758,8 @@ def make_humanoid_model(args: argparse.Namespace) -> nn.Module:
             hidden_dim=args.hidden_dim,
             dropout=args.transformer_dropout,
             attn_dropout=args.transformer_attn_dropout,
+            head_arch=args.transformer_head_arch,
+            head_depth=args.transformer_head_depth,
         )
     if args.model_arch == "motion_transformer":
         return HumanoidPairMotionTransformer(
@@ -620,6 +772,24 @@ def make_humanoid_model(args: argparse.Namespace) -> nn.Module:
             hidden_dim=args.hidden_dim,
             dropout=args.transformer_dropout,
             attn_dropout=args.transformer_attn_dropout,
+            head_arch=args.transformer_head_arch,
+            head_depth=args.transformer_head_depth,
+            raw_motion_stem=args.motion_raw_stem,
+        )
+    if args.model_arch == "motion_transformer_v2":
+        return HumanoidPairMotionTransformer(
+            int(args.action_dim),
+            patch_size=args.transformer_patch_size,
+            embed_dim=args.transformer_embed_dim,
+            depth=args.transformer_depth,
+            num_heads=args.transformer_num_heads,
+            mlp_ratio=args.transformer_mlp_ratio,
+            hidden_dim=args.hidden_dim,
+            dropout=args.transformer_dropout,
+            attn_dropout=args.transformer_attn_dropout,
+            head_arch="residual_mlp",
+            head_depth=max(2, int(args.transformer_head_depth)),
+            raw_motion_stem=True,
         )
     raise ValueError(f"Unsupported model_arch={args.model_arch!r}")
 
@@ -647,6 +817,8 @@ def humanoid_model_payload(args: argparse.Namespace) -> dict:
             "hidden_dim": args.hidden_dim,
             "dropout": args.transformer_dropout,
             "attn_dropout": args.transformer_attn_dropout,
+            "head_arch": args.transformer_head_arch,
+            "head_depth": args.transformer_head_depth,
             "alignment": "humanoid_frame_pair_t_to_t_plus_d_predict_mean_action_t_to_t_plus_d",
         }
     if args.model_arch == "motion_transformer":
@@ -661,8 +833,30 @@ def humanoid_model_payload(args: argparse.Namespace) -> dict:
             "hidden_dim": args.hidden_dim,
             "dropout": args.transformer_dropout,
             "attn_dropout": args.transformer_attn_dropout,
+            "head_arch": args.transformer_head_arch,
+            "head_depth": args.transformer_head_depth,
+            "raw_motion_stem": args.motion_raw_stem,
             "readout": "cls_motion_cls_frame0_mean_frame1_mean_motion_mean",
             "motion_tokens": "patch_feature_pair_concat_delta_abs_delta",
+            "alignment": "humanoid_frame_pair_t_to_t_plus_d_predict_mean_action_t_to_t_plus_d",
+        }
+    if args.model_arch == "motion_transformer_v2":
+        return {
+            "model_arch": "motion_transformer_v2",
+            "action_dim": args.action_dim,
+            "patch_size": args.transformer_patch_size,
+            "embed_dim": args.transformer_embed_dim,
+            "depth": args.transformer_depth,
+            "num_heads": args.transformer_num_heads,
+            "mlp_ratio": args.transformer_mlp_ratio,
+            "hidden_dim": args.hidden_dim,
+            "dropout": args.transformer_dropout,
+            "attn_dropout": args.transformer_attn_dropout,
+            "head_arch": "residual_mlp",
+            "head_depth": max(2, int(args.transformer_head_depth)),
+            "raw_motion_stem": True,
+            "readout": "cls_motion_cls_frame0_mean_frame1_mean_motion_mean_plus_raw_motion",
+            "motion_tokens": "patch_feature_pair_concat_delta_abs_delta_plus_rgb_diff_absdiff",
             "alignment": "humanoid_frame_pair_t_to_t_plus_d_predict_mean_action_t_to_t_plus_d",
         }
     raise ValueError(f"Unsupported model_arch={args.model_arch!r}")
@@ -800,6 +994,17 @@ def save_humanoid_checkpoint(
                 getattr(args, "effective_lr_warmup_steps", args.lr_warmup_steps)
             ),
             "lr_warmup_ratio": args.lr_warmup_ratio,
+            "transformer_head_arch": args.transformer_head_arch,
+            "transformer_head_depth": args.transformer_head_depth,
+            "motion_raw_stem": args.motion_raw_stem,
+            "variance_loss_weight": args.variance_loss_weight,
+            "variance_loss_warmup_ratio": args.variance_loss_warmup_ratio,
+            "variance_loss_warmup_steps_effective": int(
+                getattr(args, "effective_variance_loss_warmup_steps", 0)
+            ),
+            "amp": args.amp,
+            "grad_accum_steps": args.grad_accum_steps,
+            "init_checkpoint": args.init_checkpoint,
             "dataset": "humanoid_everyday_lerobot",
             "robot_type": "h1",
             "frame_stride": args.frame_stride,
@@ -834,8 +1039,10 @@ def load_humanoid_pair_idm(checkpoint: Path, device: str) -> tuple[nn.Module, to
             hidden_dim=int(model_cfg["hidden_dim"]),
             dropout=float(model_cfg["dropout"]),
             attn_dropout=float(model_cfg["attn_dropout"]),
+            head_arch=str(model_cfg.get("head_arch", "legacy_mlp")),
+            head_depth=int(model_cfg.get("head_depth", 2)),
         ).to(device)
-    elif model_arch == "motion_transformer":
+    elif model_arch in {"motion_transformer", "motion_transformer_v2"}:
         model = HumanoidPairMotionTransformer(
             int(model_cfg["action_dim"]),
             patch_size=int(model_cfg["patch_size"]),
@@ -846,12 +1053,71 @@ def load_humanoid_pair_idm(checkpoint: Path, device: str) -> tuple[nn.Module, to
             hidden_dim=int(model_cfg["hidden_dim"]),
             dropout=float(model_cfg["dropout"]),
             attn_dropout=float(model_cfg["attn_dropout"]),
+            head_arch=str(model_cfg.get("head_arch", "legacy_mlp")),
+            head_depth=int(model_cfg.get("head_depth", 2)),
+            raw_motion_stem=bool(model_cfg.get("raw_motion_stem", False)),
         ).to(device)
     else:
         raise ValueError(f"Unsupported checkpoint model_arch={model_arch!r}: {checkpoint}")
     model.load_state_dict(ckpt["model_state"], strict=True)
     model.eval()
     return model, ckpt["action_mean"].to(device), ckpt["action_std"].to(device), ckpt
+
+
+def load_humanoid_train_init_checkpoint(
+    model: nn.Module,
+    action_mean: torch.Tensor,
+    action_std: torch.Tensor,
+    args: argparse.Namespace,
+    *,
+    device: str,
+) -> None:
+    if args.init_checkpoint is None:
+        return
+    checkpoint = Path(args.init_checkpoint)
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f"Humanoid init checkpoint not found: {checkpoint}")
+    ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
+    model_cfg = ckpt.get("model")
+    if not isinstance(model_cfg, dict):
+        raise ValueError(f"Init checkpoint does not contain a model config: {checkpoint}")
+    expected_model = humanoid_model_payload(args)
+    checked_keys = {
+        "model_arch",
+        "action_dim",
+        "patch_size",
+        "embed_dim",
+        "depth",
+        "num_heads",
+        "mlp_ratio",
+        "hidden_dim",
+        "dropout",
+        "attn_dropout",
+        "head_arch",
+        "head_depth",
+        "raw_motion_stem",
+    }
+    mismatches = []
+    for key in sorted(checked_keys):
+        if key in expected_model or key in model_cfg:
+            if expected_model.get(key) != model_cfg.get(key):
+                mismatches.append((key, expected_model.get(key), model_cfg.get(key)))
+    if mismatches:
+        raise ValueError(
+            "Init checkpoint model config does not match requested train config: "
+            + ", ".join(
+                f"{key}: expected={expected!r} checkpoint={actual!r}"
+                for key, expected, actual in mismatches
+            )
+        )
+    ckpt_action_mean = ckpt["action_mean"].to(dtype=action_mean.dtype, device=action_mean.device)
+    ckpt_action_std = ckpt["action_std"].to(dtype=action_std.dtype, device=action_std.device)
+    if not torch.allclose(action_mean, ckpt_action_mean, rtol=1e-5, atol=1e-6):
+        raise ValueError(f"Init checkpoint action_mean does not match current train split: {checkpoint}")
+    if not torch.allclose(action_std, ckpt_action_std, rtol=1e-5, atol=1e-6):
+        raise ValueError(f"Init checkpoint action_std does not match current train split: {checkpoint}")
+    model.load_state_dict(ckpt["model_state"], strict=True)
+    print(f"loaded_init_checkpoint={checkpoint}", flush=True)
 
 
 def plot_humanoid_loss_curves(out_dir: Path) -> None:
@@ -984,6 +1250,32 @@ def build_humanoid_lr_scheduler(
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
 
+def effective_variance_loss_warmup_steps(args: argparse.Namespace) -> int:
+    if args.variance_loss_weight < 0.0:
+        raise ValueError(
+            f"variance_loss_weight must be non-negative, got {args.variance_loss_weight}"
+        )
+    if not 0.0 <= args.variance_loss_warmup_ratio <= 1.0:
+        raise ValueError(
+            "variance_loss_warmup_ratio must be in [0,1], got "
+            f"{args.variance_loss_warmup_ratio}"
+        )
+    return int(round(args.steps * args.variance_loss_warmup_ratio))
+
+
+def variance_loss_scale(
+    optimizer_step: int,
+    *,
+    weight: float,
+    warmup_steps: int,
+) -> float:
+    if weight <= 0.0:
+        return 0.0
+    if warmup_steps <= 0:
+        return float(weight)
+    return float(weight) * min(1.0, float(optimizer_step + 1) / float(warmup_steps))
+
+
 def train_humanoid(args: argparse.Namespace) -> None:
     seed = int(args.seed)
     random.seed(seed)
@@ -1022,8 +1314,20 @@ def train_humanoid(args: argparse.Namespace) -> None:
         flush=True,
     )
 
+    if args.grad_accum_steps <= 0:
+        raise ValueError(f"grad_accum_steps must be positive, got {args.grad_accum_steps}")
     device = args.device
+    if args.amp and not str(device).startswith("cuda"):
+        raise ValueError(f"--amp requires a CUDA device, got {device!r}")
+    args.effective_variance_loss_warmup_steps = effective_variance_loss_warmup_steps(args)
     model = make_humanoid_model(args).to(device)
+    load_humanoid_train_init_checkpoint(
+        model,
+        action_mean,
+        action_std,
+        args,
+        device=device,
+    )
     print(
         f"trainable_params={count_trainable_parameters(model)} action_dim={args.action_dim}",
         flush=True,
@@ -1033,7 +1337,10 @@ def train_humanoid(args: argparse.Namespace) -> None:
     print(
         f"optimizer=AdamW lr={args.lr:g} betas=({args.adam_beta1:g},{args.adam_beta2:g}) "
         f"weight_decay={args.weight_decay:g} lr_scheduler={args.lr_scheduler} "
-        f"warmup_steps={args.effective_lr_warmup_steps} min_lr_ratio={args.min_lr_ratio:g}",
+        f"warmup_steps={args.effective_lr_warmup_steps} min_lr_ratio={args.min_lr_ratio:g} "
+        f"amp={args.amp} grad_accum_steps={args.grad_accum_steps} "
+        f"variance_loss_weight={args.variance_loss_weight:g} "
+        f"variance_warmup_steps={args.effective_variance_loss_warmup_steps}",
         flush=True,
     )
 
@@ -1052,6 +1359,16 @@ def train_humanoid(args: argparse.Namespace) -> None:
     step = 0
     last_eval_step: int | None = None
     best_eval_action = float("inf")
+    accumulated_batches = 0
+    accumulated_loss = 0.0
+    accumulated_mse_loss = 0.0
+    accumulated_variance_loss = 0.0
+    accumulated_variance_scale = 0.0
+
+    def train_autocast_context():
+        if args.amp:
+            return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        return nullcontext()
 
     def run_eval(eval_step: int, *, write_predictions: bool) -> dict[str, float]:
         nonlocal best_eval_action, last_eval_step
@@ -1095,6 +1412,7 @@ def train_humanoid(args: argparse.Namespace) -> None:
     model.train()
     if args.eval_every > 0:
         run_eval(0, write_predictions=False)
+    optimizer.zero_grad(set_to_none=True)
     while step < args.steps:
         for batch in train_loader:
             if step >= args.steps:
@@ -1102,21 +1420,48 @@ def train_humanoid(args: argparse.Namespace) -> None:
             frames = batch["frames"].to(device)
             target = batch["action_target"].to(device)
             norm_target = (target - action_mean_dev) / action_std_dev
-            pred = model(frames)
-            loss = F.mse_loss(pred, norm_target)
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
+            with train_autocast_context():
+                pred = model(frames)
+                pred_float = pred.float()
+                mse_loss = F.mse_loss(pred_float, norm_target)
+                pred_var = pred_float.var(dim=0, unbiased=False)
+                target_var = norm_target.var(dim=0, unbiased=False)
+                output_variance_loss = F.mse_loss(pred_var, target_var)
+                output_variance_scale = variance_loss_scale(
+                    step,
+                    weight=args.variance_loss_weight,
+                    warmup_steps=args.effective_variance_loss_warmup_steps,
+                )
+                loss = mse_loss + output_variance_scale * output_variance_loss
+            (loss / args.grad_accum_steps).backward()
+            accumulated_batches += 1
+            accumulated_loss += tensor_float(loss)
+            accumulated_mse_loss += tensor_float(mse_loss)
+            accumulated_variance_loss += tensor_float(output_variance_loss)
+            accumulated_variance_scale += float(output_variance_scale)
+            if accumulated_batches < args.grad_accum_steps:
+                continue
             if args.grad_clip_norm > 0.0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
             optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            update_micro_batches = accumulated_batches
+            accumulated_batches = 0
             if scheduler is not None:
                 scheduler.step()
             step += 1
             row = {
                 "step": step,
-                "loss": tensor_float(loss),
+                "loss": accumulated_loss / update_micro_batches,
+                "mse_loss": accumulated_mse_loss / update_micro_batches,
+                "variance_loss": accumulated_variance_loss / update_micro_batches,
+                "variance_loss_scale": accumulated_variance_scale / update_micro_batches,
                 "lr": float(optimizer.param_groups[0]["lr"]),
             }
+            accumulated_loss = 0.0
+            accumulated_mse_loss = 0.0
+            accumulated_variance_loss = 0.0
+            accumulated_variance_scale = 0.0
             history.append(row)
             if step == 1 or step % args.log_every == 0 or step == args.steps:
                 print(f"step={step:04d} loss={row['loss']:.6f}", flush=True)
@@ -1223,7 +1568,7 @@ def add_humanoid_data_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--resize", default="256x256")
     parser.add_argument(
         "--model-arch",
-        choices=["small_cnn", "transformer", "motion_transformer"],
+        choices=["small_cnn", "transformer", "motion_transformer", "motion_transformer_v2"],
         default="motion_transformer",
     )
     parser.add_argument("--max-samples", type=int, default=0,
@@ -1243,6 +1588,18 @@ def add_humanoid_data_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--transformer-mlp-ratio", type=float, default=4.0)
     parser.add_argument("--transformer-dropout", type=float, default=0.05)
     parser.add_argument("--transformer-attn-dropout", type=float, default=0.0)
+    parser.add_argument(
+        "--transformer-head-arch",
+        choices=sorted(TRANSFORMER_HEAD_ARCHES),
+        default="legacy_mlp",
+        help="action readout head; legacy_mlp preserves task060 checkpoint structure",
+    )
+    parser.add_argument("--transformer-head-depth", type=int, default=2)
+    parser.add_argument(
+        "--motion-raw-stem",
+        action="store_true",
+        help="add RGB diff/absolute-diff patch stem to motion tokens",
+    )
 
 
 def add_humanoid_split_args(parser: argparse.ArgumentParser) -> None:
@@ -1282,6 +1639,34 @@ def build_parser() -> argparse.ArgumentParser:
     train_p.add_argument("--lr-warmup-ratio", type=float, default=0.05,
                          help="fraction of total steps used for linear warmup")
     train_p.add_argument("--grad-clip-norm", type=float, default=1.0)
+    train_p.add_argument(
+        "--variance-loss-weight",
+        type=float,
+        default=0.0,
+        help="normalized-space batch variance calibration loss weight",
+    )
+    train_p.add_argument(
+        "--variance-loss-warmup-ratio",
+        type=float,
+        default=0.0,
+        help="fraction of optimizer steps used to ramp variance loss weight",
+    )
+    train_p.add_argument(
+        "--grad-accum-steps",
+        type=int,
+        default=1,
+        help="micro-batches accumulated before each optimizer step",
+    )
+    train_p.add_argument(
+        "--amp",
+        action="store_true",
+        help="use CUDA bfloat16 autocast during training",
+    )
+    train_p.add_argument(
+        "--init-checkpoint",
+        default=None,
+        help="strictly initialize model weights from an existing humanoid_pair_idm checkpoint",
+    )
     train_p.add_argument("--log-every", type=int, default=50)
     train_p.add_argument("--eval-every", type=int, default=100)
     train_p.add_argument("--val-max-samples", type=int, default=0,
