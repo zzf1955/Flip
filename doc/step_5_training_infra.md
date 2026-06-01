@@ -1038,14 +1038,15 @@ parquet 中同一帧的 `action` 标签，形成监督对：
 
 - 输入：`z_t`，shape 为 `[N, 32]` 的 AdaWorld continuous latent action。
 - 输出：H1 `action_t`，当前实现按 26 维 `action` 向量训练。
-- 模型：仍保留 `mlp` baseline，默认 `32 -> 128 -> 128 -> 26`；当前推荐默认是
-  `residual_mlp`，用 `hidden_dim=256`、`depth=4`、`dropout=0.02`、LayerNorm、
-  `lr=5e-4`、`weight_decay=1e-4`、`betas=(0.9,0.95)`、cosine scheduler + 5% warmup、
-  `min_lr_ratio=0.02`。`gated_mlp` 也保留作消融对照。训练和验证都使用 latent / action
-  双边标准化。
-- 训练目标：标准化后的 action MSE；验证时回到原始 action 空间，输出 MSE、R2、
-  correlation、方差比等指标。checkpoint 保存完整 decoder 架构、优化器和 warmup 配置，
-  `validate` / `eval` 可复算 replay。
+- 模型：仍保留 `mlp` baseline；当前推荐默认是 `residual_mlp`，用
+  `hidden_dim=384`、`depth=4`、`dropout=0.02`、LayerNorm、shared output head、
+  `lr=8e-4`、`weight_decay=1e-4`、`betas=(0.9,0.95)`、cosine scheduler + 5% warmup、
+  `min_lr_ratio=0.02`。`gated_mlp`、`per_dim` head 和 grouped head 保留作消融对照。
+  训练和验证都使用 latent / action 双边标准化。
+- 训练目标：默认是标准化后的 action MSE；也可显式切到 weighted MSE、SmoothL1、
+  weighted SmoothL1，并用轻量 variance calibration penalty 约束预测方差。验证时回到
+  原始 action 空间，输出 MSE、R2、correlation、方差比等指标。checkpoint 保存完整
+  decoder 架构、head、loss、优化器和 warmup 配置，`validate` / `eval` 可复算 replay。
 
 输出目录包含：
 
@@ -1188,6 +1189,110 @@ scripts/flip_run.sh adaworld_action_decoder --cuda 1 -- eval \
   --device cuda:0 \
   --checkpoint tmp/adaworld_action_decoder_h1_full_t061/best_checkpoint.pt \
   --output-dir tmp/adaworld_action_decoder_h1_full_t061_eval_best \
+  --workers 0
+```
+
+### AdaWorld Latent Action Decoder 二阶段优化版
+
+task063 在 task061 的最佳 checkpoint 预测表上先生成逐维诊断，再做容量、学习率、
+正则、gated block、loss 和 head 消融。诊断输入和输出：
+
+- 输入：`.worktrees/t061/tmp/adaworld_action_decoder_h1_full_t061/best_val_predictions.csv`
+- 输入：`.worktrees/t061/tmp/adaworld_action_decoder_h1_full_t061_eval_best/predictions.csv`
+- 输出：`tmp/adaworld_action_decoder_t063_analysis/per_dim_summary.csv`
+- 输出：`tmp/adaworld_action_decoder_t063_analysis/loss_weights.json`
+
+task061 剩余绝对 MSE 最高的 full eval 维度仍是
+`action_dim_06/07/22/08/09/10/23`。held-out normalized MSE 权重更关注
+`action_dim_05/11/25/24/09` 等相对难维度，但 weighted loss 在本轮没有超过直接优化总
+MSE 的配置。
+
+1500-step sweep 结论：
+
+| 配置 | held-out action MSE | 方差比 |
+|------|---------------------|--------|
+| `hidden=384, lr=8e-4` | `0.052365291863679886` | `0.848025924884356` |
+| `hidden=384, per_dim head` | `0.05515256151556969` | `0.8425686244781201` |
+| `hidden=384, weighted_mse` | `0.05591168254613876` | `0.8340834585519937` |
+| `hidden=384` | `0.05593988299369812` | `0.8334829944830674` |
+| `hidden=384, variance_loss_weight=0.03` | `0.05599823221564293` | `0.8380882464922391` |
+| `lr=8e-4` | `0.056573834270238876` | `0.8274800479412079` |
+| `depth=6` | `0.0578899160027504` | `0.8200816328708942` |
+| `gated_mlp` | `0.05870381370186806` | `0.815233615728525` |
+| `dropout=0.0` | `0.06048283725976944` | `0.805783198429988` |
+| `weight_decay=1e-5` | `0.06090730428695679` | `0.8092035972155057` |
+| `hidden=192` | `0.06515232473611832` | `0.7895869520994333` |
+| `lr=3e-4` | `0.06696344912052155` | `0.7816409056003277` |
+
+当前推荐配置升级为：
+
+```bash
+scripts/flip_run.sh adaworld_action_decoder --cuda 2 -- train \
+  --device cuda:0 \
+  --data-root /disk_n/zzf/flip/data/humanoid-everyday-h1-chunks0-6-8-200 \
+  --latent-path /disk_n/zzf/flip/.worktrees/t057/tmp/adaworld_action_encoder_h1_full_t057/latent_actions.npz \
+  --output-dir tmp/adaworld_action_decoder_t063_full_c09_h384_lr8e4 \
+  --split-by episode \
+  --steps 3000 \
+  --batch-size 1024 \
+  --eval-every 500 \
+  --log-every 100 \
+  --workers 0 \
+  --decoder-arch residual_mlp \
+  --hidden-dim 384 \
+  --depth 4 \
+  --dropout 0.02 \
+  --layer-norm \
+  --head-arch shared \
+  --loss-type mse \
+  --lr 8e-4 \
+  --weight-decay 1e-4 \
+  --adam-beta1 0.9 \
+  --adam-beta2 0.95 \
+  --lr-scheduler cosine \
+  --min-lr-ratio 0.02 \
+  --lr-warmup-ratio 0.05
+```
+
+task063 最佳 held-out checkpoint：
+
+- 输出目录：`tmp/adaworld_action_decoder_t063_full_c09_h384_lr8e4`
+- `action_mse = 0.05023810639977455`
+- `mean_baseline_action_mse = 0.15635326504707336`
+- `action_mean_dim_r2 = 0.6858815573729001`
+- `action_mean_dim_corr = 0.8282286180899694`
+- `action_pred_std_ratio_mean = 0.8748558117793157`
+
+task063 最佳全量 eval：
+
+- 输出目录：`tmp/adaworld_action_decoder_t063_full_c09_eval_best`
+- `action_mse = 0.029545826837420464`
+- `mean_baseline_action_mse = 0.15620023012161255`
+- `action_mean_dim_r2 = 0.8002844131909884`
+- `action_mean_dim_corr = 0.893933926637356`
+- `action_pred_std_ratio_mean = 0.9002112241891714`
+
+相比 task061，task063 最佳配置在 held-out 上把 `action_mse` 从
+`0.054645732045173645` 降到 `0.05023810639977455`，约降低 `8.1%`；全量 eval 从
+`0.04235832020640373` 降到 `0.029545826837420464`，约降低 `30.3%`。这轮结果说明
+task061 的 `610k` 参数量不是容量上限，`1.36M` 参数的 `hidden=384` shared-head
+decoder 更合适；继续堆到 per-dim head 的约 `5.05M` 参数没有带来同等收益。
+
+复算命令：
+
+```bash
+scripts/flip_run.sh adaworld_action_decoder --cuda 2 -- validate \
+  --device cuda:0 \
+  --checkpoint tmp/adaworld_action_decoder_t063_full_c09_h384_lr8e4/best_checkpoint.pt \
+  --output-dir tmp/adaworld_action_decoder_t063_full_c09_validate_best \
+  --workers 0
+```
+
+```bash
+scripts/flip_run.sh adaworld_action_decoder --cuda 2 -- eval \
+  --device cuda:0 \
+  --checkpoint tmp/adaworld_action_decoder_t063_full_c09_h384_lr8e4/best_checkpoint.pt \
+  --output-dir tmp/adaworld_action_decoder_t063_full_c09_eval_best \
   --workers 0
 ```
 

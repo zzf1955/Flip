@@ -76,6 +76,108 @@ class ResidualLatentBlock(nn.Module):
         return x + h
 
 
+def parse_head_groups(value: str, output_dim: int) -> list[list[int]]:
+    if not value:
+        raise ValueError("--head-groups must be non-empty when head-arch=grouped")
+    groups: list[list[int]] = []
+    seen: set[int] = set()
+    for group_text in value.split(";"):
+        group_text = group_text.strip()
+        if not group_text:
+            raise ValueError(f"Empty group in --head-groups={value!r}")
+        group: list[int] = []
+        for dim_text in group_text.split(","):
+            dim_text = dim_text.strip()
+            if not dim_text:
+                raise ValueError(f"Empty dim in --head-groups={value!r}")
+            dim = int(dim_text)
+            if dim < 0 or dim >= output_dim:
+                raise ValueError(f"head group dim {dim} is outside [0,{output_dim})")
+            if dim in seen:
+                raise ValueError(f"head group dim {dim} appears more than once")
+            seen.add(dim)
+            group.append(dim)
+        groups.append(group)
+    expected = set(range(output_dim))
+    missing = sorted(expected - seen)
+    if missing:
+        raise ValueError(f"--head-groups must cover every output dim exactly once, missing={missing}")
+    return groups
+
+
+class MultiHeadActionHead(nn.Module):
+    def __init__(
+        self,
+        *,
+        hidden_dim: int,
+        output_dim: int,
+        dropout: float,
+        head_arch: str,
+        head_groups: str,
+    ) -> None:
+        super().__init__()
+        if head_arch not in {"shared", "per_dim", "grouped"}:
+            raise ValueError(f"Unsupported head_arch={head_arch!r}")
+        if hidden_dim <= 0:
+            raise ValueError(f"hidden_dim must be positive, got {hidden_dim}")
+        if output_dim <= 0:
+            raise ValueError(f"output_dim must be positive, got {output_dim}")
+        self.hidden_dim = int(hidden_dim)
+        self.output_dim = int(output_dim)
+        self.head_arch = str(head_arch)
+        self.head_groups_text = str(head_groups)
+        if head_arch == "shared":
+            if head_groups:
+                raise ValueError("--head-groups is only valid for head-arch=grouped")
+            self.shared = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.SiLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, output_dim),
+            )
+            self.heads = nn.ModuleList()
+            self.group_dims: list[list[int]] = []
+        elif head_arch == "per_dim":
+            if head_groups:
+                raise ValueError("--head-groups is only valid for head-arch=grouped")
+            self.shared = nn.Identity()
+            self.heads = nn.ModuleList(
+                [
+                    nn.Sequential(
+                        nn.Linear(hidden_dim, hidden_dim),
+                        nn.SiLU(),
+                        nn.Dropout(dropout),
+                        nn.Linear(hidden_dim, 1),
+                    )
+                    for _ in range(output_dim)
+                ]
+            )
+            self.group_dims = [[dim] for dim in range(output_dim)]
+        else:
+            groups = parse_head_groups(head_groups, output_dim)
+            self.shared = nn.Identity()
+            self.heads = nn.ModuleList(
+                [
+                    nn.Sequential(
+                        nn.Linear(hidden_dim, hidden_dim),
+                        nn.SiLU(),
+                        nn.Dropout(dropout),
+                        nn.Linear(hidden_dim, len(group)),
+                    )
+                    for group in groups
+                ]
+            )
+            self.group_dims = groups
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.head_arch == "shared":
+            return self.shared(x)
+        out = x.new_empty((x.shape[0], self.output_dim))
+        for dims, head in zip(self.group_dims, self.heads, strict=True):
+            out[:, dims] = head(x)
+        return out
+
+
 class LatentActionDecoder(nn.Module):
     def __init__(
         self,
@@ -87,6 +189,8 @@ class LatentActionDecoder(nn.Module):
         dropout: float,
         layer_norm: bool,
         architecture: str,
+        head_arch: str,
+        head_groups: str,
     ) -> None:
         super().__init__()
         if input_dim <= 0:
@@ -101,6 +205,10 @@ class LatentActionDecoder(nn.Module):
             raise ValueError(f"dropout must be non-negative, got {dropout}")
         if architecture not in {"mlp", "residual_mlp", "gated_mlp"}:
             raise ValueError(f"Unsupported architecture={architecture!r}")
+        if head_arch not in {"shared", "per_dim", "grouped"}:
+            raise ValueError(f"Unsupported head_arch={head_arch!r}")
+        if architecture == "mlp" and head_arch != "shared":
+            raise ValueError("Non-shared heads are only supported for residual_mlp and gated_mlp")
 
         self.input_dim = int(input_dim)
         self.output_dim = int(output_dim)
@@ -109,8 +217,12 @@ class LatentActionDecoder(nn.Module):
         self.dropout = float(dropout)
         self.layer_norm = bool(layer_norm)
         self.architecture = str(architecture)
+        self.head_arch = str(head_arch)
+        self.head_groups = str(head_groups)
 
         if self.architecture == "mlp":
+            if head_groups:
+                raise ValueError("--head-groups is only valid for head-arch=grouped")
             layers: list[nn.Module] = []
             current_dim = input_dim
             for _ in range(depth):
@@ -139,11 +251,12 @@ class LatentActionDecoder(nn.Module):
                 ]
             )
             self.output_norm = nn.LayerNorm(hidden_dim) if layer_norm else nn.Identity()
-            self.head = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.SiLU(),
-                nn.Dropout(dropout),
-                nn.Linear(hidden_dim, output_dim),
+            self.head = MultiHeadActionHead(
+                hidden_dim=hidden_dim,
+                output_dim=output_dim,
+                dropout=dropout,
+                head_arch=head_arch,
+                head_groups=head_groups,
             )
 
     def forward(self, latent: torch.Tensor) -> torch.Tensor:
@@ -444,6 +557,8 @@ def make_decoder(args: argparse.Namespace) -> LatentActionDecoder:
         dropout=float(args.dropout),
         layer_norm=bool(args.layer_norm),
         architecture=str(args.decoder_arch),
+        head_arch=str(args.head_arch),
+        head_groups=str(args.head_groups),
     )
 
 
@@ -472,6 +587,8 @@ def save_checkpoint(
             "depth": int(args.depth),
             "dropout": float(args.dropout),
             "layer_norm": bool(args.layer_norm),
+            "head_arch": str(args.head_arch),
+            "head_groups": str(args.head_groups),
             "architecture": f"{args.decoder_arch}_latent_action_decoder",
             "alignment": "(frame_t,frame_t+1)->adaworld_z_t->action_t",
         },
@@ -490,6 +607,12 @@ def save_checkpoint(
             "depth": int(args.depth),
             "dropout": float(args.dropout),
             "layer_norm": bool(args.layer_norm),
+            "head_arch": str(args.head_arch),
+            "head_groups": str(args.head_groups),
+            "loss_type": str(args.loss_type),
+            "loss_weights": str(args.loss_weights),
+            "smooth_l1_beta": float(args.smooth_l1_beta),
+            "variance_loss_weight": float(args.variance_loss_weight),
             "lr": float(args.lr),
             "weight_decay": float(args.weight_decay),
             "adam_beta1": float(args.adam_beta1),
@@ -533,6 +656,8 @@ def load_decoder_checkpoint(
         dropout=float(model_cfg["dropout"]),
         layer_norm=bool(model_cfg["layer_norm"]),
         architecture=decoder_arch,
+        head_arch=str(model_cfg.get("head_arch", "shared")),
+        head_groups=str(model_cfg.get("head_groups", "")),
     ).to(device)
     model.load_state_dict(ckpt["model_state"], strict=True)
     model.eval()
@@ -612,6 +737,75 @@ def build_decoder_lr_scheduler(
         return min_ratio + 0.5 * (1.0 - min_ratio) * (1.0 + math.cos(math.pi * progress))
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+
+def load_action_loss_weights(value: str, action_dim: int) -> torch.Tensor | None:
+    if not value:
+        return None
+    if action_dim <= 0:
+        raise ValueError(f"action_dim must be positive, got {action_dim}")
+    path = Path(value).expanduser()
+    if path.suffix.lower() in {".json", ".csv"} or "/" in value:
+        if not path.is_file():
+            raise FileNotFoundError(f"Action loss weights file not found: {path}")
+        if path.suffix.lower() == ".json":
+            payload = json.loads(path.read_text())
+            weights_obj = payload["weights"] if isinstance(payload, dict) else payload
+            weights = np.asarray(weights_obj, dtype=np.float32)
+        elif path.suffix.lower() == ".csv":
+            df = pd.read_csv(path)
+            if "weight" not in df.columns:
+                raise ValueError(f"CSV loss weights must contain a weight column: {path}")
+            if "dim" in df.columns:
+                df = df.sort_values("dim")
+            elif "action_dim" in df.columns:
+                df = df.sort_values("action_dim")
+            weights = df["weight"].to_numpy(dtype=np.float32)
+        else:
+            raise ValueError(f"Unsupported action loss weights file suffix: {path}")
+    else:
+        weights = np.asarray([float(item.strip()) for item in value.split(",")], dtype=np.float32)
+    if weights.shape != (action_dim,):
+        raise ValueError(f"Expected {action_dim} loss weights, got shape {weights.shape}")
+    if not np.isfinite(weights).all():
+        raise ValueError("Action loss weights contain non-finite values")
+    if np.any(weights <= 0.0):
+        raise ValueError("Action loss weights must be positive")
+    weights = weights / float(weights.mean())
+    return torch.from_numpy(weights.astype(np.float32, copy=False))
+
+
+def compute_decoder_loss(
+    pred: torch.Tensor,
+    norm_target: torch.Tensor,
+    args: argparse.Namespace,
+    loss_weights: torch.Tensor | None,
+) -> torch.Tensor:
+    loss_type = str(args.loss_type)
+    if loss_type == "mse" or loss_type == "weighted_mse":
+        per_dim_loss = torch.square(pred - norm_target)
+    elif loss_type == "smooth_l1" or loss_type == "weighted_smooth_l1":
+        beta = float(args.smooth_l1_beta)
+        if beta <= 0.0:
+            raise ValueError(f"smooth_l1_beta must be positive, got {beta}")
+        per_dim_loss = F.smooth_l1_loss(pred, norm_target, beta=beta, reduction="none")
+    else:
+        raise ValueError(f"Unsupported loss_type={loss_type!r}")
+    if loss_type.startswith("weighted_"):
+        if loss_weights is None:
+            raise ValueError(f"loss_type={loss_type} requires --loss-weights")
+        per_dim_loss = per_dim_loss * loss_weights[None, :]
+    elif loss_weights is not None:
+        raise ValueError("--loss-weights requires a weighted loss type")
+    loss = per_dim_loss.mean()
+    variance_weight = float(args.variance_loss_weight)
+    if variance_weight < 0.0:
+        raise ValueError(f"variance_loss_weight must be non-negative, got {variance_weight}")
+    if variance_weight > 0.0:
+        pred_std = pred.std(dim=0, unbiased=False)
+        target_std = norm_target.std(dim=0, unbiased=False)
+        loss = loss + variance_weight * F.mse_loss(pred_std, target_std)
+    return loss
 
 
 @torch.no_grad()
@@ -726,9 +920,9 @@ def plot_loss_curves(out_dir: Path) -> None:
         np.asarray([row["loss"] for row in train_rows], dtype=np.float64),
         color="#1f77b4",
         linewidth=1.2,
-        label="train normalized action MSE",
+        label="train objective",
     )
-    axes[0].set_ylabel("normalized train MSE")
+    axes[0].set_ylabel("train objective")
     axes[0].grid(True, alpha=0.25)
     axes[0].legend(frameon=False)
 
@@ -794,15 +988,23 @@ def train_decoder(args: argparse.Namespace) -> None:
     print(
         f"decoder={args.decoder_arch} depth={args.depth} hidden_dim={args.hidden_dim} "
         f"dropout={args.dropout} layer_norm={args.layer_norm} "
+        f"head_arch={args.head_arch} "
         f"trainable_params={count_trainable_parameters(model)}",
         flush=True,
     )
     optimizer = build_decoder_optimizer(model, args)
     scheduler = build_decoder_lr_scheduler(optimizer, args)
+    loss_weights = load_action_loss_weights(str(args.loss_weights), int(args.action_dim))
+    loss_weights_dev = loss_weights.to(device) if loss_weights is not None else None
     print(
         f"optimizer=AdamW lr={args.lr:g} betas=({args.adam_beta1:g},{args.adam_beta2:g}) "
         f"weight_decay={args.weight_decay:g} lr_scheduler={args.lr_scheduler} "
         f"warmup_steps={args.effective_lr_warmup_steps} min_lr_ratio={args.min_lr_ratio:g}",
+        flush=True,
+    )
+    print(
+        f"loss_type={args.loss_type} loss_weights={args.loss_weights or 'none'} "
+        f"smooth_l1_beta={args.smooth_l1_beta:g} variance_loss_weight={args.variance_loss_weight:g}",
         flush=True,
     )
 
@@ -877,7 +1079,7 @@ def train_decoder(args: argparse.Namespace) -> None:
             norm_latent = (latent - latent_mean_dev) / latent_std_dev
             norm_target = (target - action_mean_dev) / action_std_dev
             pred = model(norm_latent)
-            loss = F.mse_loss(pred, norm_target)
+            loss = compute_decoder_loss(pred, norm_target, args, loss_weights_dev)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             if float(args.grad_clip_norm) > 0.0:
@@ -1027,11 +1229,34 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["mlp", "residual_mlp", "gated_mlp"],
         default="residual_mlp",
     )
-    train_p.add_argument("--hidden-dim", type=int, default=256)
+    train_p.add_argument("--hidden-dim", type=int, default=384)
     train_p.add_argument("--depth", type=int, default=4)
     train_p.add_argument("--dropout", type=float, default=0.02)
     train_p.add_argument("--layer-norm", action=argparse.BooleanOptionalAction, default=True)
-    train_p.add_argument("--lr", type=float, default=5e-4)
+    train_p.add_argument(
+        "--head-arch",
+        choices=["shared", "per_dim", "grouped"],
+        default="shared",
+        help="output head topology for residual_mlp/gated_mlp decoders",
+    )
+    train_p.add_argument(
+        "--head-groups",
+        default="",
+        help="semicolon-separated action dim groups for --head-arch grouped, e.g. 0,1;2,3",
+    )
+    train_p.add_argument(
+        "--loss-type",
+        choices=["mse", "weighted_mse", "smooth_l1", "weighted_smooth_l1"],
+        default="mse",
+    )
+    train_p.add_argument(
+        "--loss-weights",
+        default="",
+        help="comma list, JSON, or CSV with per-action-dim positive loss weights",
+    )
+    train_p.add_argument("--smooth-l1-beta", type=float, default=1.0)
+    train_p.add_argument("--variance-loss-weight", type=float, default=0.0)
+    train_p.add_argument("--lr", type=float, default=8e-4)
     train_p.add_argument("--weight-decay", type=float, default=1e-4)
     train_p.add_argument("--adam-beta1", type=float, default=0.9)
     train_p.add_argument("--adam-beta2", type=float, default=0.95)
