@@ -50,6 +50,38 @@
 **创建的任务：**
 - [063] AdaWorld decoder 二阶段消融与 loss/head 优化
 
+**用户原始需求：**
+> 继续优化 63，可以并行跑多个实验
+
+**直接修改：**
+- `src.pipeline.adaworld_action_decoder` 新增 `--head-arch` / `--head-groups`、
+  `--loss-type`、`--loss-weights`、`--smooth-l1-beta`、`--variance-loss-weight`，
+  支持 shared / per-dim / grouped head、weighted MSE、SmoothL1 和方差校准项。
+- 新增 `src.pipeline.adaworld_decoder_diagnostics`：从 `best_val_predictions.csv` /
+  `predictions.csv` 汇总逐维 MSE、normalized MSE、R2、correlation、预测方差比，并导出
+  可复用的 loss 权重 JSON/CSV。
+- AdaWorld decoder 训练默认从 task061 的 `hidden_dim=256` / `lr=5e-4` 升级为
+  `hidden_dim=384` / `lr=8e-4` 的 residual MLP shared-head 配置。
+- 更新 `doc/step_5_training_infra.md`、`doc/scripts_inventory.md` 和
+  `doc/h1_idm_methods.md`，记录 task063 诊断、消融、最佳配置和 task061/task057 对照。
+
+**task063 实验结果：**
+- 逐维诊断表：`tmp/adaworld_action_decoder_t063_analysis/per_dim_summary.csv`
+- loss 权重：`tmp/adaworld_action_decoder_t063_analysis/loss_weights.json`
+- 1500-step sweep 里最好的候选是 `hidden_dim=384` + `lr=8e-4` 的 residual MLP shared head，
+  held-out `action_mse=0.052365291863679886`；`per_dim head`、`weighted_mse`、
+  `variance_loss` 都没有超过这个配置。
+- 3000-step 完整训练后，最佳 checkpoint 位于
+  `tmp/adaworld_action_decoder_t063_full_c09_h384_lr8e4/best_checkpoint.pt`，held-out
+  `action_mse=0.05023810639977455`，`action_mean_dim_r2=0.6858815573729001`，
+  `action_mean_dim_corr=0.8282286180899694`，`action_pred_std_ratio_mean=0.8748558117793157`。
+- 对应全量 eval 位于 `tmp/adaworld_action_decoder_t063_full_c09_eval_best/metrics.json`，
+  `action_mse=0.029545826837420464`，`action_mean_dim_r2=0.8002844131909884`，
+  `action_mean_dim_corr=0.893933926637356`，`action_pred_std_ratio_mean=0.9002112241891714`。
+- 相比 task061，task063 最佳配置在 held-out 上把 `action_mse` 再降约 `8.1%`，在全量
+  eval 上再降约 `30.3%`；说明 `610k` 参数量并非容量上限，`1.36M` 参数的
+  `hidden_dim=384` shared-head decoder 更合适。
+
 ## 2026-05-31
 
 **用户原始需求：**

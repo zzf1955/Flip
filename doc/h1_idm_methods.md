@@ -264,6 +264,57 @@ tmp/adaworld_action_decoder_h1_full_t061_validate_best/val_metrics.json
 task061 的 full eval 覆盖 train + val 全部 `560422` samples，`action_mse=0.04235832020640373`；
 它包含训练集，不能和 held-out validate 指标直接比较。
 
+### task063 二阶段优化版 Decoder
+
+task063 继续固定 AdaWorld latent artifact、H1 数据根和 episode-level split，只探索 decoder
+容量、学习率、loss 和 output head。最佳配置：
+
+```text
+model_arch=residual_mlp
+hidden_dim=384
+depth=4
+dropout=0.02
+head_arch=shared
+loss_type=mse
+steps=3000
+batch_size=1024
+optimizer=AdamW
+lr=8e-4
+weight_decay=1e-4
+betas=(0.9, 0.95)
+lr_scheduler=cosine
+min_lr_ratio=0.02
+lr_warmup_ratio=0.05
+```
+
+输出：
+
+```text
+tmp/adaworld_action_decoder_t063_full_c09_h384_lr8e4
+tmp/adaworld_action_decoder_t063_full_c09_validate_best/val_metrics.json
+tmp/adaworld_action_decoder_t063_full_c09_eval_best/metrics.json
+```
+
+完整 H1 held-out 结果：
+
+| metric | value |
+|------|------:|
+| `n_samples` | `71486` |
+| `action_mse` | `0.05023810639977455` |
+| `mean_baseline_action_mse` | `0.15635326504707336` |
+| `action_norm_mse` | `0.3202458918094635` |
+| `relative_l2_error` | `0.26881195165744` |
+| `pred_norm_var_mean` | `0.765373` |
+| `target_norm_var_mean` | `1.003733` |
+| `action_mean_dim_r2` | `0.6858815573729001` |
+| `action_mean_dim_corr` | `0.8282286180899694` |
+| `action_pred_std_ratio_mean` | `0.8748558117793157` |
+
+task063 的 full eval 覆盖 train + val 全部 `560422` samples，`action_mse=0.029545826837420464`，
+`action_mean_dim_r2=0.8002844131909884`，`action_mean_dim_corr=0.893933926637356`，
+`action_pred_std_ratio_mean=0.9002112241891714`。它包含训练集，不能和 held-out validate
+指标直接比较。
+
 ## 方法 3：RGB Motion Transformer
 
 RGB Transformer 路线不经过 AdaWorld latent bottleneck，直接从两帧 RGB 预测 H1 action：
@@ -419,6 +470,8 @@ tmp/humanoid_pair_idm_t060_full_adaworld_protocol_validate/val_predictions.csv
 相对同 split task057 AdaWorld baseline decoder held-out `action_mse=0.07853357493877411`，
 RGB motion Transformer 的 `action_mse` 低约 `34.5%`。相对 task061 optimized AdaWorld
 decoder held-out `action_mse=0.054645732045173645`，RGB motion Transformer 低约 `5.9%`。
+task063 再把 AdaWorld latent decoder held-out `action_mse` 降到 `0.05023810639977455`，
+略低于 task060 RGB motion Transformer 的 `0.051443`。
 
 ## 统一结果表
 
@@ -429,27 +482,29 @@ decoder held-out `action_mse=0.054645732045173645`，RGB motion Transformer 低�
 | Mean baseline | none | none | `1.007003` | `0.474226` | `0.000000` | `0.156353` |
 | AdaWorld task057 baseline decoder | AdaWorld LAM `z_t[32]` | MLP decoder | `0.503421` | `0.336093` | `0.508775` | `0.078534` |
 | AdaWorld task061 optimized decoder | AdaWorld LAM `z_t[32]` | residual MLP decoder | `0.349901` | `0.280356` | `0.706071` | `0.054646` |
+| AdaWorld task063 optimized decoder | AdaWorld LAM `z_t[32]` | wider residual MLP decoder | `0.320246` | `0.268812` | `0.765373` | `0.050238` |
 | RGB motion Transformer task060 | two RGB frames | full RGB IDM | `0.320904` | `0.272016` | `0.689259` | `0.051443` |
 
 结论：
 
 - Mean baseline 是必要参考线，不是可部署模型。
 - AdaWorld latent decoder 明显优于 mean baseline，说明 AdaWorld LAM latent 包含 H1 action 相关信息。
-- task061 优化版 AdaWorld decoder 与 task060 RGB motion Transformer 的数据 split / target /
+- task061/task063 优化版 AdaWorld decoder 与 task060 RGB motion Transformer 的数据 split / target /
   held-out eval 集一致，可以公平比较 held-out 指标。
-- RGB motion Transformer 在完整 H1 同 split 上略优于 task061 optimized AdaWorld decoder：
-  `action_mse` 低约 `5.9%`，`norm MSE` 从 `0.349901` 降到 `0.320904`。
+- task063 的 wider residual MLP 在完整 H1 同 split 上略优于 task060 RGB motion Transformer：
+  `action_mse` 从 RGB Transformer 的 `0.051443` 降到 `0.050238`，`norm MSE` 两者几乎持平。
 - 小样本 `700/100` 或 `800` 级别实验会严重受 episode 覆盖影响，不能代表完整 H1 效果。
 
 ## 当前推荐
 
 如果目标是在 H1 上训练一个用于 action consistency / IDM 评估的模型，当前推荐顺序：
 
-1. 首选 `src.pipeline.humanoid_pair_idm --model-arch motion_transformer`，使用完整 H1 数据和
-   AdaWorld task057/task061 同口径 episode split。
-2. 保留 task061 AdaWorld optimized decoder 作为最强 latent-action baseline；task057 只作为
-   历史基础 MLP baseline。
-3. Mean baseline 只作为 sanity check，不应作为最终 IDM。
+1. 首选 task063 AdaWorld optimized decoder 作为当前最强 H1 held-out IDM baseline；它复用
+   AdaWorld LAM latent，训练成本低于 RGB motion Transformer。
+2. 保留 `src.pipeline.humanoid_pair_idm --model-arch motion_transformer` 作为不经过
+   AdaWorld latent bottleneck 的 RGB 端对照；它仍适合验证 latent bottleneck 是否限制信息。
+3. task057/task061 作为历史 AdaWorld decoder baseline；task057 只代表基础 MLP。
+4. Mean baseline 只作为 sanity check，不应作为最终 IDM。
 
 推荐的正式 H1 RGB IDM checkpoint：
 
