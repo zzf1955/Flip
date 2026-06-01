@@ -40,7 +40,33 @@
   `42.0%`。剩余高 MSE 维度主要是 `action_dim_06/07/08/09/10/22/23`，但整体预测方差比
   已从 task057 的约 `0.71` 提高到约 `0.84-0.86`。
 
+**用户原始需求：**
+> merge 当前 task；新建 task。
+
+**直接修改：**
+- 已将 `feat/t061-adaworld-idm-opt` 通过 `git merge --no-ff` 合并回 `main`。
+- 已将 [061] 从 `doc/tasks/active/061.md` 移动到 `doc/tasks/done/061.md`，并补充交付记录。
+
+**创建的任务：**
+- [063] AdaWorld decoder 二阶段消融与 loss/head 优化
+
 ## 2026-05-31
+
+**用户原始需求：**
+> 你看一下当前 Ada world的 IDM 模型和已有的结果, 开一个 task 来优化, 关注学习率,
+> 网络架构等基础参数, 试试能不能把预测的误差优化一下
+
+**创建的任务：**
+- [061] AdaWorld IDM 基础超参与 decoder 架构优化
+
+**补充结论：**
+- 当前 AdaWorld IDM 是 `src.pipeline.adaworld_action_decoder` 的 latent decoder 路线：
+  `(frame_t, frame_{t+1}) -> AdaWorld z_t[32] -> action_t[26]`。
+- task057 全量 H1 结果使用默认小 MLP `32 -> 128 -> 128 -> 26`；held-out
+  `action_mse=0.07853357493877411`，全量 eval `action_mse=0.07298979163169861`。
+- 新任务聚焦学习率、scheduler、weight decay、batch size、MLP 宽度/深度、归一化、
+  dropout 和轻量残差/gated decoder 变体，不重新训练 AdaWorld action encoder，也不加载
+  world model。
 
 **用户原始需求：**
 > 先改别的 2. 加指标 3. 解决数据的问题, 现在是不是 eval 划分的不太对, 如果不对的话修正过来
