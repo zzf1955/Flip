@@ -3,6 +3,36 @@
 ## 2026-06-01
 
 **用户原始需求：**
+> 按照当前的思路，优化这个 Transformer IDM 的效果，在当前 H1 的视频上尽可能准确。
+
+**创建的任务：**
+- [064] H1 RGB Motion Transformer IDM 准确率优化
+
+**直接修改：**
+- `src.pipeline.humanoid_pair_idm` 新增 `motion_transformer_v2`：在 task060 patch-level
+  motion token 基础上加入 raw RGB diff/abs-diff patch stem，并使用 residual MLP readout head。
+- 旧 `motion_transformer` checkpoint 继续按 `legacy_mlp` / `raw_motion_stem=false`
+  严格 replay；新 checkpoint 保存 `head_arch`、`head_depth`、`raw_motion_stem`。
+- 训练新增 normalized action 空间的 `--variance-loss-weight` /
+  `--variance-loss-warmup-ratio`、`--grad-accum-steps` 和 CUDA bfloat16 `--amp`。
+- 已完成 compile、help、新 v2 checkpoint replay、旧 task060 checkpoint replay、真实 H1
+  smoke 和 smoke checkpoint validate。
+- 已完成 task064 正式长训：`motion_transformer_v2`、patch16、`steps=8000`、
+  `batch_size=16`、`grad_accum_steps=2`、AMP、variance loss `0.03`。
+- 完整 H1 held-out validate（`71486` samples）结果：
+  `action_mse=0.028906064108014107`、`action_norm_mse=0.1969597190618515`、
+  `relative_l2_error=0.20390427137523634`、`pred_norm_var_mean=0.8531579971313477`、
+  `action_mean_dim_corr=0.8984220096698174`；`pred_norm_var_mean` 由完整
+  `val_predictions.csv` 和 checkpoint train mean/std 复算。
+- 相比 task060 RGB motion Transformer 完整 held-out，`action_mse` 约降低 `43.8%`，
+  normalized MSE 约降低 `38.6%`。
+- 新增并验证 `--init-checkpoint` 二阶段初始化；两组 fine-tune（`lr=1e-4` + variance
+  loss `0.01`，以及 `lr=3e-5` 无 variance loss）均未刷新 `s8000` 的 4096-sample
+  subset best，因此当前推荐仍是 `tmp/humanoid_pair_idm_t064_v2_p16_s8000/best_checkpoint.pt`。
+- 更新 `doc/h1_idm_methods.md`、`doc/step_5_training_infra.md`、
+  `doc/scripts_inventory.md`，记录 v2 架构、smoke 命令和正式长训矩阵。
+
+**用户原始需求：**
 > 先看一下当前不同 task 中, Transformer 的做法/原 Ada World decoder 的效果. 然后跑一下这个改进后的 Ada World decoder.
 
 **上下文复核：**
