@@ -1451,3 +1451,4 @@
 - 将已完成且 worktree 干净的 task057、task058、task060、task061、task063、task064 正式/阶段性产物从 `.worktrees/tNNN/` 复制回 main 工作区的 `tmp/` / `output/` 同名目录，smoke 目录不迁移。
 - 更新 `doc/h1_idm_methods.md`、`doc/step_5_training_infra.md`、`doc/scripts_inventory.md`、相关 done task 文档中的产物路径，避免继续引用 `.worktrees/tNNN/tmp/...`。
 - 保留 task059、task062 worktree；它们仍是 active，且 worktree 中有未提交实现改动。
+- 进一步将 task051、task053、task054、task056 的正式/阶段性产物迁回 main 的 `tmp/` / `output/`，并同步收口它们在 task 文档中的产物路径。
