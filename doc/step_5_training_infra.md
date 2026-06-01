@@ -867,9 +867,14 @@ parquet 中同一帧的 `action` 标签，形成监督对：
 
 - 输入：`z_t`，shape 为 `[N, 32]` 的 AdaWorld continuous latent action。
 - 输出：H1 `action_t`，当前实现按 26 维 `action` 向量训练。
-- 模型：小 MLP baseline，默认 `32 -> 128 -> 128 -> 26`，使用 latent / action 双边标准化。
+- 模型：仍保留 `mlp` baseline，默认 `32 -> 128 -> 128 -> 26`；当前推荐默认是
+  `residual_mlp`，用 `hidden_dim=256`、`depth=4`、`dropout=0.02`、LayerNorm、
+  `lr=5e-4`、`weight_decay=1e-4`、`betas=(0.9,0.95)`、cosine scheduler + 5% warmup、
+  `min_lr_ratio=0.02`。`gated_mlp` 也保留作消融对照。训练和验证都使用 latent / action
+  双边标准化。
 - 训练目标：标准化后的 action MSE；验证时回到原始 action 空间，输出 MSE、R2、
-  correlation、方差比等指标。
+  correlation、方差比等指标。checkpoint 保存完整 decoder 架构、优化器和 warmup 配置，
+  `validate` / `eval` 可复算 replay。
 
 输出目录包含：
 
@@ -942,6 +947,78 @@ Held-out best checkpoint 结果：
 与同 split mean baseline 相比，held-out action MSE 约降低 `49.8%`；与全量 eval mean
 baseline 相比，action MSE 约降低 `53.3%`。历史两帧 RGB H1 IDM 结果使用不同样本量、
 split 或 target 语义，只作为参考，不作为严格同 split 对照。
+
+### AdaWorld Latent Action Decoder 优化版
+
+task061 在 task057 的完整 latent artifact 和 episode-level split 上继续优化 decoder，
+不再改 latent 提取口径，只调学习率、warmup、网络宽度/深度、残差结构和少量正则。
+当前推荐配置是 `residual_mlp`：
+
+```bash
+scripts/flip_run.sh adaworld_action_decoder --cuda 1 -- train \
+  --device cuda:0 \
+  --data-root /disk_n/zzf/flip/data/humanoid-everyday-h1-chunks0-6-8-200 \
+  --latent-path /disk_n/zzf/flip/.worktrees/t057/tmp/adaworld_action_encoder_h1_full_t057/latent_actions.npz \
+  --output-dir tmp/adaworld_action_decoder_h1_full_t061 \
+  --split-by episode \
+  --steps 3000 \
+  --batch-size 1024 \
+  --eval-every 500 \
+  --log-every 100 \
+  --workers 0 \
+  --decoder-arch residual_mlp \
+  --hidden-dim 256 \
+  --depth 4 \
+  --dropout 0.02 \
+  --layer-norm \
+  --lr 5e-4 \
+  --weight-decay 1e-4 \
+  --adam-beta1 0.9 \
+  --adam-beta2 0.95 \
+  --lr-scheduler cosine \
+  --min-lr-ratio 0.02 \
+  --lr-warmup-ratio 0.05
+```
+
+task061 的 held-out best checkpoint 指标：
+
+- `action_mse = 0.054645732045173645`
+- `mean_baseline_action_mse = 0.15635326504707336`
+- `action_mean_dim_r2 = 0.6565681374990023`
+- `action_mean_dim_corr = 0.809087702861199`
+- `action_pred_std_ratio_mean = 0.8399375424935267`
+
+task061 的全量 eval 指标：
+
+- `action_mse = 0.04235832020640373`
+- `mean_baseline_action_mse = 0.15620023012161255`
+- `action_mean_dim_r2 = 0.72525387773147`
+- `action_mean_dim_corr = 0.850245631658114`
+- `action_pred_std_ratio_mean = 0.8563885574157422`
+
+对比 task057 baseline，这个 residual MLP decoder 在 held-out 上把 `action_mse`
+从 `0.07853357493877411` 降到 `0.054645732045173645`，约降低 `30.4%`；在全量
+eval 上把 `action_mse` 从 `0.07298979163169861` 降到 `0.04235832020640373`，
+约降低 `42.0%`。高误差维度仍主要集中在 `action_dim_06/07/08/09/10/22/23`，
+但这些维度的预测方差已经明显回升，整体更接近 target 分布而不是均值回归。
+
+复算命令：
+
+```bash
+scripts/flip_run.sh adaworld_action_decoder --cuda 1 -- validate \
+  --device cuda:0 \
+  --checkpoint tmp/adaworld_action_decoder_h1_full_t061/best_checkpoint.pt \
+  --output-dir tmp/adaworld_action_decoder_h1_full_t061_validate_best \
+  --workers 0
+```
+
+```bash
+scripts/flip_run.sh adaworld_action_decoder --cuda 1 -- eval \
+  --device cuda:0 \
+  --checkpoint tmp/adaworld_action_decoder_h1_full_t061/best_checkpoint.pt \
+  --output-dir tmp/adaworld_action_decoder_h1_full_t061_eval_best \
+  --workers 0
+```
 
 小规模 smoke 示例：
 

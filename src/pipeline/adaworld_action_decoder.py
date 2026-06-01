@@ -52,6 +52,30 @@ class LatentActionSample:
     parquet_path: str
 
 
+class ResidualLatentBlock(nn.Module):
+    def __init__(self, dim: int, dropout: float, *, gated: bool, layer_norm: bool) -> None:
+        super().__init__()
+        if dim <= 0:
+            raise ValueError(f"dim must be positive, got {dim}")
+        if dropout < 0.0:
+            raise ValueError(f"dropout must be non-negative, got {dropout}")
+        self.gated = bool(gated)
+        self.pre_norm = nn.LayerNorm(dim) if layer_norm else nn.Identity()
+        self.fc = nn.Linear(dim, dim * 2 if gated else dim)
+        self.proj = nn.Linear(dim, dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.pre_norm(x)
+        if self.gated:
+            value, gate = self.fc(h).chunk(2, dim=-1)
+            h = F.silu(value) * torch.sigmoid(gate)
+        else:
+            h = F.silu(self.fc(h))
+        h = self.dropout(self.proj(h))
+        return x + h
+
+
 class LatentActionDecoder(nn.Module):
     def __init__(
         self,
@@ -62,6 +86,7 @@ class LatentActionDecoder(nn.Module):
         depth: int,
         dropout: float,
         layer_norm: bool,
+        architecture: str,
     ) -> None:
         super().__init__()
         if input_dim <= 0:
@@ -74,28 +99,66 @@ class LatentActionDecoder(nn.Module):
             raise ValueError(f"depth must be non-negative, got {depth}")
         if dropout < 0.0:
             raise ValueError(f"dropout must be non-negative, got {dropout}")
+        if architecture not in {"mlp", "residual_mlp", "gated_mlp"}:
+            raise ValueError(f"Unsupported architecture={architecture!r}")
 
-        layers: list[nn.Module] = []
-        current_dim = input_dim
-        for _ in range(depth):
-            layers.append(nn.Linear(current_dim, hidden_dim))
-            if layer_norm:
-                layers.append(nn.LayerNorm(hidden_dim))
-            layers.append(nn.SiLU())
-            if dropout > 0.0:
-                layers.append(nn.Dropout(dropout))
-            current_dim = hidden_dim
-        layers.append(nn.Linear(current_dim, output_dim))
-        self.net = nn.Sequential(*layers)
         self.input_dim = int(input_dim)
         self.output_dim = int(output_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.depth = int(depth)
+        self.dropout = float(dropout)
+        self.layer_norm = bool(layer_norm)
+        self.architecture = str(architecture)
+
+        if self.architecture == "mlp":
+            layers: list[nn.Module] = []
+            current_dim = input_dim
+            for _ in range(depth):
+                layers.append(nn.Linear(current_dim, hidden_dim))
+                if layer_norm:
+                    layers.append(nn.LayerNorm(hidden_dim))
+                layers.append(nn.SiLU())
+                if dropout > 0.0:
+                    layers.append(nn.Dropout(dropout))
+                current_dim = hidden_dim
+            layers.append(nn.Linear(current_dim, output_dim))
+            self.net = nn.Sequential(*layers)
+        else:
+            gated = self.architecture == "gated_mlp"
+            self.input_proj = nn.Linear(input_dim, hidden_dim)
+            self.input_norm = nn.LayerNorm(hidden_dim) if layer_norm else nn.Identity()
+            self.blocks = nn.ModuleList(
+                [
+                    ResidualLatentBlock(
+                        hidden_dim,
+                        dropout,
+                        gated=gated,
+                        layer_norm=layer_norm,
+                    )
+                    for _ in range(depth)
+                ]
+            )
+            self.output_norm = nn.LayerNorm(hidden_dim) if layer_norm else nn.Identity()
+            self.head = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.SiLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, output_dim),
+            )
 
     def forward(self, latent: torch.Tensor) -> torch.Tensor:
         if latent.ndim != 2 or latent.shape[1] != self.input_dim:
             raise ValueError(
                 f"Expected latent [B,{self.input_dim}], got {tuple(latent.shape)}"
             )
-        return self.net(latent.float())
+        if self.architecture == "mlp":
+            return self.net(latent.float())
+        x = self.input_proj(latent.float())
+        x = self.input_norm(x)
+        for block in self.blocks:
+            x = block(x)
+        x = self.output_norm(x)
+        return self.head(x)
 
 
 class LatentActionDataset(torch.utils.data.Dataset):
@@ -380,6 +443,7 @@ def make_decoder(args: argparse.Namespace) -> LatentActionDecoder:
         depth=int(args.depth),
         dropout=float(args.dropout),
         layer_norm=bool(args.layer_norm),
+        architecture=str(args.decoder_arch),
     )
 
 
@@ -408,7 +472,7 @@ def save_checkpoint(
             "depth": int(args.depth),
             "dropout": float(args.dropout),
             "layer_norm": bool(args.layer_norm),
-            "architecture": "mlp_latent_action_decoder",
+            "architecture": f"{args.decoder_arch}_latent_action_decoder",
             "alignment": "(frame_t,frame_t+1)->adaworld_z_t->action_t",
         },
         "config": {
@@ -421,8 +485,22 @@ def save_checkpoint(
             "train_ratio": float(args.train_ratio),
             "train_samples": int(args.train_samples),
             "eval_samples": int(args.eval_samples),
+            "decoder_arch": str(args.decoder_arch),
+            "hidden_dim": int(args.hidden_dim),
+            "depth": int(args.depth),
+            "dropout": float(args.dropout),
+            "layer_norm": bool(args.layer_norm),
+            "lr": float(args.lr),
+            "weight_decay": float(args.weight_decay),
+            "adam_beta1": float(args.adam_beta1),
+            "adam_beta2": float(args.adam_beta2),
             "lr_scheduler": args.lr_scheduler,
             "min_lr_ratio": float(args.min_lr_ratio),
+            "lr_warmup_steps": int(args.lr_warmup_steps),
+            "lr_warmup_steps_effective": int(
+                getattr(args, "effective_lr_warmup_steps", args.lr_warmup_steps)
+            ),
+            "lr_warmup_ratio": float(args.lr_warmup_ratio),
             "dataset": "humanoid_everyday_h1",
             "target_semantics": "action[rel_frame_t]",
             "latent_semantics": "AdaWorld LAM z_mu for (frame_t,frame_t+1)",
@@ -438,6 +516,15 @@ def load_decoder_checkpoint(
 ) -> tuple[LatentActionDecoder, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
     ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
     model_cfg = ckpt["model"]
+    architecture = str(model_cfg["architecture"])
+    if architecture == "mlp_latent_action_decoder":
+        decoder_arch = "mlp"
+    elif architecture == "residual_mlp_latent_action_decoder":
+        decoder_arch = "residual_mlp"
+    elif architecture == "gated_mlp_latent_action_decoder":
+        decoder_arch = "gated_mlp"
+    else:
+        raise ValueError(f"Unsupported decoder checkpoint architecture={architecture!r}: {checkpoint}")
     model = LatentActionDecoder(
         input_dim=int(model_cfg["input_dim"]),
         output_dim=int(model_cfg["output_dim"]),
@@ -445,6 +532,7 @@ def load_decoder_checkpoint(
         depth=int(model_cfg["depth"]),
         dropout=float(model_cfg["dropout"]),
         layer_norm=bool(model_cfg["layer_norm"]),
+        architecture=decoder_arch,
     ).to(device)
     model.load_state_dict(ckpt["model_state"], strict=True)
     model.eval()
@@ -456,6 +544,74 @@ def load_decoder_checkpoint(
         ckpt["action_std"].to(device),
         ckpt,
     )
+
+
+def effective_lr_warmup_steps(args: argparse.Namespace) -> int:
+    if int(args.steps) <= 0:
+        raise ValueError(f"steps must be positive, got {args.steps}")
+    if int(args.lr_warmup_steps) < 0:
+        raise ValueError(f"lr_warmup_steps must be non-negative, got {args.lr_warmup_steps}")
+    if float(args.lr_warmup_ratio) < 0.0:
+        raise ValueError(f"lr_warmup_ratio must be non-negative, got {args.lr_warmup_ratio}")
+    warmup_steps = int(args.lr_warmup_steps)
+    if warmup_steps == 0 and float(args.lr_warmup_ratio) > 0.0:
+        warmup_steps = int(round(int(args.steps) * float(args.lr_warmup_ratio)))
+    if warmup_steps > int(args.steps):
+        raise ValueError(
+            f"lr warmup steps must not exceed total steps, got {warmup_steps} > {args.steps}"
+        )
+    return warmup_steps
+
+
+def build_decoder_optimizer(
+    model: nn.Module,
+    args: argparse.Namespace,
+) -> torch.optim.Optimizer:
+    beta1 = float(args.adam_beta1)
+    beta2 = float(args.adam_beta2)
+    if not 0.0 <= beta1 < 1.0:
+        raise ValueError(f"adam_beta1 must be in [0,1), got {beta1}")
+    if not 0.0 <= beta2 < 1.0:
+        raise ValueError(f"adam_beta2 must be in [0,1), got {beta2}")
+    if beta1 >= beta2:
+        raise ValueError(f"Adam betas should satisfy beta1 < beta2, got {beta1} >= {beta2}")
+    if float(args.weight_decay) < 0.0:
+        raise ValueError(f"weight_decay must be non-negative, got {args.weight_decay}")
+    return torch.optim.AdamW(
+        model.parameters(),
+        lr=float(args.lr),
+        betas=(beta1, beta2),
+        weight_decay=float(args.weight_decay),
+    )
+
+
+def build_decoder_lr_scheduler(
+    optimizer: torch.optim.Optimizer,
+    args: argparse.Namespace,
+) -> torch.optim.lr_scheduler.LambdaLR | None:
+    warmup_steps = effective_lr_warmup_steps(args)
+    args.effective_lr_warmup_steps = warmup_steps
+    if float(args.min_lr_ratio) < 0.0:
+        raise ValueError(f"min_lr_ratio must be non-negative, got {args.min_lr_ratio}")
+    if args.lr_scheduler == "none" and warmup_steps == 0:
+        return None
+    if args.lr_scheduler not in {"none", "cosine"}:
+        raise ValueError(f"Unsupported lr_scheduler={args.lr_scheduler!r}")
+
+    def lr_lambda(step_index: int) -> float:
+        if warmup_steps > 0 and step_index < warmup_steps:
+            return float(step_index + 1) / float(warmup_steps)
+        if args.lr_scheduler == "none":
+            return 1.0
+        decay_steps = max(1, int(args.steps) - warmup_steps)
+        progress = min(
+            1.0,
+            max(0.0, float(step_index - warmup_steps) / float(decay_steps)),
+        )
+        min_ratio = float(args.min_lr_ratio)
+        return min_ratio + 0.5 * (1.0 - min_ratio) * (1.0 + math.cos(math.pi * progress))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
 
 @torch.no_grad()
@@ -636,21 +792,19 @@ def train_decoder(args: argparse.Namespace) -> None:
     device = args.device
     model = make_decoder(args).to(device)
     print(
-        f"decoder=mlp depth={args.depth} hidden_dim={args.hidden_dim} "
-        f"layer_norm={args.layer_norm} trainable_params={count_trainable_parameters(model)}",
+        f"decoder={args.decoder_arch} depth={args.depth} hidden_dim={args.hidden_dim} "
+        f"dropout={args.dropout} layer_norm={args.layer_norm} "
+        f"trainable_params={count_trainable_parameters(model)}",
         flush=True,
     )
-    optimizer = torch.optim.AdamW(model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
-    if args.lr_scheduler == "none":
-        scheduler = None
-    elif args.lr_scheduler == "cosine":
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=int(args.steps),
-            eta_min=float(args.lr) * float(args.min_lr_ratio),
-        )
-    else:
-        raise ValueError(f"Unsupported lr_scheduler={args.lr_scheduler!r}")
+    optimizer = build_decoder_optimizer(model, args)
+    scheduler = build_decoder_lr_scheduler(optimizer, args)
+    print(
+        f"optimizer=AdamW lr={args.lr:g} betas=({args.adam_beta1:g},{args.adam_beta2:g}) "
+        f"weight_decay={args.weight_decay:g} lr_scheduler={args.lr_scheduler} "
+        f"warmup_steps={args.effective_lr_warmup_steps} min_lr_ratio={args.min_lr_ratio:g}",
+        flush=True,
+    )
 
     train_loader = torch.utils.data.DataLoader(
         LatentActionDataset(train_samples),
@@ -868,14 +1022,33 @@ def build_parser() -> argparse.ArgumentParser:
     add_runtime_args(train_p)
     train_p.add_argument("--output-dir", default=None)
     train_p.add_argument("--steps", type=int, default=1000)
-    train_p.add_argument("--hidden-dim", type=int, default=128)
-    train_p.add_argument("--depth", type=int, default=2)
-    train_p.add_argument("--dropout", type=float, default=0.0)
+    train_p.add_argument(
+        "--decoder-arch",
+        choices=["mlp", "residual_mlp", "gated_mlp"],
+        default="residual_mlp",
+    )
+    train_p.add_argument("--hidden-dim", type=int, default=256)
+    train_p.add_argument("--depth", type=int, default=4)
+    train_p.add_argument("--dropout", type=float, default=0.02)
     train_p.add_argument("--layer-norm", action=argparse.BooleanOptionalAction, default=True)
-    train_p.add_argument("--lr", type=float, default=1e-3)
+    train_p.add_argument("--lr", type=float, default=5e-4)
     train_p.add_argument("--weight-decay", type=float, default=1e-4)
+    train_p.add_argument("--adam-beta1", type=float, default=0.9)
+    train_p.add_argument("--adam-beta2", type=float, default=0.95)
     train_p.add_argument("--lr-scheduler", choices=["none", "cosine"], default="cosine")
-    train_p.add_argument("--min-lr-ratio", type=float, default=0.05)
+    train_p.add_argument("--min-lr-ratio", type=float, default=0.02)
+    train_p.add_argument(
+        "--lr-warmup-steps",
+        type=int,
+        default=0,
+        help="explicit linear warmup steps; 0 derives from lr-warmup-ratio",
+    )
+    train_p.add_argument(
+        "--lr-warmup-ratio",
+        type=float,
+        default=0.05,
+        help="fraction of total steps used for linear warmup when lr-warmup-steps is 0",
+    )
     train_p.add_argument("--grad-clip-norm", type=float, default=1.0)
     train_p.add_argument("--log-every", type=int, default=50)
     train_p.add_argument("--eval-every", type=int, default=100)
