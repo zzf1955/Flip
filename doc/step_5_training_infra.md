@@ -728,7 +728,8 @@ Humanoid Everyday H1 子集使用独立 `src.pipeline.humanoid_pair_idm` 入口�
 RGB 帧。H1 版本不再拆成旧 WBT 的 `ee_action` / `hand_cmd` 两个 12 维头，而是
 训练一个单独模型输出完整 26 维 `action`。当前默认 `--model-arch motion_transformer`，
 旧的 `--model-arch transformer` 仍保留为 legacy checkpoint / ablation 对照，也可以显式传
-`--model-arch small_cnn` 复现实验对照：
+`--model-arch small_cnn` 复现实验对照。task064 新增 `--model-arch motion_transformer_v2`
+作为准确率优化实验模型：
 
 H1 上 Mean baseline、AdaWorld latent decoder 和 RGB motion Transformer 的统一方法、
 数据 split、训练命令和指标对比见 `doc/h1_idm_methods.md`。
@@ -748,6 +749,15 @@ H1 上 Mean baseline、AdaWorld latent decoder 和 RGB motion Transformer 的统
   `[(x_t, x_{t+d}, x_{t+d}-x_t, |x_{t+d}-x_t|)]`，再加入 CLS token、motion CLS、frame
   embedding 和 2D sin/cos 位置编码，用 `TransformerEncoder` 聚合后通过
   `cls + motion_cls + frame0_mean + frame1_mean + motion_mean` 的 5 路读出回归 26 维 action。
+- `motion_transformer_v2` 保持同一监督口径和 token 读出，但把原始 RGB
+  `[frame_{t+d}-frame_t, |frame_{t+d}-frame_t|]` 通过独立 patch stem 注入 motion token，
+  并使用 residual MLP readout head，减少旧模型输出方差偏低的问题。旧 checkpoint 若缺少
+  `head_arch` / `raw_motion_stem` 字段，会按 `legacy_mlp` / `false` 严格 replay。
+- 训练侧新增 `--variance-loss-weight`、`--variance-loss-warmup-ratio`、`--grad-accum-steps`
+  和 `--amp`。variance loss 只在 normalized action 空间匹配 batch-level 预测方差；
+  `--amp` 使用 CUDA bfloat16 autocast，主要用于 patch16 / 长训降低显存压力。
+- `--init-checkpoint` 可从已有 checkpoint 严格初始化 train，要求模型配置和当前 train split
+  action mean / std 一致；用于显式二阶段 fine-tune，不做隐式 fallback。
 - 训练默认使用 AdamW `lr=3e-4`、`weight_decay=1e-2`、`betas=(0.9, 0.95)`，并使用
   cosine scheduler + 5% warmup，`min_lr_ratio=0.02`；Transformer 默认 `hidden_dim=256`、
   `transformer_depth=6`、`transformer_dropout=0.05`。
@@ -765,6 +775,11 @@ H1 上 Mean baseline、AdaWorld latent decoder 和 RGB motion Transformer 的统
   `0.689259`，`action_mse=0.051443`。同 split task061 optimized AdaWorld latent decoder
   held-out normalized MSE `0.349901`、action relative L2 `0.280356`、归一化空间预测方差
   `0.706071`、`action_mse=0.054646`；当前 RGB motion Transformer `action_mse` 低约 `5.9%`。
+- task064 `motion_transformer_v2` patch16 `8000` step 已成为当前最强 H1 RGB IDM：
+  完整 held-out validate（`71486` samples）得到 normalized MSE `0.196960`、
+  action relative L2 `0.203904`、归一化空间预测方差 `0.853158`、
+  `action_mse=0.028906`、`action_mean_dim_corr=0.898422`。相对 task060，`action_mse`
+  约降低 `43.8%`，normalized MSE 约降低 `38.6%`。
 - 早期 interval sweep 里，`d=1` 在 `1/2/4/8/16` 中最好，`best action_mse=0.107009`，
   比 mean baseline `0.110856` 略好；`d>1` 没有带来稳定提升，所以默认仍保持
   `frame_delta=1`。
@@ -796,6 +811,140 @@ scripts/flip_run.sh humanoid_pair_idm --cuda 2 -- train \
   --lr 3e-4 \
   --lr-warmup-ratio 0.05
 ```
+
+task064 `motion_transformer_v2` smoke 示例，覆盖 raw motion stem、residual head、
+variance loss、AMP 和梯度累积：
+
+```bash
+scripts/flip_run.sh humanoid_pair_idm --cuda 2 -- train \
+  --device cuda:0 \
+  --data-root /disk_n/zzf/flip/data/humanoid-everyday-h1-chunks0-6-8-200 \
+  --output-dir tmp/humanoid_pair_idm_t064_v2_smoke \
+  --max-samples 64 \
+  --max-pairs-per-episode 4 \
+  --frame-delta 1 \
+  --split-by episode \
+  --train-ratio 0.75 \
+  --steps 4 \
+  --batch-size 2 \
+  --workers 0 \
+  --eval-every 2 \
+  --val-max-samples 16 \
+  --resize 256x256 \
+  --model-arch motion_transformer_v2 \
+  --transformer-patch-size 16 \
+  --transformer-embed-dim 128 \
+  --transformer-depth 2 \
+  --transformer-num-heads 4 \
+  --transformer-dropout 0.02 \
+  --hidden-dim 128 \
+  --transformer-head-depth 2 \
+  --lr 3e-4 \
+  --weight-decay 3e-3 \
+  --lr-warmup-ratio 0.25 \
+  --variance-loss-weight 0.03 \
+  --variance-loss-warmup-ratio 0.5 \
+  --grad-accum-steps 2 \
+  --amp
+```
+
+task064 正式长训首选 patch16 v2 配置：
+
+```bash
+scripts/flip_run.sh humanoid_pair_idm --cuda 2 -- train \
+  --device cuda:0 \
+  --data-root /disk_n/zzf/flip/data/humanoid-everyday-h1-chunks0-6-8-200 \
+  --output-dir tmp/humanoid_pair_idm_t064_v2_p16_s8000 \
+  --max-samples 0 \
+  --frame-stride 1 \
+  --frame-delta 1 \
+  --split-by episode \
+  --train-ratio 0.875 \
+  --steps 8000 \
+  --batch-size 16 \
+  --workers 8 \
+  --eval-every 1000 \
+  --val-max-samples 4096 \
+  --resize 256x256 \
+  --model-arch motion_transformer_v2 \
+  --transformer-patch-size 16 \
+  --transformer-embed-dim 128 \
+  --transformer-depth 4 \
+  --transformer-num-heads 4 \
+  --transformer-dropout 0.02 \
+  --hidden-dim 256 \
+  --transformer-head-depth 2 \
+  --lr 3e-4 \
+  --weight-decay 3e-3 \
+  --lr-warmup-ratio 0.05 \
+  --min-lr-ratio 0.02 \
+  --variance-loss-weight 0.03 \
+  --variance-loss-warmup-ratio 0.05 \
+  --grad-accum-steps 2 \
+  --amp
+```
+
+完整 held-out validate 仍必须单独跑：
+
+```bash
+scripts/flip_run.sh humanoid_pair_idm --cuda 2 -- validate \
+  --device cuda:0 \
+  --checkpoint tmp/humanoid_pair_idm_t064_v2_p16_s8000/best_checkpoint.pt \
+  --output-dir tmp/humanoid_pair_idm_t064_v2_p16_s8000_validate \
+  --batch-size 16 \
+  --workers 8
+```
+
+task064 完整结果输出：
+
+```text
+tmp/humanoid_pair_idm_t064_v2_p16_s8000/best_checkpoint.pt
+tmp/humanoid_pair_idm_t064_v2_p16_s8000/eval_loss.csv
+tmp/humanoid_pair_idm_t064_v2_p16_s8000_validate/val_metrics.json
+tmp/humanoid_pair_idm_t064_v2_p16_s8000_validate/val_predictions.csv
+```
+
+中途 `4096` held-out subset eval 曲线：
+
+| step | norm MSE | relative L2 | action_mse | pred std ratio |
+|------|---------:|------------:|-----------:|---------------:|
+| 1000 | `0.462395` | `0.331649` | `0.076917` | `0.807803` |
+| 2000 | `0.335283` | `0.283008` | `0.056010` | `0.863389` |
+| 3000 | `0.295146` | `0.262496` | `0.048185` | `0.871074` |
+| 4000 | `0.253979` | `0.235231` | `0.038695` | `0.898377` |
+| 5000 | `0.231605` | `0.223533` | `0.034942` | `0.905373` |
+| 6000 | `0.218726` | `0.215771` | `0.032558` | `0.924237` |
+| 7000 | `0.203808` | `0.205522` | `0.029538` | `0.917772` |
+| 8000 | `0.202892` | `0.205012` | `0.029392` | `0.926239` |
+
+完整 `71486` held-out validate：
+
+| metric | value |
+|------|------:|
+| `action_mse` | `0.028906064108014107` |
+| `mean_baseline_action_mse` | `0.15635335445404053` |
+| `action_norm_mse` | `0.1969597190618515` |
+| `relative_l2_error` | `0.20390427137523634` |
+| `pred_norm_var_mean` | `0.8531579971313477` |
+| `target_norm_var_mean` | `1.003715991973877` |
+| `action_mean_dim_r2` | `0.8071291836408468` |
+| `action_mean_dim_corr` | `0.8984220096698174` |
+| `action_pred_std_ratio_mean` | `0.9228853445786697` |
+
+这里的 `pred_norm_var_mean` / `target_norm_var_mean` 由
+`val_predictions.csv` 和 checkpoint 中保存的 train action mean / std 复算得到；
+`val_metrics.json` 直接保存的是 `action_pred_std_ratio_mean`。
+
+二阶段 fine-tune 结果：
+
+- `tmp/humanoid_pair_idm_t064_v2_p16_ft_s3000_lr1e4` 从 `s8000/best_checkpoint.pt`
+  初始化，`lr=1e-4`、variance loss `0.01`；4096-sample subset 在 step500/1000 为
+  `action_mse=0.032071` / `0.032695`，没有刷新初始化 step0 的 `0.029392`。
+- `tmp/humanoid_pair_idm_t064_v2_p16_ft_s1000_lr3e5` 从同一 checkpoint 初始化，
+  `lr=3e-5`、无 variance loss / weight decay；step250/500 为 `0.030179` /
+  `0.029506`，也没有刷新初始化。
+- 因此当前推荐 checkpoint 仍是
+  `tmp/humanoid_pair_idm_t064_v2_p16_s8000/best_checkpoint.pt`。
 
 H1 700 训练 / 100 eval / 1000 step 示例：
 

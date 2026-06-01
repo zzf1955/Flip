@@ -335,6 +335,17 @@ src.pipeline.humanoid_pair_idm
 --model-arch motion_transformer
 ```
 
+task064 开始新增优化实验模型：
+
+```text
+--model-arch motion_transformer_v2
+```
+
+`motion_transformer_v2` 仍沿用两帧 patch motion token 的主干，但额外加入 RGB
+差分 motion stem 和 residual readout head，目标是减少当前 `pred_norm_var_mean`
+低于 target 的均值回归倾向。正式可部署 checkpoint 仍以完整 held-out validate 指标为准；
+在 task064 长训完成前，task060 checkpoint 仍是已完成全量验证的基线。
+
 ### 输入与预处理
 
 - 读取同一个 H1 LeRobot 数据根。
@@ -353,6 +364,13 @@ x_tp1    = patch_embed(frame_{t+1})
 motion   = MLP([x_t, x_tp1, x_tp1 - x_t, |x_tp1 - x_t|])
 ```
 
+task064 的 `motion_transformer_v2` 进一步把原始 RGB 空间的运动差异注入 motion token：
+
+```text
+raw_motion = ConvPatch([frame_tp1 - frame_t, |frame_tp1 - frame_t|])
+motion_v2  = motion + LayerNorm(raw_motion)
+```
+
 token 组成：
 
 - `cls_token`
@@ -368,6 +386,22 @@ readout：
 ```text
 concat(cls, motion_cls, frame0_mean, frame1_mean, motion_mean) -> MLP head -> action[26]
 ```
+
+task064 新增 readout head 选项：
+
+- `legacy_mlp`：保持 task060 checkpoint 的原始 head 结构，保证旧权重可严格 replay。
+- `mlp`：可配置深度的普通 MLP head。
+- `residual_mlp`：pre-norm residual MLP blocks，`motion_transformer_v2` 默认使用。
+- `gated_mlp`：residual block 内使用 SiLU value 和 sigmoid gate 的 gated 变体。
+
+训练侧新增：
+
+- `--variance-loss-weight` / `--variance-loss-warmup-ratio`：在 normalized action 空间匹配
+  batch-level 预测方差，抑制输出方差偏低。
+- `--grad-accum-steps`：支持 patch16 或更大 batch 的有效 batch size。
+- `--amp`：CUDA bfloat16 autocast，用于降低 patch16 / 长训显存压力。
+- `--init-checkpoint`：从已有 checkpoint 严格初始化 train，要求模型配置和当前 train
+  split action mean / std 完全一致；用于显式二阶段 fine-tune，不改变默认训练行为。
 
 ### 全量训练配置
 
@@ -427,6 +461,118 @@ scripts/flip_run.sh humanoid_pair_idm --cuda 2 -- validate \
   --workers 8
 ```
 
+### task064 优化实验配置
+
+第一优先级是把 task060 的 under-train 变量和新 v2 架构拆开比较。所有正式实验仍使用完整
+H1 数据、episode split、`frame_delta=1`，训练中途可以用 `--val-max-samples 4096`
+监控，但最终必须跑完整 `71486` held-out validate。
+
+推荐的第一组长训：
+
+```bash
+scripts/flip_run.sh humanoid_pair_idm --cuda 2 -- train \
+  --device cuda:0 \
+  --data-root /disk_n/zzf/flip/data/humanoid-everyday-h1-chunks0-6-8-200 \
+  --output-dir tmp/humanoid_pair_idm_t064_v2_p16_s8000 \
+  --max-samples 0 \
+  --frame-stride 1 \
+  --frame-delta 1 \
+  --split-by episode \
+  --train-ratio 0.875 \
+  --steps 8000 \
+  --batch-size 16 \
+  --workers 8 \
+  --eval-every 1000 \
+  --val-max-samples 4096 \
+  --resize 256x256 \
+  --model-arch motion_transformer_v2 \
+  --transformer-patch-size 16 \
+  --transformer-embed-dim 128 \
+  --transformer-depth 4 \
+  --transformer-num-heads 4 \
+  --transformer-dropout 0.02 \
+  --hidden-dim 256 \
+  --transformer-head-depth 2 \
+  --lr 3e-4 \
+  --weight-decay 3e-3 \
+  --lr-warmup-ratio 0.05 \
+  --min-lr-ratio 0.02 \
+  --variance-loss-weight 0.03 \
+  --variance-loss-warmup-ratio 0.05 \
+  --grad-accum-steps 2 \
+  --amp
+```
+
+对照组建议：
+
+- `T-base-8k`：task060 架构不变，`patch=32/embed=192/depth=4`，只把训练步数拉到
+  `8000`，确认是否主要是 under-train。
+- `T-wd-drop`：task060 架构，`weight_decay=3e-3`、`dropout=0.02`，看预测方差是否上升。
+- `V2-p32`：`motion_transformer_v2`，但保持 `patch=32/embed=192/depth=4`，单独看 raw
+  RGB diff stem + residual head 的收益。
+- `V2-p16`：上面的推荐命令，测试更细 patch 对第一人称手臂 / 接触动作的收益。
+
+完整验证：
+
+```bash
+scripts/flip_run.sh humanoid_pair_idm --cuda 2 -- validate \
+  --device cuda:0 \
+  --checkpoint tmp/humanoid_pair_idm_t064_v2_p16_s8000/best_checkpoint.pt \
+  --output-dir tmp/humanoid_pair_idm_t064_v2_p16_s8000_validate \
+  --batch-size 16 \
+  --workers 8
+```
+
+判断标准仍以 task060 完整 held-out 指标为基线：
+
+```text
+action_norm_mse=0.320904
+action_mse=0.051443
+relative_l2_error=0.272016
+pred_norm_var_mean=0.689259
+```
+
+task064 `motion_transformer_v2` patch16 `8000` step 已完成完整 held-out validate：
+
+```text
+tmp/humanoid_pair_idm_t064_v2_p16_s8000
+tmp/humanoid_pair_idm_t064_v2_p16_s8000_validate/val_metrics.json
+```
+
+完整 `71486` held-out samples：
+
+| metric | value |
+|------|------:|
+| `action_mse` | `0.028906064108014107` |
+| `mean_baseline_action_mse` | `0.15635335445404053` |
+| `action_norm_mse` | `0.1969597190618515` |
+| `relative_l2_error` | `0.20390427137523634` |
+| `pred_norm_var_mean` | `0.8531579971313477` |
+| `target_norm_var_mean` | `1.003715991973877` |
+| `action_mean_dim_r2` | `0.8071291836408468` |
+| `action_mean_dim_corr` | `0.8984220096698174` |
+| `action_pred_std_ratio_mean` | `0.9228853445786697` |
+
+这里的 `pred_norm_var_mean` / `target_norm_var_mean` 由
+`val_predictions.csv` 和 checkpoint 中保存的 train action mean / std 复算得到；
+`val_metrics.json` 直接保存的是 `action_pred_std_ratio_mean`。
+
+相对 task060 RGB motion Transformer 完整 held-out，task064 v2 的 `action_mse`
+从 `0.05144283175468445` 降到 `0.028906064108014107`，约降低 `43.8%`；
+`action_norm_mse` 从 `0.32090431451797485` 降到 `0.1969597190618515`，约降低 `38.6%`；
+预测方差也更接近 target，`pred_norm_var_mean` 从 `0.6892590912375324`
+提高到 `0.8531579971313477`。
+
+二阶段 fine-tune 暂未带来收益，当前推荐保持 `s8000` checkpoint：
+
+| fine-tune | init | best subset action_mse | 结论 |
+|------|------|------:|------|
+| `tmp/humanoid_pair_idm_t064_v2_p16_ft_s3000_lr1e4` | `s8000/best_checkpoint.pt` | `0.029392` at step 0 | `lr=1e-4` 后 step500/1000 退化到 `0.032071` / `0.032695` |
+| `tmp/humanoid_pair_idm_t064_v2_p16_ft_s1000_lr3e5` | `s8000/best_checkpoint.pt` | `0.029392` at step 0 | `lr=3e-5` 后 step250/500 为 `0.030179` / `0.029506` |
+
+这两条 fine-tune 都在确认无刷新后中止，没有运行完整 held-out validate；完整验证仍以
+`tmp/humanoid_pair_idm_t064_v2_p16_s8000_validate/val_metrics.json` 为准。
+
 ### 训练曲线
 
 中途 eval 为 held-out `4096` sample 子集。这个历史 `eval_loss.csv` 没有保存每个中途点的
@@ -484,38 +630,43 @@ task063 再把 AdaWorld latent decoder held-out `action_mse` 降到 `0.050238106
 | AdaWorld task061 optimized decoder | AdaWorld LAM `z_t[32]` | residual MLP decoder | `0.349901` | `0.280356` | `0.706071` | `0.054646` |
 | AdaWorld task063 optimized decoder | AdaWorld LAM `z_t[32]` | wider residual MLP decoder | `0.320246` | `0.268812` | `0.765373` | `0.050238` |
 | RGB motion Transformer task060 | two RGB frames | full RGB IDM | `0.320904` | `0.272016` | `0.689259` | `0.051443` |
+| RGB motion Transformer v2 task064 | two RGB frames | full RGB IDM | `0.196960` | `0.203904` | `0.853158` | `0.028906` |
 
 结论：
 
 - Mean baseline 是必要参考线，不是可部署模型。
 - AdaWorld latent decoder 明显优于 mean baseline，说明 AdaWorld LAM latent 包含 H1 action 相关信息。
-- task061/task063 优化版 AdaWorld decoder 与 task060 RGB motion Transformer 的数据 split / target /
+- task061/task063 优化版 AdaWorld decoder 与 task060/task064 RGB motion Transformer 的数据 split / target /
   held-out eval 集一致，可以公平比较 held-out 指标。
-- task063 的 wider residual MLP 在完整 H1 同 split 上略优于 task060 RGB motion Transformer：
-  `action_mse` 从 RGB Transformer 的 `0.051443` 降到 `0.050238`，`norm MSE` 两者几乎持平。
+- task063 的 wider residual MLP 是当前最强 AdaWorld latent-action decoder；它在完整 H1
+  同 split 上略优于 task060 RGB motion Transformer：`action_mse` 从 `0.051443` 降到
+  `0.050238`，`norm MSE` 两者几乎持平。
+- task064 `motion_transformer_v2` 是当前最强 H1 IDM：相对 task060，`action_mse` 约降低
+  `43.8%`，`norm MSE` 约降低 `38.6%`，同时预测方差更接近 held-out target。
 - 小样本 `700/100` 或 `800` 级别实验会严重受 episode 覆盖影响，不能代表完整 H1 效果。
 
 ## 当前推荐
 
 如果目标是在 H1 上训练一个用于 action consistency / IDM 评估的模型，当前推荐顺序：
 
-1. 首选 task063 AdaWorld optimized decoder 作为当前最强 H1 held-out IDM baseline；它复用
+1. 首选 task064 `src.pipeline.humanoid_pair_idm --model-arch motion_transformer_v2`，
+   使用完整 H1 数据和 AdaWorld task057/task061 同口径 episode split。
+2. task060 `motion_transformer` 现在作为上一代强基线保留。
+3. 保留 task063 AdaWorld optimized decoder 作为最强 latent-action baseline；它复用
    AdaWorld LAM latent，训练成本低于 RGB motion Transformer。
-2. 保留 `src.pipeline.humanoid_pair_idm --model-arch motion_transformer` 作为不经过
-   AdaWorld latent bottleneck 的 RGB 端对照；它仍适合验证 latent bottleneck 是否限制信息。
-3. task057/task061 作为历史 AdaWorld decoder baseline；task057 只代表基础 MLP。
-4. Mean baseline 只作为 sanity check，不应作为最终 IDM。
+4. task057/task061 作为历史 AdaWorld decoder baseline；task057 只代表基础 MLP。
+5. Mean baseline 只作为 sanity check，不应作为最终 IDM。
 
 推荐的正式 H1 RGB IDM checkpoint：
 
 ```text
-tmp/humanoid_pair_idm_t060_full_adaworld_protocol/best_checkpoint.pt
+tmp/humanoid_pair_idm_t064_v2_p16_s8000/best_checkpoint.pt
 ```
 
 推荐的完整 held-out 指标：
 
 ```text
-tmp/humanoid_pair_idm_t060_full_adaworld_protocol_validate/val_metrics.json
+tmp/humanoid_pair_idm_t064_v2_p16_s8000_validate/val_metrics.json
 ```
 
 ## 注意事项
