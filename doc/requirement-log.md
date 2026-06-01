@@ -31,6 +31,8 @@
   subset best，因此当前推荐仍是 `tmp/humanoid_pair_idm_t064_v2_p16_s8000/best_checkpoint.pt`。
 - 更新 `doc/h1_idm_methods.md`、`doc/step_5_training_infra.md`、
   `doc/scripts_inventory.md`，记录 v2 架构、smoke 命令和正式长训矩阵。
+- 已将 `feat/t064-h1-motion-transformer-accuracy` 通过 `git merge --no-ff` 合并回 `main`，
+  并将 [064] 从 `doc/tasks/active/064.md` 移动到 `doc/tasks/done/064.md`。
 
 **用户原始需求：**
 > 先看一下当前不同 task 中, Transformer 的做法/原 Ada World decoder 的效果. 然后跑一下这个改进后的 Ada World decoder.
@@ -1389,3 +1391,11 @@
 - 新增 `src/pipeline/action_mask_precompute.py`：基于 G1 FK mesh 投影逐帧计算 action 相关 body part 可见性；`--target-mode arm_hand` 覆盖左右臂/手，`--target-mode full_body` 覆盖 torso、左右腿、左右臂、左右手；支持 `--clip-middle-only` 只渲染 IDM 监督会访问的中间帧，支持 `--workers` 按 segment 并行预计算；写出 `training_data/action_mask/<task>/<episode>/<seg>.npz` 和 `index.jsonl`。
 - `src/pipeline/wan_vae_idm.py`：`train` / `validate` / `eval` 新增 `--target-mode`、`--action-mask-root`、`--action-mask-min-frame-ratio`、`--empty-action-mask-policy`；`arm_hand` 使用 `action.ee_action + action.hand_cmd` 24 维，`full_body` 使用 `action.robot_q_desired + action.hand_cmd` 48 维；action label 与 mask 都对齐到 17 帧 clip 的中间帧；IDM head 改为纯 3D CNN + MLP，Wan VAE latent `[B,48,5,16,16]` 经 CNN 到 `[B,256,5,8,8]` 后 spatial pool/readout/MLP 输出 action；启用 mask 后训练使用 visible 维度 masked loss，验证/eval 同时输出 unmasked 与 masked MSE、relative L2 error、visible count/ratio 和逐维 mask。
 - `doc/step_5_training_infra.md`、`doc/scripts_inventory.md`：补充 action mask precompute、维度映射、masked 训练/验证/eval 参数与输出字段。
+
+## 2026-06-01 — G1 Pick-Up-Cloth 独立 IDM 对比实验
+
+**用户原始需求：**
+> 现有 Transformer IDM 和 AdaWorld IDM 目前是在纯 Humanoid Everyday 上训练的，需要在 Unitree G1 数据集上跑一下。Transformer 可以直接训；AdaWorld 需要先跑 action Encoder，再重新训练 decoder。action 只用 arm 和 hand，loss mask 应该已经处理好了。训练没问题后，在两个指定 full_eval run 上只用 pick up cloth 任务做新数据 eval。不同数据集分开做，不要把已有脚本改太大，可以给不同数据加不同入口。
+
+**创建的任务：**
+- [062] G1 Pick-Up-Cloth 独立 IDM 对比实验
