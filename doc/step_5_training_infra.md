@@ -1078,7 +1078,7 @@ H1 全量 1600 episode 训练记录：
 scripts/flip_run.sh adaworld_action_decoder --cuda 1 -- train \
   --device cuda:0 \
   --data-root /disk_n/zzf/flip/data/humanoid-everyday-h1-chunks0-6-8-200 \
-  --latent-path /disk_n/zzf/flip/.worktrees/t057/tmp/adaworld_action_encoder_h1_full_t057/latent_actions.npz \
+  --latent-path /disk_n/zzf/flip/tmp/adaworld_action_encoder_h1_full_t057/latent_actions.npz \
   --output-dir tmp/adaworld_action_decoder_h1_full_t057 \
   --split-by episode \
   --steps 2000 \
@@ -1130,7 +1130,7 @@ task061 在 task057 的完整 latent artifact 和 episode-level split 上继续�
 scripts/flip_run.sh adaworld_action_decoder --cuda 1 -- train \
   --device cuda:0 \
   --data-root /disk_n/zzf/flip/data/humanoid-everyday-h1-chunks0-6-8-200 \
-  --latent-path /disk_n/zzf/flip/.worktrees/t057/tmp/adaworld_action_encoder_h1_full_t057/latent_actions.npz \
+  --latent-path /disk_n/zzf/flip/tmp/adaworld_action_encoder_h1_full_t057/latent_actions.npz \
   --output-dir tmp/adaworld_action_decoder_h1_full_t061 \
   --split-by episode \
   --steps 3000 \
@@ -1197,8 +1197,8 @@ scripts/flip_run.sh adaworld_action_decoder --cuda 1 -- eval \
 task063 在 task061 的最佳 checkpoint 预测表上先生成逐维诊断，再做容量、学习率、
 正则、gated block、loss 和 head 消融。诊断输入和输出：
 
-- 输入：`.worktrees/t061/tmp/adaworld_action_decoder_h1_full_t061/best_val_predictions.csv`
-- 输入：`.worktrees/t061/tmp/adaworld_action_decoder_h1_full_t061_eval_best/predictions.csv`
+- 输入：`tmp/adaworld_action_decoder_h1_full_t061/best_val_predictions.csv`
+- 输入：`tmp/adaworld_action_decoder_h1_full_t061_eval_best/predictions.csv`
 - 输出：`tmp/adaworld_action_decoder_t063_analysis/per_dim_summary.csv`
 - 输出：`tmp/adaworld_action_decoder_t063_analysis/loss_weights.json`
 
@@ -1230,7 +1230,7 @@ MSE 的配置。
 scripts/flip_run.sh adaworld_action_decoder --cuda 2 -- train \
   --device cuda:0 \
   --data-root /disk_n/zzf/flip/data/humanoid-everyday-h1-chunks0-6-8-200 \
-  --latent-path /disk_n/zzf/flip/.worktrees/t057/tmp/adaworld_action_encoder_h1_full_t057/latent_actions.npz \
+  --latent-path /disk_n/zzf/flip/tmp/adaworld_action_encoder_h1_full_t057/latent_actions.npz \
   --output-dir tmp/adaworld_action_decoder_t063_full_c09_h384_lr8e4 \
   --split-by episode \
   --steps 3000 \

@@ -14,6 +14,56 @@ H2R、visible mask、Masquerade 等其他数据线。
 AdaWorld latent decoder 路线同样使用相邻两帧和 `action_t`，因此可以在完整 H1
 episode split 上做严格对比。
 
+## 当前结论
+
+从 task057 到 task064，H1 上实际在优化的是两条可公平比较的 IDM 路线：
+
+- **AdaWorld latent decoder**：先用 AdaWorld LAM 把相邻两帧编码成 `z_t[32]`，再训练
+  H1 action decoder。
+- **RGB motion Transformer**：直接从相邻两帧 RGB 预测 `action_t[26]`。
+
+两条路线当前都使用同一个完整 Humanoid Everyday H1 数据根、同一个 episode-level split、
+同一个 `frame_delta=1 / action_t` 监督口径。完整 held-out 集固定为 `71486` samples /
+`200` episodes。
+
+当前最强结果：
+
+| 路线 | 当前最佳 task | checkpoint | norm MSE | relative L2 | pred norm var | action_mse |
+|------|------|------|------:|------:|------:|------:|
+| RGB motion Transformer | task064 `motion_transformer_v2` | `tmp/humanoid_pair_idm_t064_v2_p16_s8000/best_checkpoint.pt` | `0.196960` | `0.203904` | `0.853166` | `0.028906` |
+| AdaWorld latent decoder | task063 wider residual MLP | `tmp/adaworld_action_decoder_t063_full_c09_h384_lr8e4/best_checkpoint.pt` | `0.320246` | `0.268812` | `0.765571` | `0.050238` |
+
+对应完整 held-out metrics：
+
+```text
+tmp/humanoid_pair_idm_t064_v2_p16_s8000_validate/val_metrics.json
+tmp/adaworld_action_decoder_t063_full_c09_validate_best/val_metrics.json
+```
+
+结论很直接：**t064 RGB `motion_transformer_v2` 是当前最好的 H1 IDM**。它相对当前最强
+AdaWorld decoder，held-out `action_mse` 从 `0.050238` 降到 `0.028906`，约低 `42.5%`；
+`action_norm_mse` 从 `0.320246` 降到 `0.196960`，约低 `38.5%`；预测方差也更接近
+target 方差。
+
+AdaWorld 路线的价值仍然明确：它只训练低维 latent decoder，训练成本低，且 t063 已经略优于
+t060 的上一代 RGB motion Transformer。但 t064 的 raw RGB motion stem、patch16、residual
+readout、variance loss、AMP 和更长训练把 RGB 路线重新拉开了差距。
+
+## task057 到 task064 脉络
+
+| task | 范围 | 结果定位 |
+|------|------|------|
+| task057 | AdaWorld LAM latent 全量提取 + 基础 MLP decoder | H1 AdaWorld baseline，held-out `action_mse=0.078534` |
+| task058 / task059 | Masquerade direct-render baseline | 视觉 baseline，不参与 H1 IDM 排名 |
+| task060 | H1 RGB `motion_transformer` 架构与训练超参优化 | 上一代强 RGB baseline，held-out `action_mse=0.051443` |
+| task061 | AdaWorld decoder 基础架构/超参优化 | residual MLP 把 AdaWorld held-out 降到 `0.054646` |
+| task062 | G1 Pick-Up-Cloth 独立 IDM 对比 | G1 数据迁移实验，不混入 H1 held-out 排名 |
+| task063 | AdaWorld decoder 二阶段容量/loss/head 消融 | 当前最强 AdaWorld decoder，held-out `action_mse=0.050238` |
+| task064 | H1 RGB `motion_transformer_v2` 准确率优化 | 当前最强 H1 IDM，held-out `action_mse=0.028906` |
+
+注意：本文后续的统一表只比较 H1 完整 held-out split。task062 的 G1 结果有独立数据、
+独立 action schema 和独立 eval 集，不能与 H1 的 `71486` held-out 指标直接排序。
+
 ## 数据口径
 
 统一数据根：
@@ -304,8 +354,8 @@ tmp/adaworld_action_decoder_t063_full_c09_eval_best/metrics.json
 | `mean_baseline_action_mse` | `0.15635326504707336` |
 | `action_norm_mse` | `0.3202458918094635` |
 | `relative_l2_error` | `0.26881195165744` |
-| `pred_norm_var_mean` | `0.765373` |
-| `target_norm_var_mean` | `1.003733` |
+| `pred_norm_var_mean` | `0.7655707894142848` |
+| `target_norm_var_mean` | `1.0037333875918515` |
 | `action_mean_dim_r2` | `0.6858815573729001` |
 | `action_mean_dim_corr` | `0.8282286180899694` |
 | `action_pred_std_ratio_mean` | `0.8748558117793157` |
@@ -547,8 +597,8 @@ tmp/humanoid_pair_idm_t064_v2_p16_s8000_validate/val_metrics.json
 | `mean_baseline_action_mse` | `0.15635335445404053` |
 | `action_norm_mse` | `0.1969597190618515` |
 | `relative_l2_error` | `0.20390427137523634` |
-| `pred_norm_var_mean` | `0.8531579971313477` |
-| `target_norm_var_mean` | `1.003715991973877` |
+| `pred_norm_var_mean` | `0.8531658785508718` |
+| `target_norm_var_mean` | `1.0037351498588492` |
 | `action_mean_dim_r2` | `0.8071291836408468` |
 | `action_mean_dim_corr` | `0.8984220096698174` |
 | `action_pred_std_ratio_mean` | `0.9228853445786697` |
@@ -561,7 +611,7 @@ tmp/humanoid_pair_idm_t064_v2_p16_s8000_validate/val_metrics.json
 从 `0.05144283175468445` 降到 `0.028906064108014107`，约降低 `43.8%`；
 `action_norm_mse` 从 `0.32090431451797485` 降到 `0.1969597190618515`，约降低 `38.6%`；
 预测方差也更接近 target，`pred_norm_var_mean` 从 `0.6892590912375324`
-提高到 `0.8531579971313477`。
+提高到 `0.8531658785508718`。
 
 二阶段 fine-tune 暂未带来收益，当前推荐保持 `s8000` checkpoint：
 
@@ -628,9 +678,9 @@ task063 再把 AdaWorld latent decoder held-out `action_mse` 降到 `0.050238106
 | Mean baseline | none | none | `1.007003` | `0.474226` | `0.000000` | `0.156353` |
 | AdaWorld task057 baseline decoder | AdaWorld LAM `z_t[32]` | MLP decoder | `0.503421` | `0.336093` | `0.508775` | `0.078534` |
 | AdaWorld task061 optimized decoder | AdaWorld LAM `z_t[32]` | residual MLP decoder | `0.349901` | `0.280356` | `0.706071` | `0.054646` |
-| AdaWorld task063 optimized decoder | AdaWorld LAM `z_t[32]` | wider residual MLP decoder | `0.320246` | `0.268812` | `0.765373` | `0.050238` |
+| AdaWorld task063 optimized decoder | AdaWorld LAM `z_t[32]` | wider residual MLP decoder | `0.320246` | `0.268812` | `0.765571` | `0.050238` |
 | RGB motion Transformer task060 | two RGB frames | full RGB IDM | `0.320904` | `0.272016` | `0.689259` | `0.051443` |
-| RGB motion Transformer v2 task064 | two RGB frames | full RGB IDM | `0.196960` | `0.203904` | `0.853158` | `0.028906` |
+| RGB motion Transformer v2 task064 | two RGB frames | full RGB IDM | `0.196960` | `0.203904` | `0.853166` | `0.028906` |
 
 结论：
 

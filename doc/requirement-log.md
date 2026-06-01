@@ -1431,3 +1431,23 @@
 
 **创建的任务：**
 - [062] G1 Pick-Up-Cloth 独立 IDM 对比实验
+
+## 2026-06-01 — H1 两条 IDM 路线最佳结果整理
+
+**用户原始需求：**
+> 看一下从 t57 开始一直到最新的 task，一直在优化两个 IDM 模型，对比目前最好的结果，然后整理文档。
+
+**直接修改：**
+- `doc/h1_idm_methods.md`：补充 task057 到 task064 的 H1 IDM 任务脉络，明确 task058/task059 为视觉 baseline、task062 为 G1 独立实验，不混入 H1 held-out 排名。
+- `doc/h1_idm_methods.md`：新增当前最佳结果摘要，记录 t064 RGB `motion_transformer_v2` 是当前最强 H1 IDM，t063 wider residual MLP 是当前最强 AdaWorld latent decoder，并补齐实际 worktree checkpoint / metrics 路径。
+- `doc/h1_idm_methods.md`：按 `val_predictions.csv` 和 checkpoint action mean/std 复算并校正 `pred_norm_var_mean`，统一完整 H1 held-out `71486` samples 的比较口径。
+
+## 2026-06-01 — done task 产物迁回 main 并清理 worktree
+
+**用户原始需求：**
+> 整理数据/数据路径/worktree/task 文件；tasks 文件直接提交；已经完成的 tasks，阶段性产物挪到 Main 中并更新文档；确认 worktree 中没有有用的东西且已经 done 后删除 worktree。
+
+**直接修改：**
+- 将已完成且 worktree 干净的 task057、task058、task060、task061、task063、task064 正式/阶段性产物从 `.worktrees/tNNN/` 复制回 main 工作区的 `tmp/` / `output/` 同名目录，smoke 目录不迁移。
+- 更新 `doc/h1_idm_methods.md`、`doc/step_5_training_infra.md`、`doc/scripts_inventory.md`、相关 done task 文档中的产物路径，避免继续引用 `.worktrees/tNNN/tmp/...`。
+- 保留 task059、task062 worktree；它们仍是 active，且 worktree 中有未提交实现改动。
