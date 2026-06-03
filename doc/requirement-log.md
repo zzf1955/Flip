@@ -1,5 +1,21 @@
 # 需求日志
 
+## 2026-06-03 — SAM3/SAM3.1 H2R 机械臂/夹爪分割复现
+
+**用户原始需求：**
+> 新建环境复现 SAM3，输入视频和 text condition，在 H2R robot video 中稳定分割机械臂/夹爪，比较 prompt 与模型规模、checkpoint 大小，并把结果放到 tmp/ 下查看。
+
+**直接修改：**
+- clone 官方 `facebookresearch/sam3` 到 `ref-sam3/`，并将 `ref-sam3/` 加入 `.gitignore`。
+- 新建 conda 环境 `sam3`，完成 SAM3.1 text-conditioned video segmentation 复现。
+- 在 `data/h2r/v1/video/*/*/robot_camera.mp4` 上测试多条视频、多种 prompt、`max_num_objects` 和 point refinement 策略。
+- 新增 `doc/sam3_h2r_segmentation.md`，记录模型输入输出、参数量/ckpt 大小、显存约束、稳定 prompt、keyframe point-refine 夹爪候选策略，以及 `tmp/` 产物路径。
+
+**结论摘要：**
+- 整条机械臂首选 `prompt="robot arm"`，备用 `robotic arm`，推荐 `max_num_objects=1`。
+- `robot gripper`、`mechanical gripper`、`end effector` 在当前 H2R 数据上不稳定。
+- 夹爪/末端候选可用 `robot arm` 先得到整臂轨迹，再在 keyframes `0,4,8,12` 上做 point refine；单帧 point refine 不稳定。
+
 ## 2026-06-01
 
 **用户原始需求：**

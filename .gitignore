@@ -2,6 +2,7 @@
 data/
 /archive/
 ref-cosmos-transfer2.5/
+ref-sam3/
 
 # === 二进制/大文件 ===
 *.pptx
