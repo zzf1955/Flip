@@ -788,6 +788,87 @@ H1 上 Mean baseline、AdaWorld latent decoder 和 RGB motion Transformer 的统
   task052 当时使用的临时 symlink 根 `tmp/h1_t052_valid_200_v2` 现在只作为历史记录保留，
   不再是当前必需的替代数据根。
 
+### H2R Diffusion Policy BC
+
+`src.pipeline.h2r_diffusion_policy` 是 task068 新增的 H2R / HumanAndRobot 下游
+behavior cloning 入口。当前下载的 H2R v1 数据不是 LeRobot parquet，而是：
+
+- `data/h2r/v1/data/<task>/episode_<id>.hdf5`
+- `data/h2r/v1/video/<task>/episode_<id>/robot_camera.mp4`
+
+入口会检查对应视频文件存在，但训练直接读取 HDF5 中的 `cam_data/robot_camera`，
+避免先落盘转换成 LeRobot。默认状态由 `qpos,qvel,end_position,gripper_state`
+拼接得到，当前维度为 21；监督 action 读取 HDF5 的 `action`，当前维度为 7。
+
+Diffusion Policy 口径如下：
+
+- condition：历史 clean robot video frames + 历史 clean state。
+- diffusion variable：未来 action chunk。
+- loss：对 GT action chunk 加噪后预测 noise 的 denoising MSE。
+- inference / eval：从 action noise 采样 clean action chunk，输出 normalized action
+  MSE 和 per-horizon MSE。
+- 不预测未来视频，不使用 DreamZero / WAM，也不做真机或仿真闭环。
+
+数据检查示例：
+
+```bash
+scripts/flip_run.sh h2r_diffusion_policy -- inspect \
+  --device cpu \
+  --tasks grab_cup_v1,grab_cube2_v1 \
+  --max-episodes-per-task 3 \
+  --max-train-samples 16 \
+  --max-val-samples 8 \
+  --resize 64x64 \
+  --batch-size 4 \
+  --output-json tmp/h2r_dp_t068_inspect.json
+```
+
+task068 smoke 训练示例：
+
+```bash
+scripts/flip_run.sh h2r_diffusion_policy --cuda 1 -- train \
+  --device cuda:0 \
+  --tasks grab_cup_v1,grab_cube2_v1 \
+  --max-episodes-per-task 3 \
+  --max-train-samples 32 \
+  --max-val-samples 16 \
+  --resize 64x64 \
+  --batch-size 16 \
+  --steps 220 \
+  --log-every 20 \
+  --eval-every 110 \
+  --eval-max-batches 1 \
+  --diffusion-steps 16 \
+  --hidden-dim 128 \
+  --depth 4 \
+  --dropout 0.0 \
+  --lr 0.001 \
+  --output-dir tmp/h2r_diffusion_policy_t068_overfit
+```
+
+该 bounded smoke 使用两个 H2R task、4 个 train episode、2 个 val episode、32 个
+train samples 和 16 个 val samples，验证目标只是跑通 HDF5 数据适配和 Diffusion Policy
+BC 训练。当前结果显示 train denoising loss 从 `step=1` 的 `1.023897` 降到
+`step=220` 的 `0.921348`；val denoising loss 从 `step=110` 的 `0.961218`
+降到 `step=220` 的 `0.897937`。由于数据量很小，这个结果只证明训练链路和 BC loss
+可下降，不代表绝对控制效果已经充分。
+
+checkpoint 恢复 / eval 示例：
+
+```bash
+scripts/flip_run.sh h2r_diffusion_policy --cuda 1 -- eval \
+  --device cuda:0 \
+  --checkpoint tmp/h2r_diffusion_policy_t068_overfit/last_checkpoint.pt \
+  --output-dir tmp/h2r_diffusion_policy_t068_overfit/eval_last \
+  --eval-max-batches 1 \
+  --prediction-batches 1
+```
+
+当前恢复验证输出 `denoise_loss=0.905152`、`sampled_action_mse_norm=1.848881`，
+并写出 `eval_summary.json` 和 `predictions.csv`。后续完整下游评估可在该入口基础上
+增加 video override，用同一 state/action label 固定 policy，只替换 GT / Ours /
+Mitty / Phantom video observation。
+
 H1 smoke 示例：
 
 ```bash
