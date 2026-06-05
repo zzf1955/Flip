@@ -1468,3 +1468,36 @@
 - 更新 `doc/h1_idm_methods.md`、`doc/step_5_training_infra.md`、`doc/scripts_inventory.md`、相关 done task 文档中的产物路径，避免继续引用 `.worktrees/tNNN/tmp/...`。
 - 保留 task059、task062 worktree；它们仍是 active，且 worktree 中有未提交实现改动。
 - 进一步将 task051、task053、task054、task056 的正式/阶段性产物迁回 main 的 `tmp/` / `output/`，并同步收口它们在 task 文档中的产物路径。
+
+## 2026-06-05 — task067 Wan2.2 + LoRA WAM 单卡低显存 smoke
+
+**用户原始需求：**
+> 当前 tasks 中 WAM 应为 WAN2.2 + LoRA；先计算显存是否足够，方案应单卡不爆显存。不要多卡，尝试单卡跑。上次操作导致 Codex 崩溃，不要做危险操作。继续确认是爆内存还是机器重启，并参考 FLIP 代码，尽量不要往内存加载，直接往显卡读取。
+
+**直接修改：**
+- DreamZero 独立 checkout 中新增低显存 Wan action head adapter、H2R Hydra config 和
+  `flip_experiment.py` wrapper；FLIP 仓库仅记录文档，不合入 DreamZero 运行代码。
+- 低显存 adapter：DiT 使用 Wan2.2 bf16 safetensors，通过 `safe_open(..., device="cuda")`
+  直接读到 GPU；frozen T5 / CLIP / VAE 不参与 Trainer 全模型 `.to(cuda)`，`.pth` 加载使用
+  `mmap=True` 降低 CPU 匿名内存压力，并在 encode 后 offload。
+- 本地 Wan2.2 5B DiT safetensors 不包含 DreamZero TI2V wrapper 期望的
+  `cross_attn.*_img` / `img_emb` key；adapter 在 direct-GPU load 后对这条 image branch
+  做确定性零初始化，避免冻结随机图像分支，并让 pretrained load missing keys 只剩新建
+  action/state 模块。
+
+**验证：**
+- 机器未重启；journal 显示前一次会话是在 2026-06-04 14:48:48 被 `systemd-oomd`
+  杀掉 tmux scope，属于 CPU memory pressure，不是 GPU OOM 或机器重启。
+- 单卡 GPU 2 smoke：`MAX_STEPS=1`、`Batch Size=1`、`LORA_RANK=4` 完成 1 个训练 step；
+  初始化 missing keys 仅为 `state_encoder`、`action_encoder` 和 `action_decoder`。
+- 观测：训练前 GPU memory 日志 `10.462 GB`，DiT direct-GPU 加载瞬时显存约
+  `20.7 GB`，低于 RTX 4090D 24GB；CPU RSS 未复现 oomd，训练结束后内存恢复。
+- loss：`dynamics_loss_avg=0.5703880786895752`、
+  `action_loss_avg=0.22939424216747284`、`train_loss=0.7997823357582092`。
+- 保存：`model.safetensors` 约 89.9MB，614 个 tensor，44,890,144 个 trainable 参数；
+  未生成 `model-0000*.safetensors` 全量分片。
+- checkpoint 恢复 smoke 成功恢复 trainable-only checkpoint；614 个 tensor exact compare
+  通过，`unexpected_keys_count=0`，所有 trainable key 均在 checkpoint 内。
+- 离线 rollout smoke 成功输出 2 个连续 chunk；`seed=42`，`action_chunks` shape 为
+  `(2,1,24,32)`，`final_video_latent` shape 为 `(1,48,2,10,20)`，并导出
+  `output/task067_rollout_smoke_actionstate_only_v3/rollout_smoke.mp4`。
