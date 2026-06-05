@@ -1794,6 +1794,103 @@ scripts/flip_run.sh train --cuda 2,3 --nproc 2 -- \
 - 正式实验默认 `--max-steps 1000 --save-steps 100 --eval-steps 100 --eval-video-steps 100`；smoke/debug 可临时调小。
 - `--loss`、`--patch-dir` 已从正式训练入口移除，当前统一使用标准 Mitty loss。
 
+## DreamZero 风格 Wan2.2-5B video-action 原型
+
+task067 记录下一阶段探索路线：在没有实机控制闭环的前提下，先做离线
+closed-loop video-action world-action model。主线采用 `Wan-AI/Wan2.2-TI2V-5B`
+作为视频基座，参考 DreamZero 的 action/state register 和 joint video-action diffusion
+训练方式。
+
+当前结论：
+
+- 未看到官方发布的 Wan2.2-TI2V-5B DreamZero 训练好 checkpoint；官方 DreamZero
+  公开 checkpoint 主要是 Wan2.1-I2V-14B 系。
+- DreamZero 仓库已有 Wan2.2-TI2V-5B backbone 配置和训练脚本，但语义是从 Wan2.2-5B
+  视频基座训练 DreamZero-style 模型，不是加载已有 DreamZero-5B policy。
+- `train_architecture=lora` 时，LoRA 只作用在 Wan DiT 主干；`state_encoder`、
+  `action_encoder`、`action_decoder` 是新加模块，需要从头全量训练。
+- text encoder、image encoder、VAE 冻结；Wan DiT base weight 冻结，只训练 LoRA
+  adapter 和 action/state register 相关模块。
+- 离线 rollout 时，上一轮生成的视频可以作为下一轮 visual context；上一轮 action
+  不应直接作为下一轮 action condition，state 需要固定、由 action 简化推进，或由后续
+  数据/模型显式维护。
+
+建议的最小训练配置：
+
+```text
+backbone: Wan2.2-TI2V-5B
+resolution: 160x320
+num_frames: 33
+num_frame_per_block: 2
+action_horizon: 24
+num_action_per_block: 24
+num_state_per_block: 1
+train_architecture: lora
+lora_target_modules: q,k,v,o,ffn.0,ffn.2
+lora_rank: 16 -> 32/64
+lora_alpha: same as rank
+```
+
+实现时必须验证 checkpoint 保存和恢复：`save_lora_only` 需要覆盖 LoRA adapter 以及
+`state_encoder/action_encoder/action_decoder`，恢复后必须打印 missing / unexpected keys
+并跑同一 batch inference。若 key rewrite 或 PEFT wrapper 导致 register 参数没有恢复，
+应直接修复保存/加载逻辑，不允许静默随机初始化。
+
+### Task067 单卡 smoke 记录
+
+当前已在 DreamZero 独立 checkout 中实现低显存 adapter 和 trainable-only save wrapper；
+FLIP 侧只记录运行结果和路径。task067 的 Wan2.2-5B + DreamZero-style LoRA 原型只按单卡
+运行，不使用多卡 DDP / DeepSpeed。
+
+已验证的单卡 smoke（2026-06-05，GPU 2，RTX 4090D 24GB）：
+
+- 训练配置：`global_step=1`、`per_device_train_batch_size=1`、`LORA_RANK=4`、
+  `LORA_ALPHA=4`、`NUM_GPUS=1`、`training_args.deepspeed=null`。
+- H2R 数据已转成 DreamZero / Gear 可读的 LeRobot-style 目录：
+  `training_data/dreamzero_h2r_v1`，包含 190 个有效 episode、73,885 个训练 step，
+  state/action 维度均为 7，video keys 为 `robot_camera` / `human_camera`。
+- DiT 使用 `diffusion_pytorch_model-bf16.safetensors`，通过
+  `safe_open(..., device="cuda")` 直接读入 GPU；T5 / CLIP / VAE `.pth` 权重使用
+  `torch.load(..., mmap=True)`，并在 encode 后 offload。
+- 本地 Wan2.2 5B DiT safetensors 只有 825 个 base key，不包含 DreamZero TI2V wrapper
+  期望的 `cross_attn.*_img` / `img_emb` key；adapter 在 direct-GPU load 后对这条
+  image branch 做确定性零初始化，避免冻结随机图像分支，并让 pretrained load 的
+  missing keys 只剩 `state_encoder`、`action_encoder` 和 `action_decoder`。
+- 训练前 GPU memory 日志为 `10.462 GB`；DiT direct-GPU 加载瞬时显存观测约
+  `20.7 GB`；训练 step 低于 24GB 单卡容量。
+- loss：`dynamics_loss_avg=0.5703880786895752`、
+  `action_loss_avg=0.22939424216747284`、`train_loss=0.7997823357582092`。
+- `save_lora_only` 输出
+  `training_data/log/dreamzero_h2r_wam_wan22_lora_smoke_actionstate_only_v3/model.safetensors`，
+  约 89.9MB，614 个 tensor，44,890,144 个 trainable 参数；没有生成
+  `model-0000*.safetensors` 全量分片。
+- checkpoint 恢复 smoke 通过：614 个 trainable tensor 与恢复后
+  `model.state_dict()` 对应 tensor exact compare 通过，`unexpected_keys_count=0`。
+- 离线 rollout smoke 通过：`seed=42`，滚动 2 个 chunk，`action_chunks` shape 为
+  `(2,1,24,32)`，`final_video_latent` shape 为 `(1,48,2,10,20)`；导出的
+  `output/task067_rollout_smoke_actionstate_only_v3/rollout_smoke.mp4` 可被 OpenCV 打开，
+  分辨率为 `320x160`，共 14 帧。
+
+当前 smoke 为了压低单卡风险使用 `LORA_RANK=4` / `LORA_ALPHA=4`；正式小步训练建议先用
+`rank=16` 复跑，确认 24GB 单卡峰值稳定后再尝试 `32/64`。
+
+### Cosmos Predict2B 备选路线
+
+Cosmos Predict2B 只作为备选路线，不与 task067 主线混用。它适合在 Wan2.2-5B LoRA
+仍超出显存预算时，先做更小的 video-only offline rollout 或重做一个 Cosmos-native
+video-action 模型。
+
+边界如下：
+
+- Cosmos Predict2B 有 `Text+Image` / `Text+Video -> Video` 能力，因此可以作为更小
+  video backbone 候选。
+- 它不能直接替换 DreamZero 的 Wan backbone；Cosmos 的 VAE、DiT、scheduler、token
+  layout、condition injection 和 cache 语义都不同。
+- 如果走 Cosmos 2B，建议参考 Cosmos Policy 的 latent-frame / latent-slot injection：
+  把 proprio、action、future-state 等编码成 Cosmos 原生 latent sequence 中的条件/预测槽位。
+- 第一阶段可先做 video-only loop：`initial image/video + text -> future video`，再把
+  生成片段回填继续生成；确认稳定后再加入 action/state。
+
 ## 验证
 
 ```bash
