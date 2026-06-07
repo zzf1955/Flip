@@ -1,5 +1,51 @@
 # 需求日志
 
+## 2026-06-07
+
+**用户原始需求：**
+> 加 rank,直接上 256/512/1024, 参数没有爆就往上加
+>
+> 768
+>
+> 试一下
+
+**创建/推进的任务：**
+- [074] H2R top1157 robot_wam 高 rank LoRA 扩容训练
+
+**实验产物：**
+- 输出：
+  `training_data/log/robot_wam/h2r_top1157_s8_high_rank_v1/`
+- 汇总：
+  `training_data/log/robot_wam/h2r_top1157_s8_high_rank_v1/summary.csv`
+  和 `summary.md`。
+
+**执行结果：**
+- 真实 DiT smoke：
+  - `rank=256` 通过，trainable params `398,613,672`，checkpoint 约 `800.6 MiB`。
+  - `rank=512` 通过，trainable params `776,101,032`，checkpoint 约 `1520.6 MiB`。
+  - `rank=768` 通过，trainable params `1,153,588,392`，checkpoint 约 `2240.6 MiB`。
+  - `rank=1024` 在单卡 24GB 上 AdamW optimizer step CUDA OOM。
+- 三组可跑 rank 均完成 39,024-step 训练，固定 split 与 task073 相同，每个 eval split
+  抽样 512 条，`best_metric=eval_mean_loss`：
+  - `r256_lr1e-4_aw1_s39024_eval512`：best step 39,024，
+    `eval_mean_loss=326.424`，`eval_in_task_loss=371.793`，
+    `eval_ood_loss=281.054`。
+  - `r512_lr1e-4_aw1_s39024_eval512`：best step 35,000，
+    `eval_mean_loss=333.735`，`eval_in_task_loss=378.920`，
+    `eval_ood_loss=288.550`。
+  - `r768_lr1e-4_aw1_s39024_eval512`：best step 39,024，
+    `eval_mean_loss=339.105`，`eval_in_task_loss=381.299`，
+    `eval_ood_loss=296.910`。
+- Checkpoint audit 通过：三组 best 均为 494 个 trainable tensor，无 `human` /
+  `control` key。
+
+**结论：**
+- 当前单卡 24GB + AdamW 配置下，`rank=768` 可跑满，`rank=1024` 不可行。
+- 高 rank sampled eval 没有刷新 task073 的 `rank=16` sampled best
+  `eval_mean_loss=326.157`；本轮最佳高 rank 是 `rank=256` 的 `326.424`。
+- 因没有新 sampled best，本轮未追加完整 fixed eval；完整 fixed eval 的当前参考仍是
+  task073 `r16_lr1e-4_aw1_s39024_eval512` 的 `eval_mean_loss=1135.986`。
+
 ## 2026-06-03 — SAM3/SAM3.1 H2R 机械臂/夹爪分割复现
 
 **用户原始需求：**
