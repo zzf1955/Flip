@@ -1745,3 +1745,45 @@
 - 离线 rollout smoke 成功输出 2 个连续 chunk；`seed=42`，`action_chunks` shape 为
   `(2,1,24,32)`，`final_video_latent` shape 为 `(1,48,2,10,20)`，并导出
   `output/task067_rollout_smoke_actionstate_only_v3/rollout_smoke.mp4`。
+
+## 2026-06-09 — G1 2s30fps 切片与 stage2 blur 数据交付
+
+**用户原始需求：**
+> 交付 2s 的原始视频切片数据、Seedance 的 2s 切片数据、SAM2 分割 pipeline 产出的分割+模糊后的 2s 切片视频；第二阶段原始机器人模糊数据集切片可以直接 2s 步长切，因为数据很多。
+
+**创建的任务：**
+- [076] G1 2s30fps 切片与 stage2 blur 数据交付（已完成并合入主线）
+
+**直接修改：**
+- 新增 `src/pipeline/g1_2s_slice_data.py`：统一生成 G1 `2s61f30`
+  original、Seedance direct、SAM2 blur slice，并 hardlink 成
+  `identity_r2r`、`blur_r2r`、`h2r` 三类 pair layout。
+- 更新 `doc/step_5_training_infra.md` 和 `doc/scripts_inventory.md`，记录
+  `2s61f30` 的 61 帧/30fps 口径、tail-aligned 第二窗口、输出路径、
+  stage2 blur_r2r 用法，以及后续 action/state 必须按 manifest 的
+  `source_frame_indices` 回查源 parquet。
+- `feat/t076-g1-2s30fps-slices` 已通过 `--no-ff` merge 合入 `main`；
+  实现 commit 为 `f3b225b`，merge commit 为 `dd45bf6`。
+
+**交付数据：**
+- `training_data/slice/g1_2s61f30/original/`：10908 个 2s robot original clips。
+- `training_data/slice/g1_2s61f30/seedance_direct/`：84 个 2s Seedance clips。
+- `training_data/slice/g1_2s61f30/sam2_blur/`：10908 个 2s SAM2 mask blur clips。
+- `training_data/pair/identity_r2r/2s61f30/`：10908 个 pair。
+- `training_data/pair/blur_r2r/2s61f30/`：10908 个 pair。
+- `training_data/pair/h2r/2s61f30/`：84 个 pair。
+
+**验证记录：**
+- `python -m compileall -q src/pipeline/g1_2s_slice_data.py` 通过。
+- `python -m src.pipeline.g1_2s_slice_data --task all --dry-run` 规划为
+  5454 个 robot segments、10908 个 robot clips、84 个 Seedance clips。
+- 小样本生成 smoke 通过：每个 task 限 1 个 segment，生成 6 个 robot/SAM2 clips、
+  2 个 Seedance clips 和对应 pair layout。
+- 正式生成完成：manifest schema 校验确认全部样本 `fps=30`、`num_frames=61`、
+  `source_frame_indices` 长度为 61；抽样视频均为 61 帧、30fps、640x480。
+
+**当前未完成项：**
+- 尚未生成 `2s61f30` 对应的 T5/VAE cache。
+- 尚未启动新的三阶段训练。
+- 尚未把 action/state 物化为独立 2s 标签文件；现阶段通过 manifest 中的
+  `source_segment_id`、`clip_start_frame` 和 `source_frame_indices` 与源 parquet 对齐。
