@@ -70,6 +70,70 @@ Seedance direct 的 1s 训练数据由 `src.pipeline.seedance_clip` 从
 该 manifest 对齐真实 `clip_start` 与增强类型；重建 1s 切片、pair 和 cache
 时不要改动 `seedance_direct/4s/` 原始 API 输出。
 
+G1 2s/30fps 新训练数据由 `src.pipeline.g1_2s_slice_data` 统一生成，使用
+`2s61f30` label 与旧 `1s`、旧 `2s` 数据隔离。默认窗口为 61 帧、30fps、
+2s 步长；61 帧是为了保持 Wan 的 `4k+1` 输入长度，manifest 中会记录真实
+`source_frame_indices`。对 4s/120 帧 robot segment，默认输出 `clip00`
+帧 `0..60` 和 tail-aligned `clip01` 帧 `59..119`，因此第二个窗口起点为
+59 而不是 60。这个重叠 1 帧只为满足 `4k+1`，数据步长语义仍按 2s 使用。
+
+```bash
+python -m src.pipeline.g1_2s_slice_data --task all --workers 8
+```
+
+该入口一次写出三类 slice 和三类 pair layout：
+
+```text
+training_data/slice/g1_2s61f30/
+├── original/<task>/ep*/seg*_clip*.mp4
+├── seedance_direct/<task>/ep*/seg*_clip*.mp4
+└── sam2_blur/<task>/ep*/seg*_clip*.mp4
+
+training_data/pair/
+├── identity_r2r/2s61f30/<task>/{video,control_video,metadata.csv,manifest.jsonl}
+├── blur_r2r/2s61f30/<task>/{video,control_video,metadata.csv,manifest.jsonl}
+└── h2r/2s61f30/<task>/{video,control_video,metadata.csv,manifest.jsonl}
+```
+
+其中 `blur_r2r/2s61f30` 的 `video/` 是清晰 robot target，`control_video/`
+是同一帧序列经过 SAM2 mask 局部 Gaussian blur 的 robot input；stage2 训练
+应使用该目录，而不是旧的 `blur_r2r/1s` 或 `1s_patch`。pair layout 通过
+hardlink 指向 slice 文件，不代表视频内容被重复存储。
+
+截至 2026-06-09，`2s61f30` 数据已推进到“视频 slice 与 pair layout 已落盘”
+阶段，尚未生成 VAE/T5 cache，也尚未启动新的三阶段训练。
+
+| 数据 | 路径 | 当前数量 | 说明 |
+|------|------|----------|------|
+| robot original slice | `training_data/slice/g1_2s61f30/original/` | 10908 | 三个 canonical G1 task 全量 4s segment 切片 |
+| Seedance human slice | `training_data/slice/g1_2s61f30/seedance_direct/` | 84 | 只覆盖已有 Seedance 4s 源视频对应的 segment |
+| SAM2 blur slice | `training_data/slice/g1_2s61f30/sam2_blur/` | 10908 | 与 robot original 使用完全相同的 `source_frame_indices` |
+| stage1 pair | `training_data/pair/identity_r2r/2s61f30/` | 10908 | robot → robot identity |
+| stage2 pair | `training_data/pair/blur_r2r/2s61f30/` | 10908 | SAM2 blur robot → clear robot |
+| stage3 pair | `training_data/pair/h2r/2s61f30/` | 84 | Seedance human → clear robot |
+
+Seedance 2s 数据不是旧 `1s` 数据那种 0.5s stride 密集滑窗，也没有水平翻转
+增强。当前做法是 robot-driven slicing：先按 robot 4s segment 得到 `clip00`
+与 tail-aligned `clip01`，再用相同 `source_id` 和 `clip_start_frame` 去
+Seedance 4s human 源视频中取对应时间段。因此 h2r 样本数量受已有 Seedance
+4s 源视频数量限制，目前只有 84 条；robot-only 的 identity/stage2 blur 数据
+来自全量 robot segment，目前是 10908 条。
+
+后续训练前还需要为 `identity_r2r/2s61f30`、`blur_r2r/2s61f30` 和
+`h2r/2s61f30` 分别生成 T5/VAE cache。当前 pair 目录只提供
+`video/`、`control_video/`、`metadata.csv`、`manifest.jsonl` 和全局
+`index.jsonl`；`pair_order.jsonl` 可由训练入口首次读取 manifest 时按
+`--data-seed` 生成。
+
+后续若要为 `2s61f30` 物化 state/action 标签，必须以 slice 或 pair manifest
+里的 `source_segment_id`、`source_frame_indices` 和 `clip_start_frame` 为准。
+robot state 可从同一 segment 旁边的
+`training_data/segment/<task>/<episode>/<seg>_joints.parquet` 读取；原始 action
+可从 `data/unitree_G1_WBT/G1_WBT_<task>/data/chunk-*/*.parquet` 中按
+`episode_index` / `frame_index` 回查。不要从导出的 MP4 duration 重新推断
+state/action 帧，因为 61 帧窗口会让 4s segment 的第二个 2s clip 使用
+`59..119` 的 source frame。
+
 当前维护的数据 Task 固定为三个机器人 Task：
 
 - `Inspire_Pickup_Pillow_MainCamOnly`

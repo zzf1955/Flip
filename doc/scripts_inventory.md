@@ -82,6 +82,7 @@ eval_metrics.py    ← torch, skimage, transformers (CLIP)
 | 脚本 | 功能 | 输入 | 输出 |
 |------|------|------|------|
 | `make_pair.py` | 匹配 robot+human 视频，重采样 16fps，4k+1 帧；正式训练时 `--task all` 只展开 `TRAINING_TASKS` 三任务集合 | segment + seedance/overlay | `training_data/pair/{1s,2s,4s}/` |
+| `g1_2s_slice_data.py` | G1 2s/30fps 切片交付工具；生成 61 帧 `2s61f30` original、Seedance direct、SAM2 blur slice，并 hardlink 成 `identity_r2r`、`blur_r2r`、`h2r` pair layout；stage2 blur 数据按 2s stride + tail 对齐切片 | `training_data/segment/` + `training_data/seedance_direct/4s/` + `training_data/sam2_mask/` | `training_data/slice/g1_2s61f30/`、`training_data/pair/{identity_r2r,blur_r2r,h2r}/2s61f30/` |
 | `h2r_sam3_precompute.py` | H2R / HumanAndRobot SAM3/SAM3.1 robot-arm mask 预计算；通过 `sam3` conda 环境逐 1s clip 调用 text prompt `robot arm`，把训练会用到的 source frame mask 写入 episode 级 `.npz`，供 stage2 blur 数据转换复用 | `data/h2r/v1/video/<task>/episode_*/robot_camera.mp4` + `ref-sam3` / SAM3.1 checkpoint | `training_data/h2r_sam3_mask/<h2r_task>/episode_*.npz` |
 | `h2r_sam3_blur_pair.py` | H2R / HumanAndRobot stage2 外观训练数据转换；读取 `data/h2r/v1/video/<task>/episode_*/robot_camera.mp4` 和预计算 SAM3/SAM3.1 mask，将清晰 robot clip 写为 target，将 SAM3 mask 区域模糊后写为 control；不隐式运行 SAM3，缺 mask 或帧对齐不一致时直接失败 | H2R robot-camera mp4 + `training_data/h2r_sam3_mask/<task>/episode_*.npz` 或 mask mp4 | `training_data/pair/blur_r2r/1s/<h2r_task>/` |
 | `make_robot_pair.py` | 生成 robot→robot identity pair；正式三阶段 LoRA identity 时 `--task all` 只展开 `TRAINING_TASKS` 三任务集合 | segment | `training_data/robot_pair/1s/` |
