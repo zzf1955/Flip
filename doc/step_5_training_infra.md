@@ -869,6 +869,144 @@ scripts/flip_run.sh h2r_diffusion_policy --cuda 1 -- eval \
 增加 video override，用同一 state/action label 固定 policy，只替换 GT / Ours /
 Mitty / Phantom video observation。
 
+### H2R SAM3 blur_r2r 外观训练复现
+
+当前 H2R 三阶段复现只覆盖前两步：
+
+1. step1 不重新训练 identity LoRA，直接复用已经可用的 checkpoint：
+   `training_data/log/final_ours_step1_0507_004839-identity_r2r_1s-22592d_r32_self_qkvo_ffn_1000s_0507_004911/ckpt/step-1000.safetensors`。
+2. step2 使用 H2R robot-camera 视频和 SAM3/SAM3.1 robot-arm mask 生成
+   `blur_r2r` pair：清晰 robot clip 作为 target，SAM3 mask 区域 Gaussian blur
+   后作为 control，训练外观恢复 adapter。
+3. step3 暂不做。它需要 `(human/synthetic human, real robot)` 配对数据；当前
+   H2R 原始数据只提供 robot-camera / state / action，不应在没有配对数据时启动 h2r 阶段。
+
+SAM3 分割本身是显存较重的前置步骤，先按 `doc/sam3_h2r_segmentation.md`
+的结论生成 mask artifact。`h2r_sam3_precompute` 使用 `sam3` conda 环境，
+按 1s / 17 帧短段逐 clip 调用 SAM3.1，输出 episode 级 `.npz`；只填充训练 clip
+会用到的 source frame，其它帧保持 0。训练数据转换入口只消费预计算结果，不会隐式调用 SAM3：
+
+```text
+training_data/h2r_sam3_mask/<task>/episode_<id>.npz
+training_data/h2r_sam3_mask/<task>/episode_<id>/robot_camera.npz
+training_data/h2r_sam3_mask/<task>/episode_<id>/robot_camera_mask.npz
+training_data/h2r_sam3_mask/<task>/episode_<id>/robot_camera_mask.mp4
+```
+
+`.npz` 需要包含 `masks`，shape 为 `[T,H,W]` 或 `[T,N,H,W]`；多 object 会先取
+union。默认 mask stride 为 1，即 SAM3 mask 帧与原视频帧一一对应。若 SAM3 按
+抽帧结果落盘，必须显式传 `--mask-stride`，否则 frame/mask 对齐会直接报错。
+`h2r_sam3_precompute --resume` 会读取 `.npz` 中的 `covered_frames`；只有现有
+mask 覆盖本次请求的全部 source frame 时才跳过，否则会重算该 episode，避免
+1-clip smoke 产物污染正式全量准备。
+
+SAM3 mask precompute 的 dry-run：
+
+```bash
+scripts/flip_run.sh h2r_sam3_precompute -- \
+  --tasks grab_cup_v1,grab_cube2_v1,push_box_random_v1 \
+  --max-episodes-per-task 1 \
+  --max-clips-per-episode 1 \
+  --dry-run
+```
+
+单卡 smoke / 正式预计算示例：
+
+```bash
+scripts/flip_run.sh h2r_sam3_precompute --cuda 2 -- \
+  --tasks grab_cup_v1,grab_cube2_v1,push_box_random_v1,roll \
+  --output-root training_data/h2r_sam3_mask \
+  --prompt "robot arm" \
+  --backup-prompt "robotic arm" \
+  --max-num-objects 1 \
+  --clip-stride 1.0 \
+  --resume
+```
+
+生成 H2R SAM3 blur pair 的 smoke / dry-run：
+
+```bash
+scripts/flip_run.sh h2r_sam3_blur_pair -- \
+  --tasks grab_cup_v1,grab_cube2_v1,push_box_random_v1 \
+  --max-episodes-per-task 1 \
+  --max-clips-per-episode 2 \
+  --dry-run
+```
+
+正式生成 pair：
+
+```bash
+scripts/flip_run.sh h2r_sam3_blur_pair -- \
+  --tasks grab_cup_v1,grab_cube2_v1,push_box_random_v1,roll \
+  --mask-root training_data/h2r_sam3_mask \
+  --pair-root training_data/pair \
+  --resize 224x416 \
+  --clip-stride 1.0 \
+  --clean
+```
+
+`224x416` 是当前 H2R SAM3 blur_r2r 的默认尺寸：Wan VAE 后 latent grid 为
+`14x26`，能和 Wan/Mitty 训练前向输出对齐。不要使用 `240x432` 这类会得到
+`15x27` 奇数 latent grid 的尺寸；训练 loss 阶段会因预测/目标 latent 尺寸不一致而失败。
+
+输出仍使用维护中的 Mitty layout：
+
+```text
+training_data/pair/blur_r2r/1s/<h2r_task>/
+├── video/pair_NNNN.mp4          # clear robot target
+├── control_video/pair_NNNN.mp4  # SAM3-mask blurred robot control
+├── metadata.csv
+└── manifest.jsonl
+```
+
+随后逐 task 生成 VAE/T5 cache。例如：
+
+```bash
+scripts/flip_run.sh mitty_cache --cuda 2 -- \
+  --pair-dir training_data/pair/blur_r2r/1s/grab_cup_v1 \
+  --output training_data/cache/vae/blur_r2r/1s/grab_cup_v1 \
+  --t5-cache-dir training_data/cache/t5/blur_r2r/1s \
+  --device cuda:0 \
+  --batch-size 4 \
+  --prefetch-workers 8 \
+  --prefetch-batches 2 \
+  --save-workers 1
+```
+
+stage2 launcher：
+
+```bash
+DRY_RUN=1 scripts/run_final_ours_three_stage.sh
+
+CUDA_ID=2 NPROC=1 \
+MAIN_TRAIN_TASKS=grab_cup_v1,grab_cube2_v1,push_box_random_v1 \
+OOD_TASKS=roll \
+scripts/run_final_ours_three_stage.sh
+```
+
+`scripts/run_final_ours_three_stage.sh` 当前默认 `RUN_STAGE3=0`，因此只会复用 step1
+checkpoint 并启动 step2。若以后补齐配对数据再启用第三阶段，必须显式传
+`RUN_STAGE3=1`，并确认 `h2r_1s` 的 H2R 配对 pair/cache 已经存在。
+
+2026-06-03 正式复现实验记录：
+
+- H2R SAM3 mask 全量准备完成：`grab_cup_v1`、`grab_cube2_v1`、
+  `push_box_random_v1`、`roll` 共 40 episodes / 353 clips。
+- H2R `blur_r2r/1s` pair/cache 行数分别为：
+  `grab_cup_v1=57`、`grab_cube2_v1=90`、`push_box_random_v1=64`、
+  `roll=142`；VAE cache 抽样 latent shape 为 `(1,48,5,14,26)`。
+- stage2 正式训练 run：
+  `training_data/log/final_ours_h2r_sam3_step2_0603_220432-blur_r2r_1s-207d_r256_self_qkvo_ffn_1000s_0603_220442`。
+  该 run 复用 step1 checkpoint，merge 180 个 rank-32 LoRA pair；stage2 训练
+  rank 256 LoRA，targets 为 `self_attn.q,self_attn.k,self_attn.v,self_attn.o,ffn.0,ffn.2`。
+- 为避免正式训练在模型加载期受到外部 SIGTERM / 显存压力影响，本次复现保留
+  1000 steps 和 rank/target 设置，但使用较轻评估配置：
+  `BATCH_SIZE=1 IN_TASK_EVAL_SIZE=4 OOD_EVAL_SIZE=4 IN_TASK_VIDEO_SIZE=0 OOD_VIDEO_SIZE=0 EVAL_VIDEO_STEPS=0`。
+- 训练完成 1000 steps，用时 554s，最终 checkpoint：
+  `training_data/log/final_ours_h2r_sam3_step2_0603_220432-blur_r2r_1s-207d_r256_self_qkvo_ffn_1000s_0603_220442/ckpt/step-1000.safetensors`。
+  最终 eval：`eval_loss_in_task=0.1478`，`eval_loss_ood=0.1658`
+  （各 4 samples x 5 t）。stage3 仍未启动。
+
 H1 smoke 示例：
 
 ```bash
@@ -1873,6 +2011,238 @@ FLIP 侧只记录运行结果和路径。task067 的 Wan2.2-5B + DreamZero-style
 
 当前 smoke 为了压低单卡风险使用 `LORA_RANK=4` / `LORA_ALPHA=4`；正式小步训练建议先用
 `rank=16` 复跑，确认 24GB 单卡峰值稳定后再尝试 `32/64`。
+
+### Robot WAM train-wan 调参汇总
+
+task072 基于 task071 的 H2R top-level 1157 episode robot-only cache，复用以下产物：
+
+- T5 cache：`training_data/cache/t5/robot_wam_h2r_top1157_s8`
+- VAE cache：`training_data/cache/vae/robot_wam/h2r_top1157_s8_160x320`
+- baseline run：`training_data/log/robot_wam/h2r_top1157_s8_wan_lora`
+
+调参 run 统一输出到：
+
+```text
+training_data/log/robot_wam/h2r_top1157_s8_tune/<run_name>/
+```
+
+每个有效 run 至少应包含：
+
+- `config.json`
+- `train_log.jsonl`
+- `train_summary.json`
+- `best_summary.json`
+- `best_checkpoint.safetensors`
+- 至少一个 `step_*.safetensors`
+
+汇总工具：
+
+```bash
+/home/leadtek/miniconda3/envs/flip/bin/python -m src.tools.summarize_robot_wam_tune \
+  --baseline-dir /disk_n/zzf/flip/training_data/log/robot_wam/h2r_top1157_s8_wan_lora \
+  --baseline-name baseline \
+  --baseline-lr 1e-4 \
+  --tune-dir /disk_n/zzf/flip/training_data/log/robot_wam/h2r_top1157_s8_tune \
+  --default-state-tokens 4 \
+  --out-csv /disk_n/zzf/flip/training_data/log/robot_wam/h2r_top1157_s8_tune/summary.csv \
+  --out-md /disk_n/zzf/flip/training_data/log/robot_wam/h2r_top1157_s8_tune/summary.md
+```
+
+`summarize_robot_wam_tune` 会读取 baseline/tune run 的配置、日志和 best summary，
+输出统一 CSV/Markdown，并用 `safetensors.safe_open` 对 best checkpoint 做 hard audit：
+禁止 `human` / `control` key，只允许 LoRA、`state_encoder`、`action_decoder` trainable
+权重。审计失败时默认直接退出失败。
+
+task072 已完成 4 个 1000-step tune run：
+
+| run | lr | action_loss_weight | best_eval_loss | best_eval_video_loss | best_eval_action_loss |
+| --- | --- | --- | --- | --- | --- |
+| `r16_lr5e-5_aw1_s1k` | 5e-5 | 1.0 | 1368.6613 | 0.1210 | 1368.5404 |
+| `r16_lr2e-4_aw1_s1k` | 2e-4 | 1.0 | 1076.8829 | 0.0893 | 1076.7936 |
+| `r16_lr1e-4_aw0p1_s1k` | 1e-4 | 0.1 | 112.7114 | 0.0813 | 1126.3013 |
+| `r16_lr1e-4_aw0p01_s1k` | 1e-4 | 0.01 | 11.5169 | 0.0795 | 1143.7440 |
+
+同一 `action_loss_weight=1.0` 口径下，`r16_lr2e-4_aw1_s1k` 优于 task071 baseline
+`1145.6176`，下一轮推荐先把该配置延长到 `max_steps=3000`。`aw=0.1/0.01` 的
+weighted total loss 不应直接与 `aw=1.0` 排名混用；如需要更低 video loss，可把
+`lr=1e-4, action_loss_weight=0.1` 保留作平衡对照。
+
+后续 `train-wan` 的 `config.json` 应记录 optimizer、训练步数、eval/save/log 间隔、
+seed 和 state/action 模型参数。早期 run 如果缺少这些字段，汇总工具可以从稳定 run name
+和 `train_log.jsonl` 中补齐 `lr/max_steps`。
+
+### Robot WAM 固定 split 完整训练
+
+task073 将 H2R top1157 robot-only WAM 从 task072 的短调参升级为固定 split
+完整训练。固定 split 输出在：
+
+```text
+training_data/robot_wam/splits/h2r_top1157_s8_fixed_v1/
+├── train.jsonl
+├── eval_in_task.jsonl
+├── eval_ood.jsonl
+└── summary.json
+```
+
+Split 规则：
+
+- OOD task 完整留出：`grab_cube2_v1`、`push_box_random_v1`、
+  `push_box_two_v1`、`roll`。
+- 其余 15 个 task 作为训练 task。
+- 训练 task 内按 episode 稳定排序，尾部 10% episode 进入 `eval_in_task`，
+  每个 task 至少保留 1 个 held-out episode。
+- train / eval_in_task / eval_ood 的 `sample_id` 互斥，OOD task 不进入 train。
+
+Split 统计：
+
+| split | samples | tasks | episodes |
+| --- | ---: | ---: | ---: |
+| train | 39024 | 15 | 861 |
+| eval_in_task | 4693 | 15 | 105 |
+| eval_ood | 4931 | 4 | 189 |
+
+生成命令：
+
+```bash
+scripts/flip_run.sh robot_wam -- build-split \
+  --cache-dir /disk_n/zzf/flip/training_data/cache/vae/robot_wam/h2r_top1157_s8_160x320 \
+  --output-dir /disk_n/zzf/flip/training_data/robot_wam/splits/h2r_top1157_s8_fixed_v1 \
+  --ood-tasks roll,push_box_random_v1,push_box_two_v1,grab_cube2_v1 \
+  --in-task-eval-episode-fraction 0.1 \
+  --min-eval-episodes-per-task 1
+```
+
+`train-wan` 支持以下固定 split 参数：
+
+- `--train-manifest`
+- `--eval-manifest`
+- `--eval-ood-manifest`
+- `--best-metric`，默认 `eval_mean_loss`
+
+每次 eval 会记录：
+
+- `eval_in_task_loss` / `eval_in_task_video_loss` / `eval_in_task_action_loss`
+- `eval_ood_loss` / `eval_ood_video_loss` / `eval_ood_action_loss`
+- `eval_mean_loss`
+
+完整训练输出：
+
+```text
+training_data/log/robot_wam/h2r_top1157_s8_fixed_v1_full/
+├── r16_lr1e-4_aw1_s39024_eval512/
+├── r16_lr2e-4_aw1_s39024_eval512/
+├── r32_lr2e-4_aw1_s39024_eval512/
+├── summary.csv
+└── summary.md
+```
+
+训练内 eval 为了控制耗时，每个 eval split 最多抽样 512 条。三组完整
+39,024-step run 的 best 结果：
+
+| run | rank | lr | best_step | best_eval_mean_loss | best_in_task | best_ood |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `r16_lr1e-4_aw1_s39024_eval512` | 16 | 1e-4 | 39024 | 326.157 | 372.536 | 279.778 |
+| `r16_lr2e-4_aw1_s39024_eval512` | 16 | 2e-4 | 30000 | 349.804 | 396.927 | 302.680 |
+| `r32_lr2e-4_aw1_s39024_eval512` | 32 | 2e-4 | 10000 | 408.997 | 474.481 | 343.513 |
+
+当前训练内推荐 checkpoint：
+
+```text
+training_data/log/robot_wam/h2r_top1157_s8_fixed_v1_full/
+  r16_lr1e-4_aw1_s39024_eval512/best_checkpoint.safetensors
+```
+
+该 checkpoint audit 通过：494 个 trainable tensors，44,719,272 参数，无
+`human` / `control` key。
+
+`eval-wan` 用于 eval-only 恢复 trainable-only checkpoint。恢复时会同时加载
+DiT LoRA、`state_encoder` 和 `action_decoder`；如果 checkpoint 中缺少预期
+trainable 权重会直接暴露为指标/加载问题，不做旧行为 fallback。
+
+推荐 checkpoint 的完整 fixed eval 命令使用 `--eval-batches 0 --max-eval-samples 0`，
+覆盖 `eval_in_task=4693` 和 `eval_ood=4931` 全部样本：
+
+```bash
+scripts/flip_run.sh robot_wam --cuda 1 -- eval-wan \
+  --cache-train /disk_n/zzf/flip/training_data/cache/vae/robot_wam/h2r_top1157_s8_160x320 \
+  --cache-eval /disk_n/zzf/flip/training_data/cache/vae/robot_wam/h2r_top1157_s8_160x320 \
+  --eval-manifest /disk_n/zzf/flip/training_data/robot_wam/splits/h2r_top1157_s8_fixed_v1/eval_in_task.jsonl \
+  --eval-ood-manifest /disk_n/zzf/flip/training_data/robot_wam/splits/h2r_top1157_s8_fixed_v1/eval_ood.jsonl \
+  --t5-cache-dir /disk_n/zzf/flip/training_data/cache/t5/robot_wam_h2r_top1157_s8 \
+  --batch-size 1 --workers 4 --prefetch-factor 2 --persistent-workers \
+  --lora-rank 16 \
+  --lora-attn-types self,cross \
+  --lora-attn-projections q,k,v,o \
+  --state-tokens 4 --state-hidden-dim 1024 --action-hidden-dim 512 --action-depth 3 \
+  --eval-batches 0 \
+  --max-eval-samples 0 \
+  --init-lora /disk_n/zzf/flip/training_data/log/robot_wam/h2r_top1157_s8_fixed_v1_full/r16_lr1e-4_aw1_s39024_eval512/best_checkpoint.safetensors \
+  --output-json /disk_n/zzf/flip/training_data/log/robot_wam/h2r_top1157_s8_fixed_v1_full/r16_lr1e-4_aw1_s39024_eval512/full_eval_best.json \
+  --device cuda:0 --no-skip-dit-load
+```
+
+完整 eval 结果：
+
+| metric | value |
+| --- | ---: |
+| `eval_in_task_loss` | 163.882 |
+| `eval_in_task_video_loss` | 0.094833 |
+| `eval_in_task_action_loss` | 163.787 |
+| `eval_ood_loss` | 2108.090 |
+| `eval_ood_video_loss` | 0.104568 |
+| `eval_ood_action_loss` | 2107.985 |
+| `eval_mean_loss` | 1135.986 |
+
+因此后续报告 robot_wam 结果时必须区分两种口径：
+
+- 训练内抽样 eval：用于同一 run 内选择 checkpoint，本轮最佳为 `326.157`。
+- 完整 fixed eval：用于最终外推判断，本轮 OOD action loss 很高，`eval_mean_loss=1135.986`。
+
+当前结论是 `r16_lr1e-4` 比 `r16_lr2e-4` 更适合 1 epoch 训练，rank32 在本轮没有优势；
+下一轮应优先提高 OOD 覆盖或降低 eval 抽样噪声，而不是继续单纯增大 rank。
+
+### Robot WAM 高 rank LoRA 扩容实验
+
+task074 在 task073 的固定 split 和 sampled eval 口径上直接把 LoRA rank 提到
+`256/512/768/1024`。固定配置保持 `lr=1e-4`、`action_loss_weight=1`、
+`max_steps=39024`、`eval_every=5000`、每个 eval split 抽样 512 条，
+`best_metric=eval_mean_loss`。
+
+输出目录：
+
+```text
+training_data/log/robot_wam/h2r_top1157_s8_high_rank_v1/
+├── r256_lr1e-4_aw1_s39024_eval512/
+├── r512_lr1e-4_aw1_s39024_eval512/
+├── r768_lr1e-4_aw1_s39024_eval512/
+├── summary.csv
+└── summary.md
+```
+
+容量验证：
+
+| rank | 结果 | trainable params | best checkpoint size |
+| ---: | --- | ---: | ---: |
+| 256 | 通过 | 398,613,672 | 800.6 MiB |
+| 512 | 通过 | 776,101,032 | 1520.6 MiB |
+| 768 | 通过 | 1,153,588,392 | 2240.6 MiB |
+| 1024 | OOM | 1,531,075,752 | 未产出 |
+
+`rank=1024` 在单卡 24GB 上进入 AdamW optimizer step 时 CUDA OOM；`rank=768`
+是本轮已验证可跑满的最高 rank。
+
+训练内 sampled eval 结果：
+
+| run | rank | best_step | best_eval_mean_loss | best_in_task | best_ood |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `r16_lr1e-4_aw1_s39024_eval512` | 16 | 39024 | 326.157 | 372.536 | 279.778 |
+| `r256_lr1e-4_aw1_s39024_eval512` | 256 | 39024 | 326.424 | 371.793 | 281.054 |
+| `r512_lr1e-4_aw1_s39024_eval512` | 512 | 35000 | 333.735 | 378.920 | 288.550 |
+| `r768_lr1e-4_aw1_s39024_eval512` | 768 | 39024 | 339.105 | 381.299 | 296.910 |
+
+高 rank 三组 best checkpoint audit 均通过：494 个 trainable tensor，无 `human` /
+`control` key。单纯增大 rank 没有刷新 task073 的 `rank=16` sampled best，因此本轮
+没有追加完整 fixed eval；最终泛化判断仍以 task073 的完整 fixed eval 作为当前参考。
 
 ### Cosmos Predict2B 备选路线
 

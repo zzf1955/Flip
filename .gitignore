@@ -3,6 +3,7 @@ data/
 /archive/
 ref-cosmos-transfer2.5/
 ref-sam3/
+ref-DreamZero/
 
 # === 二进制/大文件 ===
 *.pptx

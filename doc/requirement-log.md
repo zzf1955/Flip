@@ -3,6 +3,20 @@
 ## 2026-06-07
 
 **用户原始需求：**
+> 1. 归一化
+> 2. eval 修一下,这部分我记得是固定一部分样本作为 eval 集合
+> 3. 你参考 DreamZero 的实现, 看一下 Action 这块他是咋处理的. 我咋记得 backbone 也参与计算呢, 因为 backbone 中有专门加噪的 Action token
+
+**创建/推进的任务：**
+- [075] robot_wam action 归一化、eval 修复与 DreamZero action-token 对齐
+
+**进展更新：**
+- 已在 `.worktrees/t070` 将 `train-wan` / `eval-wan` 从外置 MLP action head
+  改为最小 DreamZero-style action-token：normalized action 加噪后进入 Wan
+  self-attention backbone，再由 action token slice 预测 action flow target；同时保留
+  action normalization、task-stratified fixed eval 抽样和 raw-unit action RMSE 诊断。
+
+**用户原始需求：**
 > 加 rank,直接上 256/512/1024, 参数没有爆就往上加
 >
 > 768
@@ -46,6 +60,113 @@
 - 因没有新 sampled best，本轮未追加完整 fixed eval；完整 fixed eval 的当前参考仍是
   task073 `r16_lr1e-4_aw1_s39024_eval512` 的 `eval_mean_loss=1135.986`。
 
+## 2026-06-06
+
+**用户原始需求：**
+> 全量训练?
+
+**创建/推进的任务：**
+- [073] H2R top1157 robot_wam 固定 split 完整训练与调参
+
+**直接修改：**
+- `.worktrees/t070/src/pipeline/robot_wam.py`：
+  - `RobotWAMCacheDataset` 支持固定 split manifest。
+  - 新增 `build-split` 和 `eval-wan` 子命令。
+  - `train-wan` 支持 `--train-manifest`、`--eval-manifest`、`--eval-ood-manifest`
+    和 `--best-metric`。
+- `.worktrees/t070/src/pipeline/robot_wam_wan.py`：
+  - `train-wan` 同时输出 in-task eval、OOD eval 和 `eval_mean_loss`。
+  - best checkpoint 默认按 `eval_mean_loss` 选择。
+  - `--init-lora` 恢复时同步加载 LoRA、`state_encoder` 和 `action_decoder`。
+- `src/tools/summarize_robot_wam_tune.py`：
+  - 汇总工具兼容 split eval 字段，输出 `best_metric`、`best_metric_value`、
+    `best_eval_in_task_*`、`best_eval_ood_*`、`best_eval_mean_loss`。
+
+**固定 split：**
+- 输出：`training_data/robot_wam/splits/h2r_top1157_s8_fixed_v1/`
+- train：39,024 samples，15 tasks，861 episodes。
+- eval_in_task：4,693 samples，15 tasks，105 episodes。
+- eval_ood：4,931 samples，4 tasks，189 episodes。
+- OOD task：`grab_cube2_v1`、`push_box_random_v1`、`push_box_two_v1`、`roll`。
+- 已校验三组 split 的 `sample_id` 互斥，OOD task 不进入 train。
+
+**完整训练结果：**
+- 输出：`training_data/log/robot_wam/h2r_top1157_s8_fixed_v1_full/`
+- 三组完整 39,024-step run 均完成：
+  - `r16_lr1e-4_aw1_s39024_eval512`：best step 39,024，
+    `eval_mean_loss=326.157`，`eval_in_task_loss=372.536`，
+    `eval_ood_loss=279.778`。
+  - `r16_lr2e-4_aw1_s39024_eval512`：best step 30,000，
+    `eval_mean_loss=349.804`。
+  - `r32_lr2e-4_aw1_s39024_eval512`：best step 10,000，
+    `eval_mean_loss=408.997`。
+- 推荐 checkpoint：
+  `training_data/log/robot_wam/h2r_top1157_s8_fixed_v1_full/r16_lr1e-4_aw1_s39024_eval512/best_checkpoint.safetensors`。
+- 汇总：`summary.csv` / `summary.md` 已生成，checkpoint audit 通过。
+
+**完整 eval：**
+- 使用推荐 checkpoint 对 `eval_in_task=4693` 和 `eval_ood=4931` 全量样本运行
+  `eval-wan --eval-batches 0 --max-eval-samples 0`。
+- 输出：
+  `training_data/log/robot_wam/h2r_top1157_s8_fixed_v1_full/r16_lr1e-4_aw1_s39024_eval512/full_eval_best.json`。
+- 全量 fixed eval 结果：
+  `eval_in_task_loss=163.882`、`eval_ood_loss=2108.090`、
+  `eval_mean_loss=1135.986`。
+- 结论：训练内 512-sample eval 能用于 checkpoint selection，但不能代表全量 OOD；
+  当前模型 in-task 明显下降，task-level OOD action loss 很高，后续优化应优先处理 OOD 泛化。
+
+**用户原始需求：**
+> 好的,发布新任务,训练+调参
+
+**创建的任务：**
+- [072] H2R top1157 robot_wam train-wan 调参与对比训练
+
+**进展更新：**
+- 已完成 4 个 H2R top1157 robot-only `train-wan` 调参 run，输出到
+  `training_data/log/robot_wam/h2r_top1157_s8_tune/`：
+  `r16_lr5e-5_aw1_s1k`、`r16_lr2e-4_aw1_s1k`、`r16_lr1e-4_aw0p1_s1k`、
+  `r16_lr1e-4_aw0p01_s1k`。
+- 汇总表写入 `summary.csv` / `summary.md`，包含 task071 baseline 和 4 个 tune run；
+  best checkpoint 均通过 key 审计：无 `human` / `control` key，只包含 LoRA、
+  `state_encoder` 和 `action_decoder` trainable 权重。
+- 同一 `action_loss_weight=1.0` 口径下，`r16_lr2e-4_aw1_s1k`
+  优于 task071 baseline：`best_eval_loss=1076.8829` vs `1145.6176`；
+  推荐下一轮优先把该配置延长到 3000 steps。
+- 新增 `src.tools.summarize_robot_wam_tune` 汇总工具；`.worktrees/t070` 的
+  `train-wan` 配置输出补充 optimizer、训练步数、eval/save 间隔和 state/action 参数，
+  便于后续调参 run 直接追溯。
+
+## 2026-06-03 — H2R SAM3 blur_r2r 三阶段复现收口
+
+**用户原始需求：**
+> 你看一下现在 H2R 的数据集,现在我要在这上面复现三阶段的训练. 需要做的有
+> 1. step1 完全重用之前能用的 ckpt 即可
+> 2. 第二阶段用 SAM3 模糊机器人, 在外观训练
+> 3. 第三阶段先不做, 因为需要配对数据,这部分之后做
+
+**直接修改：**
+- 新增 `src.pipeline.h2r_sam3_precompute`，通过 `sam3` conda 环境对
+  `data/h2r/v1/video/<task>/episode_*/robot_camera.mp4` 逐 1s clip 运行 SAM3.1
+  text segmentation，默认 prompt 为 `robot arm`、backup prompt 为 `robotic arm`，
+  输出 `training_data/h2r_sam3_mask/<task>/episode_*.npz`。
+- 新增 `src.pipeline.h2r_sam3_blur_pair`，把 `data/h2r/v1/video/<task>/episode_*/robot_camera.mp4`
+  与预计算 SAM3/SAM3.1 mask 转成 `training_data/pair/blur_r2r/1s/<h2r_task>/`。
+  清晰 robot clip 作为 target，SAM3 mask 区域 Gaussian blur 后作为 control；缺 mask、
+  mask 帧数不足或 frame/mask 尺寸不一致时直接失败。
+- `scripts/flip_run.sh` 新增 `h2r_sam3_precompute` 与 `h2r_sam3_blur_pair`
+  子命令，分别使用 SAM3 环境和项目 `flip` 环境。
+- `scripts/run_final_ours_three_stage.sh` 默认改为：
+  - step1 只复用已有 identity checkpoint；
+  - step2 运行 H2R SAM3 blur_r2r 外观训练；
+  - step3 默认 `RUN_STAGE3=0`，不在缺少 H2R 配对数据时启动。
+- 更新 `doc/step_5_training_infra.md` 与 `doc/scripts_inventory.md`，记录 H2R SAM3 mask
+  artifact 格式、pair/cache 生成命令和 stage2 launcher 用法。
+
+**当前边界：**
+- SAM3 precompute 是显式前置步骤；blur pair 转换入口只消费 `training_data/h2r_sam3_mask`
+  下的 mask artifact，不会隐式加载 SAM3。
+- 第三阶段 H2R h2r 配对训练暂未实现，等待后续配对数据。
+
 ## 2026-06-03 — SAM3/SAM3.1 H2R 机械臂/夹爪分割复现
 
 **用户原始需求：**
@@ -61,6 +182,31 @@
 - 整条机械臂首选 `prompt="robot arm"`，备用 `robotic arm`，推荐 `max_num_objects=1`。
 - `robot gripper`、`mechanical gripper`、`end effector` 在当前 H2R 数据上不稳定。
 - 夹爪/末端候选可用 `robot arm` 先得到整臂轨迹，再在 keyframes `0,4,8,12` 上做 point refine；单帧 point refine 不稳定。
+
+## 2026-06-03
+
+**用户原始需求：**
+> 先不改 draft，列一个新的 task：从 H2R 的数据中训练一个 Diffusion Policy。
+
+**创建的任务：**
+- [068] H2R Diffusion Policy BC 下游控制训练
+
+## 2026-06-02
+
+**用户原始需求：**
+> 发布一个 task，把已经讨论好的 WAN2.2 5B + DreamZero 的技术细节写进去，然后更新文档，
+> 说明 Cosmos Predict2B 路线作为备选。
+
+**创建的任务：**
+- [067] Wan2.2-5B + DreamZero-style LoRA 离线 video-action 原型
+
+**直接修改：**
+- 新增 `doc/tasks/pending/067.md`，明确主线是从 `Wan-AI/Wan2.2-TI2V-5B` 视频基座开始，
+  在 Wan DiT 上训练 LoRA，并从头训练 DreamZero-style `state_encoder`、
+  `action_encoder`、`action_decoder`。
+- 更新 `doc/step_5_training_infra.md`，记录 Wan2.2-5B + DreamZero LoRA 的训练语义、
+  checkpoint 保存/恢复风险、建议最小配置，以及 Cosmos Predict2B 作为备选路线的边界：
+  只能复用高层思路，不能直接替换 DreamZero 的 Wan wrapper。
 
 ## 2026-06-01
 
@@ -1514,6 +1660,58 @@
 - 更新 `doc/h1_idm_methods.md`、`doc/step_5_training_infra.md`、`doc/scripts_inventory.md`、相关 done task 文档中的产物路径，避免继续引用 `.worktrees/tNNN/tmp/...`。
 - 保留 task059、task062 worktree；它们仍是 active，且 worktree 中有未提交实现改动。
 - 进一步将 task051、task053、task054、task056 的正式/阶段性产物迁回 main 的 `tmp/` / `output/`，并同步收口它们在 task 文档中的产物路径。
+
+## 2026-06-01 — G1 三任务 IDM 重训与 action-label 误差表
+
+**用户原始需求：**
+> 目前有两种 IDM 方法，在 task063 task064 中，在 G1 三个 task(in task 和 ood) 上分别重新 train，然后比较 Baseline, Transformer, ada world 的效果。最终呈现的表格是：Task, IDM Method, MSE, relevant Error。其中的数值是模型预测和 action label 的对比，其中 IDM Baseline 是 Ours, Mitty, Baseline(均值,理论最差)。
+
+**创建的任务：**
+- [065] G1 三任务 IDM 重训与 action-label 误差表
+
+**进展更新：**
+- `t065` worktree 中新增 G1 专用 `g1_pair_idm`、`g1_adaworld_action_encoder`、
+  `g1_adaworld_action_decoder`、`g1_h2r_pair_idm_eval` 和
+  `g1_three_task_idm_report` 入口，并接入 `scripts/flip_run.sh`。
+- 在 Collect Clothes、Washing Machine、Pickup Pillow 三个 G1 task 上分别重训
+  Transformer IDM 和 AdaWorld decoder；本轮 bounded 口径为 Transformer `s1000`、
+  AdaWorld latent `s40k`、AdaWorld decoder `s1000`，统一使用 unmasked 24 维
+  `action.ee_action + action.hand_cmd` MSE。
+- 最终 H2R action-label 主表写入
+  `output/g1_three_task_action_eval_t065/task065_final_idm_action_label_report.csv`，
+  共 18 行，schema 为 `Task,IDM Method,MSE,relative Error`；主指标是
+  `MSE(IDM(video), action_label)`，`relative Error` 以对应 task/method 的
+  train-action mean baseline MSE 为分母。
+- 六个 best checkpoint 均已完成 `validate --val-max-samples 2048` replay；新增 /
+  修改的 G1 IDM 模块已通过 `compileall`，相关 CLI `--help` 已验证。
+
+## 2026-06-03 — H2R SAM3 blur_r2r 三阶段复现收口
+
+**用户原始需求：**
+> 看当前 H2R 数据集能不能复现三阶段训练：step1 直接复用之前跑通的 checkpoint；stage2 用 SAM3 把 robot 模糊掉做外观训练；stage3 暂时不做，因为需要后续配对数据。
+
+**直接修改：**
+- 新增 `src/pipeline/h2r_sam3_precompute.py`：用 SAM3/SAM3.1 预计算 H2R robot-camera 的 robot-arm mask，输出 episode 级 `training_data/h2r_sam3_mask/<task>/episode_<id>.npz`。
+- 新增 `src/pipeline/h2r_sam3_blur_pair.py`：消费预计算 SAM3 mask，把 H2R robot-camera 转成维护中的 Mitty `blur_r2r/1s/<task>` pair layout；target 是清晰 robot，control 是 SAM3 mask 区域 Gaussian blur 后的 robot。
+- `scripts/flip_run.sh` 增加 `h2r_sam3_precompute` 和 `h2r_sam3_blur_pair` 子命令；`scripts/prepare_h2r_sam3_stage2.sh` 串联 precompute、pair、cache 和可选训练。
+- `scripts/run_final_ours_three_stage.sh` 默认复用既有 step1 checkpoint，只运行 H2R SAM3 `blur_r2r` stage2，并默认 `RUN_STAGE3=0`。
+- H2R SAM3 blur pair 默认尺寸改为 `224x416`，并要求 resize 维度为 32 的倍数。`240x432` 会得到 `15x27` 奇数 latent grid，Wan/Mitty 前向输出为 `14x26`，训练 loss 会形状不一致。
+
+**验证记录：**
+- H2R 数据集检查：`data/h2r/v1/video` 下共有 22 个 task、210 个 `robot_camera.mp4`；本轮 stage2 选定 `grab_cup_v1`、`grab_cube2_v1`、`push_box_random_v1` 作为 in-task，`roll` 作为 OOD。四个任务全量 dry-run 规划为 40 episodes / 353 clips。
+- SAM3 smoke：GPU2 上对 `grab_cup_v1` 的 1 episode / 1 clip 预计算成功，生成 `masks (242,240,426) uint8`，17 个训练 source frame 中 12 帧有非空 mask。
+- 小规模真实准备：四个任务各生成 1 个 mask、1 个 `blur_r2r` pair、1 个 VAE cache；重建后 cache latent shape 均为 `(1,48,5,14,26)`。
+- stage2 训练冒烟：`MAX_STEPS=1 SAVE_STEPS=1 EVAL_STEPS=999 EVAL_VIDEO_STEPS=0`、`WANDB_MODE=offline` 跑通，成功 merge step1 LoRA、训练 1 step、保存 `training_data/log/final_ours_h2r_sam3_step2_0603_211422-blur_r2r_1s-2d_r256_self_qkvo_ffn_1s_0603_211429/ckpt/step-0001.safetensors`；step3 保持禁用。
+- 全量准备完成：SAM3 mask index 为 40 episodes / 353 clips；`blur_r2r/1s` pair 和 VAE cache 行数为 `grab_cup_v1=57`、`grab_cube2_v1=90`、`push_box_random_v1=64`、`roll=142`，cache 抽样 `human_latent` / `robot_latent` shape 均为 `(1,48,5,14,26)`。
+- stage2 正式复现完成：`BATCH_SIZE=1 IN_TASK_EVAL_SIZE=4 OOD_EVAL_SIZE=4 IN_TASK_VIDEO_SIZE=0 OOD_VIDEO_SIZE=0 EVAL_VIDEO_STEPS=0` 跑满 1000 steps，复用 step1 checkpoint 并 merge 180 个 rank-32 LoRA pair，stage2 训练 rank-256 `self_qkvo_ffn` LoRA；最终 checkpoint 为 `training_data/log/final_ours_h2r_sam3_step2_0603_220432-blur_r2r_1s-207d_r256_self_qkvo_ffn_1000s_0603_220442/ckpt/step-1000.safetensors`，最终 eval 为 `eval_loss_in_task=0.1478`、`eval_loss_ood=0.1658`。stage3 未启动，因为仍缺少 H2R 配对数据。
+
+## 2026-06-03 — task067 标题术语修正
+
+**用户原始需求：**
+> 当前 tasks 里有一个 WAM 的，应该是 WAN2.2 + LoRA。
+
+**直接修改：**
+- `doc/tasks/active/067.md`：将标题中的 `WAM 原型` 改为明确的 `Wan2.2-5B + DreamZero-style LoRA 离线 video-action 原型`，避免把该任务误标为 WAM。
 
 ## 2026-06-05 — task067 Wan2.2 + LoRA WAM 单卡低显存 smoke
 

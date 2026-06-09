@@ -5,8 +5,8 @@
 ```
 src/
 ├── core/          9 个基础库模块（不可直接运行）
-├── pipeline/     19 个可执行 pipeline 入口
-└── tools/        17 个实验/调试/可视化工具
+├── pipeline/     20+ 个可执行 pipeline 入口
+└── tools/        18+ 个实验/调试/可视化工具
 ```
 
 旧代码保留在 `scripts/`（已归档）。
@@ -82,6 +82,8 @@ eval_metrics.py    ← torch, skimage, transformers (CLIP)
 | 脚本 | 功能 | 输入 | 输出 |
 |------|------|------|------|
 | `make_pair.py` | 匹配 robot+human 视频，重采样 16fps，4k+1 帧；正式训练时 `--task all` 只展开 `TRAINING_TASKS` 三任务集合 | segment + seedance/overlay | `training_data/pair/{1s,2s,4s}/` |
+| `h2r_sam3_precompute.py` | H2R / HumanAndRobot SAM3/SAM3.1 robot-arm mask 预计算；通过 `sam3` conda 环境逐 1s clip 调用 text prompt `robot arm`，把训练会用到的 source frame mask 写入 episode 级 `.npz`，供 stage2 blur 数据转换复用 | `data/h2r/v1/video/<task>/episode_*/robot_camera.mp4` + `ref-sam3` / SAM3.1 checkpoint | `training_data/h2r_sam3_mask/<h2r_task>/episode_*.npz` |
+| `h2r_sam3_blur_pair.py` | H2R / HumanAndRobot stage2 外观训练数据转换；读取 `data/h2r/v1/video/<task>/episode_*/robot_camera.mp4` 和预计算 SAM3/SAM3.1 mask，将清晰 robot clip 写为 target，将 SAM3 mask 区域模糊后写为 control；不隐式运行 SAM3，缺 mask 或帧对齐不一致时直接失败 | H2R robot-camera mp4 + `training_data/h2r_sam3_mask/<task>/episode_*.npz` 或 mask mp4 | `training_data/pair/blur_r2r/1s/<h2r_task>/` |
 | `make_robot_pair.py` | 生成 robot→robot identity pair；正式三阶段 LoRA identity 时 `--task all` 只展开 `TRAINING_TASKS` 三任务集合 | segment | `training_data/robot_pair/1s/` |
 | `r2h_synthesize.py` | 用训练好的 r2h Mitty LoRA 从 `training_data/segment` 枚举 robot clip，排除 Seedance 已覆盖来源后生成 h2r `_syn` pair；支持按 task 可用量比例分配固定生成总量 | segment + r2h checkpoint | `training_data/pair/h2r/<duration>/<task>_syn/` |
 | `run_r2h_synthesize_queue.py` | 按全局 `_syn` 目标总量计算每个 source task 的目标数，生成单 task `r2h_synthesize` 命令队列，并按用户提供的 CUDA 列表调度；每张卡一次跑一个任务，结束后取队列下一项 | segment + r2h checkpoint + CUDA 列表 | `training_data/pair/h2r/<duration>/<task>_syn/`、`training_data/log/r2h_synthesize_queue/<timestamp>/` |
@@ -180,6 +182,7 @@ scripts/flip_run.sh nvidia-smi
 | 脚本 | 功能 |
 |------|------|
 | `svg2gif.py` | SVG→GIF 转换（独立） |
+| `summarize_robot_wam_tune.py` | 汇总 robot_wam `train-wan` baseline/tune/full run；读取 `config.json`、`train_log.jsonl`、`train_summary.json` 和 `best_summary.json`，输出 `summary.csv` / `summary.md`；兼容旧单 eval 字段和 task073 的 `eval_in_task_*`、`eval_ood_*`、`eval_mean_loss` split eval 字段，并用 `safetensors.safe_open` 审计 best checkpoint 只包含 LoRA、`state_encoder`、`action_decoder`，无 `human` / `control` key |
 
 ### 运行方式
 

@@ -2,6 +2,7 @@
 set -euo pipefail
 
 PYTHON_BIN="/home/leadtek/miniconda3/envs/flip/bin/python"
+SAM3_PYTHON_BIN="${SAM3_PYTHON_BIN:-/home/leadtek/miniconda3/envs/sam3/bin/python}"
 LIBJPEG_SO="/home/leadtek/miniconda3/envs/flip/lib/libjpeg.so.8"
 HF_HOME_DEFAULT="/disk_n/zzf/.cache/huggingface"
 PIP_CACHE_DIR_DEFAULT="/disk_n/zzf/.pip_cache"
@@ -16,6 +17,10 @@ Subcommands:
   nvidia-smi       Run NVIDIA-SMI on the host GPU device.
   mitty_cache      Run python -m src.pipeline.mitty_cache.
   sam2_precompute  Run python -m src.pipeline.sam2_precompute.
+  h2r_sam3_precompute
+                   Run python -m src.pipeline.h2r_sam3_precompute with the sam3 env.
+  h2r_sam3_blur_pair
+                   Run python -m src.pipeline.h2r_sam3_blur_pair.
   r2h_synthesize   Run python -m src.pipeline.r2h_synthesize.
   masquerade_baseline
                    Run python -m src.pipeline.masquerade_baseline.
@@ -45,6 +50,8 @@ Examples:
   scripts/flip_run.sh nvidia-smi
   scripts/flip_run.sh mitty_cache --cuda 0 -- --pair-dir training_data/pair/1s/train --output training_data/cache/1s/train --device cuda:0 --no-frames
   scripts/flip_run.sh sam2_precompute --cuda 0 -- --task all --device cuda:0 --resume
+  scripts/flip_run.sh h2r_sam3_precompute --cuda 2 -- --tasks grab_cup_v1 --max-episodes-per-task 1 --max-clips-per-episode 1
+  scripts/flip_run.sh h2r_sam3_blur_pair -- --tasks grab_cup_v1 --dry-run
   scripts/flip_run.sh r2h_synthesize --cuda 0 -- --source-task Inspire_Collect_Clothes_MainCamOnly --duration 1s --run RUN --checkpoint latest --num-samples 1000 --resume-existing
   scripts/flip_run.sh masquerade_baseline -- --task Inspire_Pickup_Pillow_MainCamOnly --head 1
   scripts/flip_run.sh syn_error_analysis --cuda 0 -- --run RUN --checkpoint latest
@@ -90,7 +97,7 @@ case "$subcommand" in
   nvidia-smi)
     exec nvidia-smi "$@"
     ;;
-  mitty_cache|sam2_precompute|r2h_synthesize|masquerade_baseline|syn_error_analysis|wan_vae_idm|wan_pair_idm|humanoid_pair_idm|h2r_diffusion_policy|adaworld_action_encoder|adaworld_action_decoder|train|train_mitty_mixed_h2r|eval_mitty)
+  mitty_cache|sam2_precompute|h2r_sam3_precompute|h2r_sam3_blur_pair|r2h_synthesize|masquerade_baseline|syn_error_analysis|wan_vae_idm|wan_pair_idm|humanoid_pair_idm|h2r_diffusion_policy|adaworld_action_encoder|adaworld_action_decoder|train|train_mitty_mixed_h2r|eval_mitty)
     ;;
   *)
     usage >&2
@@ -150,6 +157,12 @@ case "$subcommand" in
     ;;
   sam2_precompute)
     exec "$PYTHON_BIN" -m src.pipeline.sam2_precompute "${script_args[@]}"
+    ;;
+  h2r_sam3_precompute)
+    exec "$SAM3_PYTHON_BIN" -m src.pipeline.h2r_sam3_precompute "${script_args[@]}"
+    ;;
+  h2r_sam3_blur_pair)
+    exec "$PYTHON_BIN" -m src.pipeline.h2r_sam3_blur_pair "${script_args[@]}"
     ;;
   r2h_synthesize)
     exec "$PYTHON_BIN" -m src.pipeline.r2h_synthesize "${script_args[@]}"

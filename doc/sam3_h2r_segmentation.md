@@ -278,3 +278,24 @@ tmp/sam3_h2r_keyframe_point_refine.py
 2. 若需要夹爪 mask，优先使用 `robot arm` + keyframe point-refine 生成候选，再做人工检查或几何/运动后处理。
 3. 长视频应分段处理。当前显存条件下，SAM3.1 16 帧稳定，32 帧在 GPU 2 上会 OOM。
 4. 若要接入正式 pipeline，建议把 `robot arm` text prompt 作为第一阶段，把 keyframe point-refine 作为可选第二阶段，而不是直接依赖 `gripper` text prompt。
+
+当前已新增正式 mask 预计算入口：
+
+```bash
+scripts/flip_run.sh h2r_sam3_precompute --cuda 2 -- \
+  --tasks grab_cup_v1,grab_cube2_v1,push_box_random_v1,roll \
+  --output-root training_data/h2r_sam3_mask \
+  --prompt "robot arm" \
+  --backup-prompt "robotic arm" \
+  --max-num-objects 1 \
+  --clip-stride 1.0 \
+  --resume
+```
+
+该入口按 H2R 1s / 17 帧训练 clip 逐段调用 SAM3.1，输出
+`training_data/h2r_sam3_mask/<task>/episode_*.npz`，其中 `masks` 为
+`[source_frame_count,H,W]` uint8。只填充训练 clip 使用到的 source frame，未覆盖帧保持 0。
+`--resume` 不只检查 `.npz` 是否存在，还会读取 `covered_frames`；只有现有 mask
+覆盖本次请求的所有 source frame 时才跳过，否则会重算该 episode。
+后续 `src.pipeline.h2r_sam3_blur_pair` 会读取同一组 source frame index 生成
+`blur_r2r` control 视频。

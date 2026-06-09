@@ -11,6 +11,8 @@ CUDA_ID="${CUDA_ID:-0}"
 NPROC="${NPROC:-1}"
 RUN_ID="${RUN_ID:-$(date +%m%d_%H%M%S)}"
 OUTPUT_DIR="${OUTPUT_DIR:-training_data/log}"
+RUN_STAGE2="${RUN_STAGE2:-1}"
+RUN_STAGE3="${RUN_STAGE3:-0}"
 
 BATCH_SIZE="${BATCH_SIZE:-4}"
 MAX_STEPS="${MAX_STEPS:-1000}"
@@ -30,13 +32,15 @@ IN_TASK_VIDEO_SIZE="${IN_TASK_VIDEO_SIZE:-4}"
 OOD_VIDEO_SIZE="${OOD_VIDEO_SIZE:-2}"
 DATA_SEED="${DATA_SEED:-42}"
 
-STAGE1_TRAIN_SIZE="${STAGE1_TRAIN_SIZE:-0}"
 STAGE2_TRAIN_SIZE="${STAGE2_TRAIN_SIZE:-0}"
 STAGE3_TRAIN_SIZE="${STAGE3_TRAIN_SIZE:-400}"
 
-IDENTITY_TRAIN_TASKS="${IDENTITY_TRAIN_TASKS:-Inspire_Put_Clothes_into_Washing_Machine,Inspire_Put_Clothes_Into_Basket}"
-MAIN_TRAIN_TASKS="${MAIN_TRAIN_TASKS:-Inspire_Collect_Clothes_MainCamOnly,Inspire_Put_Clothes_into_Washing_Machine}"
-OOD_TASKS="${OOD_TASKS:-Inspire_Pickup_Pillow_MainCamOnly}"
+STEP1_CKPT="${STEP1_CKPT:-training_data/log/final_ours_step1_0507_004839-identity_r2r_1s-22592d_r32_self_qkvo_ffn_1000s_0507_004911/ckpt/step-1000.safetensors}"
+MAIN_TRAIN_TASKS="${MAIN_TRAIN_TASKS:-grab_cup_v1,grab_cube2_v1,push_box_random_v1}"
+OOD_TASKS="${OOD_TASKS:-roll}"
+PAIR_ROOT="${PAIR_ROOT:-training_data/pair}"
+CACHE_ROOT="${CACHE_ROOT:-training_data/cache/vae}"
+T5_CACHE_DIR="${T5_CACHE_DIR:-training_data/cache/t5/blur_r2r/1s}"
 
 QKVO_FFN_TARGETS="${QKVO_FFN_TARGETS:-self_attn.q,self_attn.k,self_attn.v,self_attn.o,ffn.0,ffn.2}"
 
@@ -100,6 +104,9 @@ run_train() {
 
 COMMON_ARGS=(
   --output-dir "$OUTPUT_DIR"
+  --pair-root "$PAIR_ROOT"
+  --cache-root "$CACHE_ROOT"
+  --t5-cache-dir "$T5_CACHE_DIR"
   --in-task-eval-size "$IN_TASK_EVAL_SIZE"
   --ood-eval-size "$OOD_EVAL_SIZE"
   --in-task-video-size "$IN_TASK_VIDEO_SIZE"
@@ -117,31 +124,13 @@ COMMON_ARGS=(
   --wandb-project "$WANDB_PROJECT"
 )
 
-STAGE1_PREFIX="final_ours_step1_${RUN_ID}"
-STAGE2_PREFIX="final_ours_step2_${RUN_ID}"
-STAGE3_PREFIX="final_ours_step3_${RUN_ID}"
-
-run_train "ours step1 identity" \
-  --task-name identity_r2r_1s \
-  --train-tasks "$IDENTITY_TRAIN_TASKS" \
-  --ood-tasks "$OOD_TASKS" \
-  --run-prefix "$STAGE1_PREFIX" \
-  --lora-rank 32 \
-  --lora-target-modules "$QKVO_FFN_TARGETS" \
-  --train-size "$STAGE1_TRAIN_SIZE" \
-  "${COMMON_ARGS[@]}" \
-  --wandb-tags final ours step1 identity_r2r layout:self_qkvo_ffn rank:32
-
-if [[ "${DRY_RUN:-0}" == "1" ]]; then
-  STEP1_CKPT="<dry-run-step1-checkpoint>"
-else
-  STEP1_RUN_DIR="$(latest_run_dir "$STAGE1_PREFIX")"
-  STEP1_CKPT="$(latest_checkpoint "$STEP1_RUN_DIR")"
-  require_file "$STEP1_CKPT"
-fi
+require_file "$STEP1_CKPT"
+STAGE2_PREFIX="final_ours_h2r_sam3_step2_${RUN_ID}"
+STAGE3_PREFIX="final_ours_h2r_step3_${RUN_ID}"
 printf 'STEP1_CKPT=%s\n' "$STEP1_CKPT"
 
-run_train "ours step2 blur_r2r" \
+if [[ "$RUN_STAGE2" == "1" ]]; then
+run_train "ours step2 H2R SAM3 blur_r2r appearance" \
   --task-name blur_r2r_1s \
   --train-tasks "$MAIN_TRAIN_TASKS" \
   --ood-tasks "$OOD_TASKS" \
@@ -151,7 +140,7 @@ run_train "ours step2 blur_r2r" \
   --lora-target-modules "$QKVO_FFN_TARGETS" \
   --train-size "$STAGE2_TRAIN_SIZE" \
   "${COMMON_ARGS[@]}" \
-  --wandb-tags final ours step2 blur_r2r merge_step1 layout:self_qkvo_ffn rank:256
+  --wandb-tags final ours h2r_sam3 step2 blur_r2r merge_step1 layout:self_qkvo_ffn rank:256
 
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
   STEP2_CKPT="<dry-run-step2-checkpoint>"
@@ -161,6 +150,26 @@ else
   require_file "$STEP2_CKPT"
 fi
 printf 'STEP2_CKPT=%s\n' "$STEP2_CKPT"
+else
+  STEP2_CKPT="${STEP2_CKPT:-}"
+  printf 'RUN_STAGE2=0, skipping step2. STEP2_CKPT=%s\n' "${STEP2_CKPT:-<unset>}"
+fi
+
+if [[ "$RUN_STAGE3" != "1" ]]; then
+  printf '\nStep3 is disabled by default. Pair data is not part of this reproduction yet.\n'
+  printf 'Current checkpoints:\n'
+  printf '  step1(reused): %s\n' "$STEP1_CKPT"
+  printf '  step2: %s\n' "${STEP2_CKPT:-<not-run>}"
+  exit 0
+fi
+
+if [[ -z "${STEP2_CKPT:-}" ]]; then
+  echo "RUN_STAGE3=1 requires STEP2_CKPT or RUN_STAGE2=1" >&2
+  exit 2
+fi
+if [[ "$STEP2_CKPT" != "<dry-run-step2-checkpoint>" ]]; then
+  require_file "$STEP2_CKPT"
+fi
 
 run_train "ours step3 h2r" \
   --task-name h2r_1s \
