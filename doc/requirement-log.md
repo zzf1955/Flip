@@ -1787,3 +1787,18 @@
 - 尚未启动新的三阶段训练。
 - 尚未把 action/state 物化为独立 2s 标签文件；现阶段通过 manifest 中的
   `source_segment_id`、`clip_start_frame` 和 `source_frame_indices` 与源 parquet 对齐。
+
+## 2026-06-09 — Seedance 2s 滑动窗口切片与 step layout 任务发布
+
+**用户原始需求：**
+> 写一个新的 task，用滑动窗口切 Seedance 的数据。生成的数据应该有两部分：
+> 1. 已有的 origin 数据/blur 用于 Step2 训练，这部分目前没有问题，只要配对；
+> 2. Seedance 新切片 + 对应的 origin 切片，因为切片方式不同，不能用原来的 origin 数据。
+> 最终在 training data 中呈现 step2/origin、step2/blur、step1/origin、step1/human。
+> 仅发布 task，不执行。
+
+**创建的任务：**
+- [077] Seedance 2s 滑动窗口切片与 step1/step2 数据布局重建
+
+**状态：**
+- 只创建 pending task；未实现脚本、未生成数据、未创建分支、未启动训练。
