@@ -90,6 +90,24 @@ TRAIN_TASKS: dict[str, TrainTaskConfig] = {
         "identity_r2r",
         description="Robot-to-robot identity 1s cache with runtime task split.",
     ),
+    "h2r_2s61f30_slide": _preset(
+        "h2r_2s61f30_slide",
+        "h2r",
+        duration="2s61f30_slide",
+        description="G1 2s Seedance sliding-window human-to-robot cache.",
+    ),
+    "blur_r2r_2s61f30_slide": _preset(
+        "blur_r2r_2s61f30_slide",
+        "blur_r2r",
+        duration="2s61f30_slide",
+        description="G1 2s SAM2-blur to clear-robot cache matching the slide layout.",
+    ),
+    "identity_r2r_2s61f30_slide": _preset(
+        "identity_r2r_2s61f30_slide",
+        "identity_r2r",
+        duration="2s61f30_slide",
+        description="G1 2s robot-to-robot identity cache matching the slide layout.",
+    ),
     # Compatibility aliases for existing commands; they now map to semantic data types.
     "pair_1s": _preset(
         "pair_1s",

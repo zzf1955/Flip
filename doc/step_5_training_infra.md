@@ -125,6 +125,68 @@ Seedance 4s human 源视频中取对应时间段。因此 h2r 样本数量受已
 `index.jsonl`；`pair_order.jsonl` 可由训练入口首次读取 manifest 时按
 `--data-seed` 生成。
 
+`src.pipeline.g1_2s_seedance_slide_data` 用于补齐 2s Seedance 密集滑窗口径。
+它不会覆盖 task076 的 `2s61f30` slice/pair，而是写入新的 step layout 和新的
+duration label `2s61f30_slide`：
+
+```bash
+python -m src.pipeline.g1_2s_seedance_slide_data --task all --workers 8
+```
+
+默认输出：
+
+```text
+training_data/g1_2s61f30_seedance_slide/
+├── step2/
+│   ├── origin/<task>/ep*/seg*_clip*.mp4
+│   └── blur/<task>/ep*/seg*_clip*.mp4
+└── step1/
+    ├── origin/<task>/ep*/seg*_slide*_f*.mp4
+    └── human/<task>/ep*/seg*_slide*_f*.mp4
+
+training_data/pair/
+├── identity_r2r/2s61f30_slide/<task>/{video,control_video,metadata.csv,manifest.jsonl}
+├── blur_r2r/2s61f30_slide/<task>/{video,control_video,metadata.csv,manifest.jsonl}
+└── h2r/2s61f30_slide/<task>/{video,control_video,metadata.csv,manifest.jsonl}
+```
+
+Step2 的 `origin` / `blur` 默认 hardlink 复用 task076 已验证的全量
+`2s61f30` robot-only slice，因此数量应保持 10908 / 10908。Step1 从
+`training_data/seedance_direct/4s/<task>/ep*/seg*_human.mp4` 读取 Seedance 4s
+source，默认 61 帧、30fps、0.5s stride；对 4s/120 帧 robot segment，窗口
+起点为 `0, 15, 30, 45, 59`，其中 `59` 为 tail-aligned 起点。Step1 的
+`source_id` 显式包含 `slideXX_fSTART`，避免和旧 `2s61f30` 的 `clip01`
+语义混淆。
+
+`2s61f30_slide` 对应训练 preset 已注册为：
+
+- `identity_r2r_2s61f30_slide`
+- `blur_r2r_2s61f30_slide`
+- `h2r_2s61f30_slide`
+
+生成 VAE/T5 cache 时仍按每个 robot task 单独运行 `mitty_cache`，T5 cache 目录
+按 data type + duration 共享。例如：
+
+```bash
+scripts/flip_run.sh mitty_cache --cuda 2 -- \
+  --pair-dir training_data/pair/h2r/2s61f30_slide/Inspire_Collect_Clothes_MainCamOnly \
+  --output training_data/cache/vae/h2r/2s61f30_slide/Inspire_Collect_Clothes_MainCamOnly \
+  --t5-cache-dir training_data/cache/t5/h2r/2s61f30_slide \
+  --device cuda:0 \
+  --resume \
+  --batch-size 1 \
+  --prefetch-workers 4 \
+  --prefetch-batches 2 \
+  --save-workers 1
+```
+
+`identity_r2r` 的 `video` 与 `control_video` 指向同一物理文件时，`mitty_cache`
+会只执行一次 VAE encode，并将结果同时写入 `human_latent` 与 `robot_latent`；
+`blur_r2r` 和 `h2r` 默认仍分别编码输入视频与目标视频。对 `blur_r2r` 这种目标端
+与 `identity_r2r` 清晰 robot cache 对齐的数据，可额外传入
+`--target-cache-dir training_data/cache/vae/identity_r2r/<duration>/<task>`，
+让 `mitty_cache` 复用已有 `robot_latent`，只重新编码模糊输入端。
+
 后续若要为 `2s61f30` 物化 state/action 标签，必须以 slice 或 pair manifest
 里的 `source_segment_id`、`source_frame_indices` 和 `clip_start_frame` 为准。
 robot state 可从同一 segment 旁边的
