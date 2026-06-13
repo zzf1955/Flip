@@ -1815,6 +1815,167 @@
 - 创建 task078，默认不覆盖 task076 的 `2s61f30` 产物；以新的
   `2s61f30_slide` 口径收口 Seedance 滑窗、三阶段 pair layout、T5 cache 和 VAE cache。
 
+## 2026-06-13 — G1 blur_r2r 切换到 SAM3 mask 任务发布
+
+**用户原始需求：**
+> 看一下当前 Unitree-g1 的数据和 sam3 分割的 pipeline，现在的分割 pipeline 非常复杂，我想把 g1 的 blur 也换成 SAM3。
+
+**创建的任务：**
+- [079] G1 blur_r2r 切换到 SAM3 mask
+
+**前置结论：**
+- 当前 G1 `2s61f30` blur 数据由 `src.pipeline.g1_2s_slice_data` 从
+  `training_data/sam2_mask/` 生成，产物命名为 `sam2_blur`，`blur_r2r/2s61f30`
+  manifest 记录 `control_degrade=sam2_blur`。
+- H2R SAM3 已有清晰的两段式实现：`h2r_sam3_precompute` 显式预计算 mask，
+  `h2r_sam3_blur_pair` 只消费 mask，不隐式运行 SAM3。
+- G1 canonical 三任务当前合计 5454 个 segment，`2s61f30` blur pair 为 10908 条；
+  G1 2s blur 需要覆盖每个 segment 的 0..119 全部 120 帧，因此 SAM3 预计算应按短
+  chunk 处理并用 `covered_frames` 校验。
+
+**状态：**
+- 只创建 pending task；未实现脚本、未生成 SAM3 mask、未重建 blur 数据。
+- task078 当前 active 需求仍以 SAM2 step2 blur 为基础；若本任务先实施，task078 的
+  step2 blur/cache 口径需要同步切到 SAM3，避免继续生成旧 SAM2 cache。
+
+**2026-06-13 执行记录：**
+- 已认领 task079，创建 worktree `.worktrees/t079` 和分支 `feat/t079-g1-sam3-blur`。
+- 新增 G1 SAM3 smoke / 预计算入口 `src.pipeline.g1_sam3_precompute`，并在
+  `scripts/flip_run.sh` 中加入 `g1_sam3_precompute` 子命令。
+- 按用户要求，真实 SAM3.1 运行前先检查全卡显存：
+  - GPU0 约 22682/24564 MiB used，只剩约 1408 MiB free，不适合跑 SAM3。
+  - GPU1/GPU2 约 3592/24564 MiB used，约 20499 MiB free。
+  - GPU3 约 4482/24564 MiB used，约 19609 MiB free。
+- 在 GPU1 测试 G1 2s 61 帧单 session：确认 OOM。传播到约第 16 帧时，
+  SAM3 进程约占 19.28 GiB，尝试再分配 1.27 GiB 失败。
+- 在 GPU1 测试 61 帧拆成 17 帧 chunk：三任务各 1 个 segment 跑通，无 OOM。
+- 分割质量结论：
+  - `robot arm` 聚合 `mean_nonempty_frame_ratio=0.645`、`mean_sam2_iou=0.142`。
+  - `robot` 聚合 `mean_nonempty_frame_ratio=0.574`、`mean_sam2_iou=0.301`，但
+    Washing Machine 任务 0/61 帧非空。
+  - `robotic arm` 对 Washing Machine 只有 20/61 帧非空，IoU 0.111。
+- 当前判断：SAM3.1 可以按短 chunk 跑 G1 segment，但 text-only prompt 不能干净替代
+  当前 SAM2 全身 blur mask；后续不能直接全量切换，需要 point/box refine、SAM2/FK
+  bbox 约束、跨 chunk 质量过滤或任务级 prompt 策略。
+
+**2026-06-13 扩展执行记录：**
+- 按用户补充要求，本轮只处理 G1 robot segment，不处理 human / H2R 数据。
+- `src.pipeline.g1_sam3_precompute` 增加 `--prompt-list`，可在一次 SAM3.1 模型加载下
+  sweep 多组 robot prompt；增加 `--prompt-mode text_bbox` 和 `--bbox-include-text`，
+  支持 text mask 生成 bbox 后第二阶段重新跑 bbox+text prompt。
+- 7 个 robot-only text prompt sweep 在 GPU1 上完成，无 OOM：
+  - `robot`：聚合 `mean_nonempty_frame_ratio=0.574`、`mean_sam2_iou=0.301`，当前最好；
+    Collect Clothes 过分割，Washing Machine 0/61 全空。
+  - `mechanical arm`：IoU 0.188；`robot arm`：IoU 0.123；`robot hand` 非空率 0.754
+    但平均面积只有 0.0052；`robot body`、`humanoid robot`、`Unitree G1 robot` 全空。
+- text->bbox 二阶段完成，无 OOM：
+  - 纯 bbox prompt 接口可跑，但 17 帧样本输出全空；`bbox + 同 text prompt` 才有实际 mask。
+  - `robot` 二阶段聚合 IoU 0.302，基本等同 text-only 0.301，Washing Machine 仍全空。
+  - `mechanical arm` 二阶段 IoU 从 0.188 提升到 0.232，但仍不能满足全身 robot blur mask 口径。
+- 当前结论更新：SAM3.1 61 帧短 chunk 可运行，但纯 SAM3 prompt 与 text->bbox 二阶段都不能
+  干净替代 SAM2/FK 全身 blur mask；纯 SAM3.1 在 Washing Machine 上表现一般且不稳定，
+  多数 prompt 全空，能出 mask 的 prompt 也只覆盖少量局部帧。暂不应继续生成全量
+  `sam3_blur` pair/cache，除非引入 SAM2/FK bbox seed、point/instance refine、跨 chunk
+  质量过滤或任务级 prompt 策略。
+
+## 2026-06-13 — H2R Seedance 机械臂转人手 smoke 入口
+
+**用户原始需求：**
+> 256 x 488 吧，这块先不用进入 WAN 的训练，目前先只管 Seedance。处理 3 段机器人视频，
+> 使用 Seedance 编辑为人手：看 api pipeline 怎么用、三路并发、看 prompt 有没有问题，
+> 目前的视频中只有机械臂，原来的 prompt 可能不适用了。
+
+**直接修改：**
+- 新增 `src/pipeline/h2r_seedance_edit.py`：H2R HDF5 专用 Seedance smoke 入口，
+  默认导出 `grab_both_cubes_v1`、`grab_cup_v1`、`roll` 三段 `robot_camera`
+  为 16:9 `864x480`、120 帧、30fps 的 Seedance reference 视频，支持三路并发调用
+  API，并保存 raw Seedance 输出与 `256x488`（HxW）、120 帧、30fps 的本地 review
+  输出；API key 支持从项目 `.env` 的 `ARK_API_KEY` 读取。
+- 更新 `doc/step_4_seedance_api.md`：记录 H2R smoke 的入口、默认样本、尺寸口径和
+  新 prompt。新 prompt 只替换可见机械臂/机械手/夹爪为人类前臂和手，不再使用
+  G1 full-body prompt。
+
+**状态：**
+- 已运行 dry-run，生成 3 段 Seedance 输入视频和运行计划到
+  `tmp/h2r_seedance_edit_smoke/`。
+- 按用户确认将默认 prompt 收敛为：`把视频中机械臂换成人类手臂，无袖子。`
+- 已使用 `.env` 中的 `ARK_API_KEY` 实际三路并发调用 Seedance，3/3 成功；
+  汇总写入 `tmp/h2r_seedance_edit_smoke/seedance_summary.json`。
+- 本轮 Seedance raw 输出均为 `864x496`、24fps、约 4.04s；脚本已生成
+  `final/` 下 `488x256`、30fps、4.0s 的 review 视频。
+- 复看原视频和本轮输出后确认失败模式：Seedance 容易在夹爪旁新增一只手，而不是覆盖
+  原机械夹爪；默认 prompt 已改为“擦除机器人机械臂/黑色两指夹爪/白色机械外壳，并在
+  完全相同位置替换为一只裸露人类手和前臂”，同时显式禁止额外生成手、袖子、完整人物和
+  机器人残留。
+- 已用新版原位置替换 prompt 重新三路并发运行 3 段 Seedance，输出到
+  `tmp/h2r_seedance_edit_prompt_v2/`；3/3 成功，汇总为
+  `tmp/h2r_seedance_edit_prompt_v2/seedance_summary.json`。raw 输出仍为 `864x496`、
+  24fps、97 帧，final 输出为 `488x256`、30fps、120 帧。
+- 用户复核后确认效果仍不理想；本轮先收口保留 smoke 入口和中间产物，但文档明确记录：
+  Seedance 直接 H2R robot2human / 机械夹爪转人手当前效果不好，暂不进入正式配对数据生成或
+  Wan 训练。
+
+## 2026-06-13 — H2R Seedance SAM3 红色 mask 引导 smoke
+
+**用户原始需求：**
+> 换一种方式, 目前有 SAM3 分割 human2robot 中机械臂的 pipeline, 你尝试先 SAM3 分割,
+> 然后 Seedance prompt 改成, 将图中红色部分替换为 xxxx
+
+**直接修改：**
+- 新增 `src/pipeline/h2r_seedance_sam3_edit.py`：消费 H2R SAM3/SAM3.1 episode 级
+  `masks` / `covered_frames` npz，读取 HDF5 `cam_data/robot_camera` 的三段 120 帧
+  30fps 视频，把 SAM3 mask 区域染成红色后作为 Seedance reference video。
+- 默认 prompt 改为“图中红色半透明区域标出了需要编辑的机器人机械臂、机械夹爪和机械外壳；
+  请只将红色部分替换为真实裸露的人类手和前臂，无袖子”，并显式要求非红色区域完全不变、
+  红色标记消失、禁止额外生成手或保留机械残留。
+- 更新 `doc/step_4_seedance_api.md`、`doc/scripts_inventory.md` 和 `doc/notice.md`，
+  记录 SAM3 红色 mask 引导 smoke 的命令、输入输出、prompt、产物路径和使用限制。
+
+**状态：**
+- 使用 `scripts/flip_run.sh h2r_sam3_precompute --cuda 1` 对
+  `grab_both_cubes_v1`、`grab_cup_v1`、`roll` 的 `episode_0` 前 4 个 1s clip 运行
+  SAM3.1 `robot arm` 分割，mask 输出到
+  `tmp/h2r_seedance_sam3_red_edit/sam3_mask/`。
+- 已 dry-run 生成三段 `864x480`、120 帧、30fps 的原图 reference、红色 mask reference 和
+  mask review 视频；`prepared_inputs.jsonl` 记录每段 `mask_nonzero_frames`、mask 面积和
+  30fps 到 SAM3 `covered_frames` 的最近邻映射 gap。
+- 已使用 `.env` 中 `ARK_API_KEY` 三路并发调用 Seedance，3/3 成功；
+  汇总写入 `tmp/h2r_seedance_sam3_red_edit/seedance_summary.json`，`elapsed_sec=314.5`。
+- Seedance raw 输出均为 `864x496`、24fps、约 4.04s；本地 `final/` 已统一后处理为
+  `488x256`、30fps、120 帧。
+- 额外生成 `tmp/h2r_seedance_sam3_red_edit/_review/*_original_red_final_compare.mp4`，
+  三列展示 `original | sam3 red input | seedance final`，供人工复核显式红色区域 prompt
+  是否改善替换质量。
+
+**2026-06-13 追加：简化 prompt 单条 smoke**
+- 按用户要求，将 `src.pipeline.h2r_seedance_sam3_edit` 默认 prompt 简化为：
+  `把视频中红色部分替换为人手，保持动作和交互不变。`
+- 入口样本数限制从“必须 3 条”放宽为“至少 1 条”，便于用 `--sample` 跑单条 prompt
+  smoke，同时不影响默认三条样本。
+- 已用简化 prompt 跑通单条 `grab_both_cubes_v1:0:0`，输出到
+  `tmp/h2r_seedance_sam3_red_simple_prompt_one/`；`seedance_summary.json` 记录
+  `ok=1`、`failed=0`、`elapsed_sec=255.8`。raw 输出为 `864x496`、24fps、约 4.04s，
+  final 输出为 `488x256`、30fps、120 帧，并生成 `_review/` 三列并排视频供人工核对。
+
+**2026-06-13 追加：裸露手臂 prompt 单条 smoke**
+- 按用户要求，将 `src.pipeline.h2r_seedance_sam3_edit` 默认 prompt 更新为：
+  `把视频中红色机械臂更换成人的手臂, 手臂裸露无袖, 与机械臂动作一致, 保持背景不变`
+- 单条输出目录使用 `tmp/h2r_seedance_sam3_red_bare_arm_prompt_one/`，避免覆盖上一版
+  `simple_prompt_one` 结果。
+- 已跑通单条 `grab_both_cubes_v1:0:0`，`seedance_summary.json` 记录 `ok=1`、
+  `failed=0`、`elapsed_sec=211.1`。raw 输出为 `864x496`、24fps、约 4.04s，
+  final 输出为 `488x256`、30fps、120 帧，并生成 `_review/` 三列并排视频供人工核对。
+
+**2026-06-13 追加：按 H2R task 中文动作名生成三条 prompt**
+- 按用户要求，将 `src.pipeline.h2r_seedance_sam3_edit` 改为默认 task-specific prompt：
+  模板为 `把视频移动的红色装置替换成裸露的人类胳膊。保持背景不变，人手和红色装置的动作轨迹保持一致。人类手臂{task_name}`。
+- 当前三条默认样本的中文动作名为：
+  `grab_both_cubes_v1=抓起物块。`、`grab_cup_v1=抓起杯子。`、`roll=滚动物体。`。
+- 已三路并发跑通默认三样本，输出到 `tmp/h2r_seedance_sam3_red_task_prompts/`；
+  `seedance_summary.json` 记录 `ok=3`、`failed=0`、`elapsed_sec=184.0`。三条 raw
+  输出均为 `864x496`、24fps、约 4.04s；final 输出均为 `488x256`、30fps、120 帧；
+  `_review/` 下生成三条三列并排视频和 `task_prompts_contact_sheet.jpg`。
+
 ## 2026-06-13 — G1 2s Seedance 滑窗与三阶段 cache 补全
 
 **用户原始需求：**
@@ -1854,3 +2015,202 @@
   `(1,48,16,30,40)`；pair/cache manifest 与 `.pth` 文件数量一致；identity 抽样
   `human_latent == robot_latent`；blur/Washing tail 抽样 target latent 与 identity
   cache 一致。
+
+## 2026-06-13 — G1 2s 数据接入 Diffusion Policy
+
+**用户原始需求：**
+> 你看一下当前 Diffusion Policy 的训练.
+> 现在有新的 2s 机器人数据切片, 你看一下当前 2s 的数据如何和 robot state/robot Action 对齐, 我需要在这些新数据上训练 Diffusion Policy
+
+**结论与实现：**
+- 现有 `src.pipeline.h2r_diffusion_policy` 原本只支持 H2R HDF5 数据；
+  本次新增 `--dataset-kind g1_2s_pair`，可直接读取 G1 `2s61f30_slide` pair
+  manifest 训练同一个 action-only Diffusion Policy。
+- 默认 G1 训练数据源设为
+  `training_data/pair/identity_r2r/2s61f30_slide`，即真实 robot→真实 robot 的
+  10908 条 robot-only clips；`h2r/2s61f30_slide` 只有 210 条 human→robot pair，
+  后续更适合作为固定 label 的 video override / eval 数据。
+- 对齐口径已修正：manifest 的 `source_frame_indices` 是 segment video 内的局部帧号，
+  不是 episode 全局 `frame_index`。训练时先按局部帧号读取
+  `training_data/segment/<task>/<episode>/<seg>_joints.parquet`；再用 joints 行中的
+  全局 `frame_index` 回查
+  `data/unitree_G1_WBT/G1_WBT_<task>/data/chunk-*/*.parquet` action。
+- 默认 state 为 `observation.state.robot_q_current(36) + observation.state.hand_state(12)`，
+  默认 action 为 `action.robot_q_desired(36) + action.hand_cmd(12)`，二者均为 48 维。
+- G1 hand command 存在近常量维度；G1 分支默认 `--g1-norm-std-floor 0.01`，并写入
+  checkpoint config / dataset summary，避免极小 std 放大训练输入。
+
+**验证：**
+- `python -m compileall -q src/pipeline/h2r_diffusion_policy.py` 通过。
+- 单任务 Inspect 通过：
+  `tmp/g1_dp_2s_inspect_collect.json`，Collect clips `1186`，batch shapes 为
+  video `[4,2,3,64,64]`、state `[4,2,48]`、action `[4,8,48]`。
+- 三任务 Inspect 通过：
+  `tmp/g1_dp_2s_inspect_all.json`，clips `10908`，episode split 后
+  train/val clips 为 `8796/2112`。
+- 12-step G1 smoke 训练通过：
+  `tmp/g1_dp_2s_smoke_floor1e2_lr3e4`，最终 eval step 输出
+  `denoise_loss=1.001034`、`sampled_action_mse_norm=1.891784`。
+- Checkpoint 恢复 eval 通过：
+  `tmp/g1_dp_2s_smoke_floor1e2_lr3e4/eval_last`，
+  `denoise_loss=0.960461`、`sampled_action_mse_norm=1.897220`。
+
+**后续长训准备更新：**
+- 明确当前 `h2r_diffusion_policy` 默认仍是 H2R HDF5；Unitree G1 2s 训练必须显式使用
+  `--dataset-kind g1_2s_pair`，否则不会读取
+  `training_data/pair/identity_r2r/2s61f30_slide`。
+- Eval / train-log 的采样指标新增反归一化 action 空间统计：
+  `sampled_action_mse_action`、`sampled_action_rmse_action`、
+  `sampled_action_relative_l2_action` 和 per-horizon relative L2；
+  `predictions.csv` 逐样本写出 `mse_action`、`relative_l2_action`。
+  之后参数试验同时看 `sampled_action_mse_norm` 和 action 空间相对误差。
+- 训练新增 `--best-metric`；默认仍为 `denoise_loss`，G1 长训若要按真实 action 空间误差
+  选 best checkpoint，应设置 `--best-metric sampled_action_relative_l2_action` 并开启
+  `--eval-sample-actions`。
+- Action sampling eval 新增 `--eval-sample-seed`，默认 `12345`，用于固定 DDPM 采样噪声，
+  让同一 checkpoint 的 normalized MSE 与 action-space 相对误差可复现。
+
+**2026-06-13 长训/调参进展：**
+- 当前训练已切到 Unitree G1：所有新 run 的 dataset summary 均为
+  `format=g1_2s_pair_manifest`，数据源为
+  `training_data/pair/identity_r2r/2s61f30_slide`，三任务 `10908` clips，
+  state/action 均为 48 维。
+- 小试结果：
+  - `diffusion_steps=16/dropout=0.05/lr=3e-4` 不占优，160-step relative L2
+    约 `0.6987`。
+  - `diffusion_steps=8/dropout=0/lr=3e-4` 更好，512 train / 128 val 的 step80
+    relative L2 约 `0.6605`。
+  - 同配置 `lr=1e-4` 没有明显收益，best step80 relative L2 约 `0.6607`。
+- 已按较优参数加到 1000 steps：
+  `tmp/g1_dp_2s_long_g1_s1000_h128_d4_diff8_drop0_lr3e4_m4096_norm5k`。
+  训练集 4096 samples、验证集 512 samples、frame stride 4、norm 5000 frames；
+  train summary final `sampled_action_mse_norm=2.5580`、
+  `sampled_action_mse_action=0.12145`、`sampled_action_relative_l2_action=0.66357`。
+- 1000-step last checkpoint 恢复 eval 通过；同一 checkpoint / `--eval-sample-seed 12345`
+  连跑两次 eval 完全一致：
+  `denoise_loss=1.003447`、`sampled_action_mse_norm=2.788211`、
+  `sampled_action_relative_l2_action=0.682433`。`predictions.csv` 已含
+  `mse_action`、`relative_l2_action` 和 `source_id`。
+
+## 2026-06-13 — H2R Seedance SAM3.1 人手评估与 dark gripper marker 实验
+
+**用户原始需求：**
+> 1. 你在分析视频的时候, 可以使用 SAM3.1 进行分割+统计像素, 目前项目中有 SAM3.1, 然 SAM3.1 分割人手,搭配之前标红用的分割, 就能比较出来
+> 2. 实验控制在 20 个左右, 可以调用 API,
+
+**实现与实验：**
+- 新增 `src.pipeline.h2r_seedance_sam3_eval`：读取 Seedance `seedance_results.jsonl`，
+  用 SAM3.1 prompt `human hand,bare human hand,human fingers` 分割 final 视频中的人手，
+  与 Seedance 输入侧 `target_mask_video_path` 对齐统计
+  `target_covered_by_hand_ratio`、`hand_on_target_ratio`、`mean_iou` 等指标，并写出
+  `sam3_hand_green_target_red_contour.mp4` overlay 供人工复核。
+- `scripts/flip_run.sh` 新增 `h2r_seedance_sam3_eval` 子命令，使用 `sam3` conda 环境运行
+  评估入口。
+- `src.pipeline.h2r_seedance_sam3_edit` 从固定红色全臂 marker 扩展为通用 marker-mask
+  smoke：支持 `--mask-filter full|dark`、`--marker-color red|magenta|cyan|yellow|green`、
+  `--annotation-mode fill|outline|bbox`。默认 prompt 模板改为使用 `{marker_desc}` 和
+  `{task_name}`，避免 marker 颜色/形态变化后 prompt 仍写死“红色装置”。
+- `src.pipeline.h2r_sam3_precompute` 新增 `--prompt-frame-position first|middle|<int>`；
+  可在每个 17 帧 SAM3.1 clip 中选择非首帧做 text prompt。末帧 prompt 不作为稳定路径，
+  因为 SAM3.1 从最后一帧反向传播时会出现缓存缺失异常。
+- `src.pipeline.seedance_gen` 新增环境变量 `ARK_REQUEST_TIMEOUT`，默认从 30s 提高到
+  120s，避免 Seedance 创建任务请求慢时被本地 urllib 超时误判失败。
+
+**运行结果：**
+- 先用 SAM3.1 `robot gripper` / `black gripper` prompt 分割夹爪，first-frame 与
+  middle-frame 两轮 smoke 的目标 mask 均为空；当前放弃直接 text prompt 夹爪分割。
+- 改用已有 `robot arm` mask 与暗像素相交：`--mask-filter dark --dark-threshold 80`。
+  dry-run 的 target 平均面积约为 `grab_both_cubes_v1=3774px`、
+  `grab_cup_v1=2940px`、`roll=1381px`，三条样本均有 100+ 非空帧。
+- API 实验控制在 20 次以内：第一批 15 次 Seedance 成功生成，另有 3 次创建任务请求在
+  30s timeout 后失败且没有返回 task id；后续沿黄/紫框方向追加 2 次单样本成功生成，
+  总成功数为 17。第一批成功实验目录为：
+  `tmp/h2r_seedance_sam3_exp01b_dark_magenta_fill/`、
+  `tmp/h2r_seedance_sam3_exp02_dark_cyan_fill/`、
+  `tmp/h2r_seedance_sam3_exp03_dark_yellow_outline/`、
+  `tmp/h2r_seedance_sam3_exp04_dark_yellow_bbox/`、
+  `tmp/h2r_seedance_sam3_exp05_dark_magenta_bbox/`。
+- SAM3.1 评估汇总写入 `tmp/h2r_seedance_sam3_experiment_summary.csv`；对应评估目录为
+  `tmp/h2r_seedance_sam3_eval_exp01b_dark_magenta_fill/`、
+  `tmp/h2r_seedance_sam3_eval_exp02_dark_cyan_fill/`、
+  `tmp/h2r_seedance_sam3_eval_exp03_dark_yellow_outline/`、
+  `tmp/h2r_seedance_sam3_eval_exp04_dark_yellow_bbox/`、
+  `tmp/h2r_seedance_sam3_eval_exp05_dark_magenta_bbox/`。
+- 三样本平均指标中，`exp04_dark_yellow_bbox` 最好：
+  `target_covered_by_hand_ratio=0.507`、`hand_on_target_ratio=0.207`、
+  `mean_iou=0.156`、`mean_hand_area_px=6893.5`。
+  `grab_cup_v1` 单条最好的是 `exp01b_dark_magenta_fill`。
+
+**当前结论：**
+- dark gripper target + marker 显著优于全臂红色 baseline；全臂 baseline 的平均
+  `target_covered_by_hand_ratio` 只有 `0.062`。
+- 但当前最佳的 `hand_on_target_ratio` 仍偏低，说明 Seedance 输出里可能还有额外人手、
+  手臂过大或 SAM3.1 hand false positive。该路线暂不能作为训练数据生产路径。
+- 人工优先复核：
+  `tmp/h2r_seedance_sam3_eval_exp04_dark_yellow_bbox/*/sam3_hand_green_target_red_contour.mp4`
+  以及
+  `tmp/h2r_seedance_sam3_eval_exp01b_dark_magenta_fill/grab_cup_v1_ep000000_f000000/sam3_hand_green_target_red_contour.mp4`。
+
+**2026-06-13 追加：回到黄框/紫框方向**
+- 用户反馈此前黄色和紫色方框效果相对更好，要求继续沿这个方向尝试。
+- 先验证一个非 bbox 方向：`exp06_dark_skin_fill_one` 把暗色夹爪区域预填成肤色，只跑
+  `grab_both_cubes_v1` 单条。Seedance API 成功，但 SAM3.1 hand eval 为 0：
+  `target_covered_by_hand_ratio=0.0`、`hand_on_target_ratio=0.0`、`mean_iou=0.0`。
+  结论：肤色预填不是有效方向。
+- 新增 `src.pipeline.h2r_seedance_sam3_edit` 的实验选项：
+  `--mask-filter distal_dark`、`--distal-max-area`、`--distal-max-aspect`、
+  `--distal-temporal-weight`，以及 `--marker-color skin`。`distal_dark` 能缩小暗色区域，
+  但 dry-run contact sheet 显示个别帧仍会跳到桌面黑色长条或线缆，因此暂不烧 API。
+- 沿黄框方向跑 `exp07_dark_yellow_bbox_strict_prompt`：保持 `dark + yellow bbox`，
+  但 prompt 明确“黄色方框只是定位标记，输出不要保留方框，只在方框内删除黑色两指夹爪”。
+  三条 API 3/3 成功，评估为明显负结果：
+  平均 `target_covered_by_hand_ratio=0.0017`、`hand_on_target_ratio=0.0021`、
+  `mean_iou=0.0008`。
+- 结论更新：继续优先黄/紫 `bbox`，但不要把 prompt 收得太硬；当前最佳仍是
+  `exp04_dark_yellow_bbox` 的自然描述 prompt。下一轮若继续烧 API，应小步改
+  bbox 尺寸、颜色或任务动作短语，而不是改成肤色预填或强约束“只在方框内”。
+
+**2026-06-13 追加：黄框放大与紫/黄双框验证**
+- 新增 `src.pipeline.h2r_seedance_sam3_edit --annotation-mode fill_bbox|dual_bbox`：
+  `fill_bbox` 可填充目标并叠加第二颜色方框，`dual_bbox` 只画两层方框，例如
+  `--marker-color magenta --bbox-marker-color yellow` 生成紫色内框 + 黄色外框；
+  新增 `--secondary-bbox-extra-pixels` 控制第二层框外扩距离。`dual_bbox` 必须显式设置
+  `--bbox-marker-color`，否则直接报错。
+- 先离线生成 contact sheet：
+  `tmp/h2r_seedance_sam3_bbox_candidate_contact_sheet.jpg` 与
+  `tmp/h2r_seedance_sam3_dual_bbox_contact_sheet.jpg`。紫色填充 + 黄色框会把白色机械臂也染色，
+  风险较高；紫/黄双框不填充，输入看起来更干净。
+- API 低成本验证 2 条单样本 `grab_cup_v1`：
+  `tmp/h2r_seedance_sam3_exp08_yellow_bbox_big_cup/` 与
+  `tmp/h2r_seedance_sam3_exp09_dual_bbox_cup/`，评估目录分别为
+  `tmp/h2r_seedance_sam3_eval_exp08_yellow_bbox_big_cup/`、
+  `tmp/h2r_seedance_sam3_eval_exp09_dual_bbox_cup/`。
+- 自动评估更新版汇总写入
+  `tmp/h2r_seedance_sam3_experiment_summary_updated.csv`。`exp08_yellow_bbox_big_cup`
+  的 `target_covered_by_hand_ratio=0.006`、`hand_on_target_ratio=0.004`、`mean_iou=0.002`；
+  视觉 contact sheet 中能看到清楚人手，但动作位置偏离原夹爪目标。
+  `exp09_dual_bbox_cup` 的 hand eval 全为 0，视觉上基本保留机器人。
+- 结论：不要继续扩展“更大黄框”或“紫/黄双层框”；当前黄/紫框方向仍以单色
+  `exp04_dark_yellow_bbox` / `exp05_dark_magenta_bbox` 为基线。如果继续调用 API，
+  应回到单色 bbox 并小幅改自然语言动作短语，而不是增加复杂图形标记。
+
+**2026-06-13 最终收口：回退到当前最优**
+- 用户要求停止继续探索并回退到当前最优方案。当前保留的最优 Seedance 方案为
+  `exp04_dark_yellow_bbox`：SAM3/SAM3.1 `robot arm` mask + 暗像素过滤夹爪 +
+  单色黄色 bbox + task-specific 自然 prompt。
+- ROI 放大方向只完成了 dry-run 输入检查，产物为
+  `tmp/h2r_seedance_sam3_roi_yellow_bbox_dryrun/` 和
+  `tmp/h2r_seedance_sam3_roi_input_contact_sheet.jpg`。检查发现部分帧的 ROI 黄框会框到白色
+  机械臂或整块 crop，目标不够干净，因此没有调用 Seedance API，也不纳入最终方案。
+- 未验证的 ROI 代码已回退；最终交付只保留已跑通并量化评估过的全画面
+  `h2r_seedance_sam3_edit.py`、`h2r_seedance_sam3_eval.py`、SAM3 mask 预计算改动和
+  Seedance request timeout 改动。
+
+## 2026-06-13
+
+**用户原始需求：**
+> 把其他参数在实验计划中补全，保持 `- 参数:` 的形式；启动第二阶段的训练，打开 eval Video。
+
+**直接修改：**
+- 更新 `实验计划.md`：补齐三阶段外观编辑训练的通用参数、W&B 参数、eval video 参数、LoRA target modules、stage 间 `merge-lora` 连接方式和第一阶段已完成 ckpt 路径。
+- 第二阶段计划使用空闲单卡、`batch size: 2`、`eval-video step: 50`、W&B 视频上传开启，并显式关闭 Frechet 在线指标以降低 2s/rank256 训练的显存风险。

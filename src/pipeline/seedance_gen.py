@@ -46,6 +46,7 @@ FFPROBE = os.environ.get(
     "FFPROBE_BIN",
     "/home/leadtek/miniconda3/envs/flip/bin/ffprobe",
 )
+ARK_REQUEST_TIMEOUT = float(os.environ.get("ARK_REQUEST_TIMEOUT", "120"))
 
 DEFAULT_PROMPT = (
     "将视频中的机器人完全替换为真人。真人为亚洲男性，穿白色短袖T恤，黑色长裤，灰色拖鞋。"
@@ -145,7 +146,7 @@ def ark_request(method: str, endpoint: str, api_key: str,
     proxy_handler = urllib.request.ProxyHandler({})
     opener = urllib.request.build_opener(proxy_handler)
     try:
-        with opener.open(req, timeout=30) as resp:
+        with opener.open(req, timeout=ARK_REQUEST_TIMEOUT) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
         err_body = e.read().decode()

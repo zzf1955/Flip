@@ -253,7 +253,13 @@ def run_prompt_once(
     prompt: str,
     frame_count: int,
     output_prob_thresh: float,
+    prompt_frame_index: int,
 ) -> tuple[np.ndarray, list[dict]]:
+    if prompt_frame_index < 0 or prompt_frame_index >= frame_count - 1:
+        raise ValueError(
+            f"prompt_frame_index must be in [0, {frame_count - 2}] for stable SAM3.1 "
+            f"forward/backward propagation, got {prompt_frame_index}"
+        )
     response = predictor.handle_request(
         {
             "type": "start_session",
@@ -267,23 +273,38 @@ def run_prompt_once(
             {
                 "type": "add_prompt",
                 "session_id": session_id,
-                "frame_index": 0,
+                "frame_index": prompt_frame_index,
                 "text": prompt,
                 "output_prob_thresh": output_prob_thresh,
             }
         )
         outputs_by_frame = {first["frame_index"]: first["outputs"]}
+        forward_count = frame_count - prompt_frame_index
         for item in predictor.handle_stream_request(
             {
                 "type": "propagate_in_video",
                 "session_id": session_id,
                 "propagation_direction": "forward",
-                "start_frame_index": 0,
-                "max_frame_num_to_track": frame_count,
+                "start_frame_index": prompt_frame_index,
+                "max_frame_num_to_track": forward_count,
                 "output_prob_thresh": output_prob_thresh,
             }
         ):
             outputs_by_frame[item["frame_index"]] = item["outputs"]
+
+        if prompt_frame_index > 0:
+            backward_count = prompt_frame_index + 1
+            for item in predictor.handle_stream_request(
+                {
+                    "type": "propagate_in_video",
+                    "session_id": session_id,
+                    "propagation_direction": "backward",
+                    "start_frame_index": prompt_frame_index,
+                    "max_frame_num_to_track": backward_count,
+                    "output_prob_thresh": output_prob_thresh,
+                }
+            ):
+                outputs_by_frame[item["frame_index"]] = item["outputs"]
 
         first_frame = np.asarray(Image.open(frame_dir / "00000.jpg").convert("RGB"))
         height, width = first_frame.shape[:2]
@@ -316,16 +337,38 @@ def run_sam3_clip(
     backup_prompt: str,
     frame_count: int,
     output_prob_thresh: float,
+    prompt_frame_index: int,
 ) -> tuple[np.ndarray, str, list[dict]]:
     masks, summary = run_prompt_once(
-        predictor, frame_dir, prompt, frame_count, output_prob_thresh
+        predictor, frame_dir, prompt, frame_count, output_prob_thresh, prompt_frame_index
     )
     if int(masks.astype(bool).sum()) > 0 or not backup_prompt:
         return masks, prompt, summary
     backup_masks, backup_summary = run_prompt_once(
-        predictor, frame_dir, backup_prompt, frame_count, output_prob_thresh
+        predictor,
+        frame_dir,
+        backup_prompt,
+        frame_count,
+        output_prob_thresh,
+        prompt_frame_index,
     )
     return backup_masks, backup_prompt, backup_summary
+
+
+def resolve_prompt_frame_index(frame_count: int, position: str) -> int:
+    key = position.strip().lower()
+    if key == "first":
+        index = 0
+    elif key == "middle":
+        index = frame_count // 2
+    else:
+        index = int(key)
+    if index < 0 or index >= frame_count - 1:
+        raise ValueError(
+            f"--prompt-frame-position={position!r} resolves to {index}, but stable "
+            f"SAM3.1 propagation requires a prompt frame in [0, {frame_count - 2}]"
+        )
+    return index
 
 
 def output_path_for_episode(output_root: Path, episode: EpisodeInfo) -> Path:
@@ -390,6 +433,9 @@ def process_episode(args: argparse.Namespace, predictor, episode: EpisodeInfo) -
         frame_paths = extract_clip_frames(
             episode.video_path, clip.source_indices, frame_dir
         )
+        prompt_frame_index = resolve_prompt_frame_index(
+            len(frame_paths), args.prompt_frame_position
+        )
         clip_masks, used_prompt, frame_summary = run_sam3_clip(
             predictor,
             frame_dir,
@@ -397,6 +443,7 @@ def process_episode(args: argparse.Namespace, predictor, episode: EpisodeInfo) -
             args.backup_prompt,
             len(frame_paths),
             args.output_prob_thresh,
+            prompt_frame_index,
         )
         for local_index, source_index in enumerate(clip.source_indices):
             masks_full[source_index] = np.maximum(
@@ -408,6 +455,7 @@ def process_episode(args: argparse.Namespace, predictor, episode: EpisodeInfo) -
                 "clip_index": clip.clip_index,
                 "start_frame": clip.start_frame,
                 "source_indices": list(clip.source_indices),
+                "prompt_frame_index": int(prompt_frame_index),
                 "prompt": used_prompt,
                 "nonempty_frames": int(np.count_nonzero(clip_masks.reshape(len(clip_masks), -1).sum(axis=1))),
                 "area_sum": int(clip_masks.astype(bool).sum()),
@@ -424,6 +472,7 @@ def process_episode(args: argparse.Namespace, predictor, episode: EpisodeInfo) -
         clip_starts=np.array([clip.start_frame for clip in clips], dtype=np.int32),
         prompt=np.array(args.prompt),
         backup_prompt=np.array(args.backup_prompt),
+        prompt_frame_position=np.array(args.prompt_frame_position),
         task=np.array(episode.task),
         episode=np.array(episode.episode),
         video_path=np.array(str(episode.video_path)),
@@ -492,6 +541,11 @@ def main() -> None:
     parser.add_argument("--camera-key", default="robot_camera")
     parser.add_argument("--prompt", default="robot arm")
     parser.add_argument("--backup-prompt", default="robotic arm")
+    parser.add_argument(
+        "--prompt-frame-position",
+        default="first",
+        help="local SAM3 prompt frame inside each 17-frame clip: first, middle, or an integer before the last frame",
+    )
     parser.add_argument("--sam3-version", default="sam3.1", choices=["sam3", "sam3.1"])
     parser.add_argument("--max-num-objects", type=int, default=1)
     parser.add_argument("--multiplex-count", type=int, default=16)
@@ -541,6 +595,7 @@ def main() -> None:
     print(f"  output:   {args.output_root}")
     print(f"  prompt:   {args.prompt}")
     print(f"  backup:   {args.backup_prompt or '<none>'}")
+    print(f"  prompt frame: {args.prompt_frame_position}")
     if args.dry_run:
         by_task: dict[str, int] = {}
         for row in planned:
@@ -565,6 +620,7 @@ def main() -> None:
             "sam3_version": args.sam3_version,
             "prompt": args.prompt,
             "backup_prompt": args.backup_prompt,
+            "prompt_frame_position": args.prompt_frame_position,
             "target_fps": TARGET_FPS,
             "clip_seconds": args.clip_seconds,
             "clip_stride": args.clip_stride,

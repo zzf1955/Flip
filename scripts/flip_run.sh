@@ -19,6 +19,8 @@ Subcommands:
   sam2_precompute  Run python -m src.pipeline.sam2_precompute.
   h2r_sam3_precompute
                    Run python -m src.pipeline.h2r_sam3_precompute with the sam3 env.
+  h2r_seedance_sam3_eval
+                   Run python -m src.pipeline.h2r_seedance_sam3_eval with the sam3 env.
   g1_sam3_precompute
                    Run python -m src.pipeline.g1_sam3_precompute with the sam3 env.
   h2r_sam3_blur_pair
@@ -100,7 +102,7 @@ case "$subcommand" in
   nvidia-smi)
     exec nvidia-smi "$@"
     ;;
-  mitty_cache|sam2_precompute|h2r_sam3_precompute|g1_sam3_precompute|h2r_sam3_blur_pair|r2h_synthesize|masquerade_baseline|syn_error_analysis|wan_vae_idm|wan_pair_idm|humanoid_pair_idm|h2r_diffusion_policy|adaworld_action_encoder|adaworld_action_decoder|train|train_mitty_mixed_h2r|eval_mitty)
+  mitty_cache|sam2_precompute|h2r_sam3_precompute|h2r_seedance_sam3_eval|g1_sam3_precompute|h2r_sam3_blur_pair|r2h_synthesize|masquerade_baseline|syn_error_analysis|wan_vae_idm|wan_pair_idm|humanoid_pair_idm|h2r_diffusion_policy|adaworld_action_encoder|adaworld_action_decoder|train|train_mitty_mixed_h2r|eval_mitty)
     ;;
   *)
     usage >&2
@@ -163,6 +165,9 @@ case "$subcommand" in
     ;;
   h2r_sam3_precompute)
     exec "$SAM3_PYTHON_BIN" -m src.pipeline.h2r_sam3_precompute "${script_args[@]}"
+    ;;
+  h2r_seedance_sam3_eval)
+    exec "$SAM3_PYTHON_BIN" -m src.pipeline.h2r_seedance_sam3_eval "${script_args[@]}"
     ;;
   g1_sam3_precompute)
     exec "$SAM3_PYTHON_BIN" -m src.pipeline.g1_sam3_precompute "${script_args[@]}"
