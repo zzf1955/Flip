@@ -1802,3 +1802,54 @@
 
 **状态：**
 - 只创建 pending task；未实现脚本、未生成数据、未创建分支、未启动训练。
+
+## 2026-06-13 — G1 2s Seedance 滑窗与 cache 补全任务发布
+
+**用户原始需求：**
+> 发布一个新的 task，把 G1 2s 的 Seedance 滑窗切片 / VAE Cache / T5 Cache 全部补全。
+
+**创建的任务：**
+- [078] G1 2s Seedance 滑窗切片与训练 cache 补全
+
+**状态：**
+- 创建 task078，默认不覆盖 task076 的 `2s61f30` 产物；以新的
+  `2s61f30_slide` 口径收口 Seedance 滑窗、三阶段 pair layout、T5 cache 和 VAE cache。
+
+## 2026-06-13 — G1 2s Seedance 滑窗与三阶段 cache 补全
+
+**用户原始需求：**
+> 发布一个新的 task，把 G1 2s 的 Seedance 滑窗切片 / VAE Cache / T5 Cache 全部补全。
+> build
+
+**交付状态：**
+- 已完成 `doc/tasks/done/078.md`，开发 worktree 为 `.worktrees/t078`，
+  分支为 `feat/t078-g1-2s-seedance-cache`。
+- 新增 `src.pipeline.g1_2s_seedance_slide_data`，以新的 duration label
+  `2s61f30_slide` 和 `training_data/g1_2s61f30_seedance_slide/` step layout
+  生成数据，不覆盖 task076 的 `2s61f30`。
+- 注册三阶段训练 preset：
+  `identity_r2r_2s61f30_slide`、`blur_r2r_2s61f30_slide`、
+  `h2r_2s61f30_slide`。
+- 扩展 `src.pipeline.mitty_cache`：identity 同文件输入/目标只做一次 VAE encode；
+  `blur_r2r` 可通过 `--target-cache-dir` 复用 identity 的 `robot_latent`。
+
+**最终数量：**
+- Step2 origin / blur：各 10908 条，三任务分布为 Collect 1186、Pillow 1928、
+  Washing 7794。
+- Step1 origin / human：各 210 条，三任务分布为 Collect 40、Pillow 15、Washing 155；
+  默认 0.5s stride 起点分布为 `{0: 42, 15: 42, 30: 42, 45: 42, 59: 42}`。
+- Pair / VAE cache：
+  - `identity_r2r/2s61f30_slide`：10908。
+  - `blur_r2r/2s61f30_slide`：10908。
+  - `h2r/2s61f30_slide`：210。
+- T5 cache：`identity_r2r`、`blur_r2r`、`h2r` 均各有 1 个 positive prompt cache
+  和 `negative.pth`。
+
+**验证：**
+- `compileall` 覆盖 `g1_2s_seedance_slide_data.py`、`train_config.py`、
+  `mitty_cache.py` 通过。
+- slide 数据入口 dry-run、小样本 smoke、全量数据 manifest/video 校验通过。
+- 最终 cache 校验通过：T5 embedding shape 为 `(1,512,4096)`；VAE latent shape 为
+  `(1,48,16,30,40)`；pair/cache manifest 与 `.pth` 文件数量一致；identity 抽样
+  `human_latent == robot_latent`；blur/Washing tail 抽样 target latent 与 identity
+  cache 一致。

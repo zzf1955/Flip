@@ -23,6 +23,9 @@ Usage:
     # T5 cache is written to --t5-cache-dir. If omitted, it is inferred from
     # --output, e.g. training_data/cache/vae/pair_1s/train ->
     # training_data/cache/t5/pair_1s.
+    #
+    # When another pair-aligned cache already contains the target/video side,
+    # --target-cache-dir reuses its robot_latent by pair_NNNN filename.
 
 Legacy (old format with embedded T5 + frames):
     python -m src.pipeline.mitty_cache \\
@@ -203,33 +206,44 @@ def encode_pair_batch(vae, human_videos: list[np.ndarray],
 
 
 BatchItem = tuple[int, dict, Path, str]
-DecodedItem = tuple[BatchItem, np.ndarray, np.ndarray]
-DecodedBatch = tuple[list[BatchItem], list[np.ndarray], list[np.ndarray]]
+DecodedItem = tuple[BatchItem, np.ndarray, np.ndarray, bool]
+DecodedBatch = tuple[list[BatchItem], list[np.ndarray], list[np.ndarray], list[bool]]
 
 
-def decode_item(pair_dir: Path, item: BatchItem) -> DecodedItem:
+def decode_item(pair_dir: Path, item: BatchItem,
+                decode_robot: bool = True) -> DecodedItem:
     """Decode one paired sample on CPU for later batch assembly."""
     _, row, _, _ = item
-    human_video = load_video_as_rgb_array(str(pair_dir / row["control_video"]))
-    robot_video = load_video_as_rgb_array(str(pair_dir / row["video"]))
-    return item, human_video, robot_video
+    human_path = pair_dir / row["control_video"]
+    robot_path = pair_dir / row["video"]
+    same_video = os.path.samefile(human_path, robot_path)
+    human_video = load_video_as_rgb_array(str(human_path))
+    if not decode_robot:
+        robot_video = human_video
+    elif same_video:
+        robot_video = human_video
+    else:
+        robot_video = load_video_as_rgb_array(str(robot_path))
+    return item, human_video, robot_video, same_video
 
 
-def decode_batch(pair_dir: Path, batch_items: list[BatchItem]) -> DecodedBatch:
+def decode_batch(pair_dir: Path, batch_items: list[BatchItem],
+                 decode_robot: bool = True) -> DecodedBatch:
     """Decode a batch of paired videos on CPU for later GPU VAE encoding."""
-    decoded = [decode_item(pair_dir, item) for item in batch_items]
-    items = [item for item, _, _ in decoded]
-    human_videos = [human_video for _, human_video, _ in decoded]
-    robot_videos = [robot_video for _, _, robot_video in decoded]
-    return items, human_videos, robot_videos
+    decoded = [
+        decode_item(pair_dir, item, decode_robot=decode_robot)
+        for item in batch_items
+    ]
+    return assemble_decoded_batch(decoded)
 
 
 def assemble_decoded_batch(decoded: list[DecodedItem]) -> DecodedBatch:
     """Assemble decoded per-sample items into one ordered batch."""
-    batch_items = [item for item, _, _ in decoded]
-    human_videos = [human_video for _, human_video, _ in decoded]
-    robot_videos = [robot_video for _, _, robot_video in decoded]
-    return batch_items, human_videos, robot_videos
+    batch_items = [item for item, _, _, _ in decoded]
+    human_videos = [human_video for _, human_video, _, _ in decoded]
+    robot_videos = [robot_video for _, _, robot_video, _ in decoded]
+    same_videos = [same_video for _, _, _, same_video in decoded]
+    return batch_items, human_videos, robot_videos, same_videos
 
 
 def save_cache_item(out_path: Path, data: dict):
@@ -347,6 +361,36 @@ def _write_jsonl(path: Path, rows: list[dict]):
             fh.write(json.dumps(row, sort_keys=True) + "\n")
 
 
+def load_robot_latents_from_cache(
+    target_cache_dir: Path,
+    batch_items: list[BatchItem],
+    expected_tail_shape: tuple[int, ...],
+) -> torch.Tensor:
+    """Load target-side robot latents from an existing pair-aligned cache."""
+    latents = []
+    for _, _, _, name in batch_items:
+        cache_path = target_cache_dir / f"{name}.pth"
+        if not cache_path.is_file():
+            raise FileNotFoundError(
+                f"Missing target cache for {name}: {cache_path}")
+        cache = torch.load(str(cache_path), map_location="cpu")
+        if "robot_latent" not in cache:
+            raise KeyError(f"robot_latent missing in target cache: {cache_path}")
+        latent = cache["robot_latent"]
+        if latent.ndim != 5 or latent.shape[0] != 1:
+            raise ValueError(
+                f"Unexpected robot_latent rank in {cache_path}: "
+                f"{tuple(latent.shape)}"
+            )
+        if tuple(latent.shape[1:]) != expected_tail_shape:
+            raise ValueError(
+                f"Unexpected robot_latent shape in {cache_path}: "
+                f"{tuple(latent.shape)}, expected tail {expected_tail_shape}"
+            )
+        latents.append(latent.to(dtype=torch.bfloat16))
+    return torch.cat(latents, dim=0)
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Encode pair videos + prompt to .pth cache for Mitty training")
@@ -370,6 +414,9 @@ def main():
                     help="max decoded batches buffered ahead of GPU encode")
     ap.add_argument("--save-workers", type=int, default=1,
                     help="threads for async .pth writes in new cache format")
+    ap.add_argument("--target-cache-dir", default="",
+                    help=("optional pair-aligned VAE cache dir to reuse "
+                          "robot_latent for the target/video side"))
     ap.add_argument("--cpu-affinity", default="",
                     help="optional CPU list for this process, e.g. 0-17,72-89")
     args = ap.parse_args()
@@ -389,6 +436,8 @@ def main():
             "--legacy only supports --batch-size 1, --prefetch-workers 0, "
             "and --save-workers 1"
         )
+    if args.legacy and args.target_cache_dir:
+        raise ValueError("--target-cache-dir is only supported in new cache format")
 
     apply_cpu_affinity(args.cpu_affinity)
 
@@ -400,6 +449,14 @@ def main():
     pair_dir = Path(args.pair_dir).resolve()
     output_dir = Path(args.output).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    target_cache_dir = None
+    if args.target_cache_dir:
+        if not os.path.isabs(args.target_cache_dir):
+            args.target_cache_dir = os.path.join(MAIN_ROOT, args.target_cache_dir)
+        target_cache_dir = Path(args.target_cache_dir).resolve()
+        if not target_cache_dir.is_dir():
+            raise NotADirectoryError(
+                f"--target-cache-dir does not exist: {target_cache_dir}")
 
     t5_dir = args.t5_cache_dir
     if not t5_dir:
@@ -440,6 +497,8 @@ def main():
     print(f"Batch:    {args.batch_size}")
     print(f"Prefetch: workers={args.prefetch_workers} batches={args.prefetch_batches}")
     print(f"Save:     workers={args.save_workers}")
+    if target_cache_dir is not None:
+        print(f"Target:   reuse robot_latent from {target_cache_dir}")
 
     # In new mode, T5 is only needed if cache files don't exist yet
     need_t5 = args.legacy or not all(
@@ -558,11 +617,19 @@ def main():
         def process_decoded_batch(save_pool: ThreadPoolExecutor,
                                   decoded: DecodedBatch):
             nonlocal encoded
-            batch_items, human_videos, robot_videos = decoded
+            batch_items, human_videos, robot_videos, same_videos = decoded
             t0 = time.time()
             human_lats = encode_video_array_batch(vae, human_videos, args.device).cpu()
             t_human = time.time()
-            robot_lats = encode_video_array_batch(vae, robot_videos, args.device).cpu()
+            if target_cache_dir is not None:
+                robot_lats = load_robot_latents_from_cache(
+                    target_cache_dir, batch_items,
+                    expected_tail_shape=tuple(human_lats.shape[1:]),
+                )
+            elif all(same_videos):
+                robot_lats = human_lats
+            else:
+                robot_lats = encode_video_array_batch(vae, robot_videos, args.device).cpu()
             t_robot = time.time()
 
             for batch_idx, (_, row, out_path, _) in enumerate(batch_items):
@@ -600,7 +667,12 @@ def main():
             if args.prefetch_workers == 0:
                 for batch_items in batches:
                     process_decoded_batch(
-                        save_pool, decode_batch(pair_dir, batch_items))
+                        save_pool,
+                        decode_batch(
+                            pair_dir, batch_items,
+                            decode_robot=target_cache_dir is None,
+                        ),
+                    )
             else:
                 with ThreadPoolExecutor(
                     max_workers=args.prefetch_workers,
@@ -616,7 +688,10 @@ def main():
                         except StopIteration:
                             break
                         item_futures.append(
-                            decode_pool.submit(decode_item, pair_dir, item))
+                            decode_pool.submit(
+                                decode_item, pair_dir, item,
+                                target_cache_dir is None,
+                            ))
 
                     decoded_batch: list[DecodedItem] = []
                     while item_futures:
@@ -627,7 +702,10 @@ def main():
                             item = None
                         if item is not None:
                             item_futures.append(
-                                decode_pool.submit(decode_item, pair_dir, item))
+                                decode_pool.submit(
+                                    decode_item, pair_dir, item,
+                                    target_cache_dir is None,
+                                ))
                         if len(decoded_batch) == args.batch_size:
                             process_decoded_batch(
                                 save_pool, assemble_decoded_batch(decoded_batch))
