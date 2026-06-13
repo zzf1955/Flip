@@ -65,6 +65,7 @@ eval_metrics.py    ← torch, skimage, transformers (CLIP)
 | `sam2_segment.py` | SAM2 多部位分割实验 | episode 视频 | `output/inpaint/sam2_segment/` |
 | `sam2_precompute.py` | SAM2 mask 预计算（FK bbox prompt → SAM2 propagation → npz） | segment 视频 | `training_data/sam2_mask/` |
 | `batch_sam2_precompute.py` | sam2_precompute 多 GPU 调度（多 worker/GPU） | 多 task | `training_data/sam2_mask/` |
+| `g1_sam3_precompute.py` | G1 segment SAM3/SAM3.1 mask smoke / 预计算；通过 `sam3` conda 环境按短 chunk 调用 text prompt，支持 `--prompt-list` sweep 和 `--prompt-mode text_bbox` 二阶段 bbox prompt，写出 segment 级 `.npz`、summary 和可选 overlay；当前 smoke 结论是 61 帧单 session 会 OOM，纯 SAM3 prompt 不能干净替代 SAM2 全身 mask | `training_data/segment/<task>/ep*/seg*_video.mp4` + `ref-sam3` / SAM3.1 checkpoint | `training_data/g1_sam3_mask/<task>/ep*/seg*.npz` 或 `tmp/g1_sam3_*` |
 | `batch_inpaint.py` | 多 GPU 批量修复调度 | 多 task/episode | 自定义 |
 | `video_inpaint.py` | 逐帧 FK + GrabCut + LaMa | episode 视频 | `output/inpaint/per_frame_lama/` |
 

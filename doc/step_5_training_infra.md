@@ -1013,6 +1013,48 @@ scripts/flip_run.sh h2r_sam3_blur_pair -- \
 `14x26`，能和 Wan/Mitty 训练前向输出对齐。不要使用 `240x432` 这类会得到
 `15x27` 奇数 latent grid 的尺寸；训练 loss 阶段会因预测/目标 latent 尺寸不一致而失败。
 
+### G1 SAM3 blur_r2r smoke 结论
+
+task079 新增了 `src.pipeline.g1_sam3_precompute`，用于验证 G1 segment 视频能否用
+SAM3/SAM3.1 直接生成 blur mask。该入口通过 `scripts/flip_run.sh g1_sam3_precompute`
+使用 `sam3` conda 环境运行，读取：
+
+```text
+training_data/segment/<task>/<episode>/seg*_video.mp4
+```
+
+输出 segment 级 mask artifact：
+
+```text
+training_data/g1_sam3_mask/<task>/<episode>/<seg>.npz
+```
+
+smoke 详情见 `doc/sam3_g1_segmentation.md`。截至 2026-06-13 的结论是：
+
+- 先查全卡显存后在 GPU1 测试；GPU0 只有约 1.4GiB free，不适合跑 SAM3。
+- G1 2s 的 61 帧作为一个 SAM3.1 video session 会 OOM；传播到约第 16 帧时，
+  SAM3 进程约占 19.28GiB，尝试再分配 1.27GiB 失败。
+- 61 帧拆成 17 帧短 chunk 可以跑通，三任务各 1 个 segment 的 smoke 无 OOM。
+- text-only prompt 不能干净替代当前 SAM2 全身 blur mask：
+  - `robot` 聚合 `mean_nonempty_frame_ratio=0.574`、`mean_sam2_iou=0.301`，是
+    当前 text-only prompt 里最高；但 Collect Clothes 面积约为 SAM2 的 2.29x，
+    Washing Machine 任务 61 帧全空。
+  - `mechanical arm` 聚合 IoU 0.188，低于 `robot`，且 Washing Machine 全空。
+  - `robot arm` 聚合 `mean_nonempty_frame_ratio=0.601`、`mean_sam2_iou=0.123`，
+    更像局部 arm mask。
+  - `robot hand` 非空率 0.754，但平均面积只有 0.0052，明显不是全身 robot mask。
+  - `robot body`、`humanoid robot`、`Unitree G1 robot` 在三任务 smoke 中全空。
+- text->bbox 二阶段已测试：
+  - 纯 bbox prompt 可跑但 17 帧 smoke 输出全空。
+  - `bbox + 同 text prompt` 可产生 mask，但 61 帧聚合没有根本改善：
+    `robot` IoU 0.302，`mechanical arm` IoU 0.232；Washing Machine 仍全空。
+- 纯 SAM3.1 在 Washing Machine 上表现一般且不稳定：多数 prompt 全空，能出 mask 的
+  `robot arm` / `robotic arm` 只覆盖少量局部帧，不能作为干净的全身 robot blur mask。
+
+因此，G1 `blur_r2r` 不能直接全量切到纯 SAM3 prompt 方案。若继续推进 SAM3 mask，需要
+更强空间约束或质量控制，例如 SAM2/FK bbox seed、point/instance refine、跨 chunk
+质量过滤或任务级 prompt 策略；否则 stage2 blur 数据会出现漏 mask 或过分割。
+
 输出仍使用维护中的 Mitty layout：
 
 ```text
