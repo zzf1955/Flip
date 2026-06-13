@@ -1822,7 +1822,8 @@
 > build
 
 **交付状态：**
-- 已完成 `doc/tasks/done/078.md`，开发 worktree 为 `.worktrees/t078`，
+- 已完成并合入 `main`：实现 commit `e82a420`，merge commit `f57b377`。
+- 任务文档为 `doc/tasks/done/078.md`，开发 worktree 为 `.worktrees/t078`，
   分支为 `feat/t078-g1-2s-seedance-cache`。
 - 新增 `src.pipeline.g1_2s_seedance_slide_data`，以新的 duration label
   `2s61f30_slide` 和 `training_data/g1_2s61f30_seedance_slide/` step layout
