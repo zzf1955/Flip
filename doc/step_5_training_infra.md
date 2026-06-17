@@ -995,6 +995,161 @@ scripts/flip_run.sh h2r_diffusion_policy --cuda 1 -- eval \
 增加 video override，用同一 state/action label 固定 policy，只替换 GT / Ours /
 Mitty / Phantom video observation。
 
+#### G1 2s Pair Manifest Diffusion Policy
+
+`src.pipeline.h2r_diffusion_policy` 默认仍是 `--dataset-kind h2r_hdf5`，会读取旧
+H2R / HumanAndRobot HDF5；当前要跑 Unitree G1 2s 数据必须显式传
+`--dataset-kind g1_2s_pair`。该模式用于在 G1 `2s61f30_slide` robot-only 数据上
+训练同一个 action-only Diffusion Policy。
+推荐训练数据源是：
+
+```text
+training_data/pair/identity_r2r/2s61f30_slide/<task>/manifest.jsonl
+```
+
+这里的 `video` 是真实 robot target clip；默认三任务共 `10908` 个 2s / 61f30
+robot clips。`training_data/pair/h2r/2s61f30_slide/` 只有 `210` 条 Seedance
+human→robot pair，更适合后续固定 state/action label 做 video override 评估，不建议作为
+Diffusion Policy 主训练集。
+
+G1 2s 对齐口径必须按 manifest 显式字段走：
+
+- `source_frame_indices` 是 segment video 内的局部帧号，不是整条 episode 的全局
+  `frame_index`。
+- state 先从同一 segment 的
+  `training_data/segment/<task>/<episode>/<seg>_joints.parquet` 按局部帧号取行。
+- 上一步取到的 joints 行里有原始 LeRobot 全局 `frame_index`；action 再从
+  `data/unitree_G1_WBT/G1_WBT_<task>/data/chunk-*/*.parquet` 按
+  `episode_index` / 全局 `frame_index` 回查。
+- 默认 state 为
+  `observation.state.robot_q_current(36) + observation.state.hand_state(12)`，共 `48`
+  维。
+- 默认 action 为 `action.robot_q_desired(36) + action.hand_cmd(12)`，共 `48` 维。
+- action chunk 与 H2R 口径一致：历史 observation 的最后一帧为 `t`，监督
+  `action[t:t+pred_horizon]`。
+
+G1 hand command 有近常量维度；G1 分支默认 `--g1-norm-std-floor 0.01`，避免极小
+std 把近常量维度的微小抖动放大到训练输入中。该值会写入 checkpoint config 和
+dataset summary。
+
+训练和 eval 的 action 采样指标同时记录两个空间：
+
+- `sampled_action_mse_norm` / `sampled_action_mse_norm_per_horizon`：归一化
+  action 空间中的采样 MSE，用于观察 diffusion policy 自身是否在 normalized label
+  上收敛。
+- `sampled_action_mse_action`、`sampled_action_rmse_action`、
+  `sampled_action_relative_l2_action` / `*_per_horizon`：按 checkpoint 中的
+  action mean/std 反归一化回真实 action 空间后的绝对误差和 L2 相对误差，用于比较
+  控制量尺度下的实际偏差。`predictions.csv` 也会逐样本写出 `mse_action` 和
+  `relative_l2_action`。
+
+训练默认仍按 `denoise_loss` 保存 `best_checkpoint.pt`；如果要按真实 action 空间控制误差
+挑选 checkpoint，应在 G1 训练命令中显式加入：
+
+```bash
+--best-metric sampled_action_relative_l2_action
+```
+
+该指标只有开启 `--eval-sample-actions` 时才会产生；若未产生，训练会直接报错而不是静默
+回退到其它指标。
+
+Eval 默认使用 `--eval-sample-seed 12345` 的本地 torch generator 固定 denoising
+noise 和 action sampling noise；同一 checkpoint、同一 eval batch 范围会得到可复现的
+denoise loss 与 sampled action 指标。若要恢复随机采样行为，可设置
+`--eval-sample-seed -1`。
+
+G1 三任务 inspect 示例：
+
+```bash
+scripts/flip_run.sh h2r_diffusion_policy -- inspect \
+  --dataset-kind g1_2s_pair \
+  --device cpu \
+  --tasks all \
+  --g1-pair-root training_data/pair/identity_r2r/2s61f30_slide \
+  --resize 64x64 \
+  --batch-size 4 \
+  --workers 0 \
+  --train-sample-order episode \
+  --frame-stride 8 \
+  --output-json tmp/g1_dp_2s_inspect_all.json
+```
+
+当前三任务小样本 inspect 已确认：`clips_total=10908`，episode split 后
+`clips_train=8796`、`clips_val=2112`；batch shapes 为 video `[B,2,3,64,64]`、
+state `[B,2,48]`、action `[B,8,48]`。
+
+G1 smoke 训练示例：
+
+```bash
+scripts/flip_run.sh h2r_diffusion_policy --cuda 1 -- train \
+  --dataset-kind g1_2s_pair \
+  --device cuda:0 \
+  --tasks all \
+  --g1-pair-root training_data/pair/identity_r2r/2s61f30_slide \
+  --max-train-samples 32 \
+  --max-val-samples 16 \
+  --norm-max-frames 2000 \
+  --resize 64x64 \
+  --batch-size 4 \
+  --workers 0 \
+  --train-sample-order episode \
+  --frame-stride 8 \
+  --steps 12 \
+  --log-every 4 \
+  --eval-every 6 \
+  --eval-max-batches 1 \
+  --eval-sample-actions \
+  --diffusion-steps 8 \
+  --hidden-dim 64 \
+  --time-dim 32 \
+  --depth 2 \
+  --dropout 0.0 \
+  --lr 0.0003 \
+  --output-dir tmp/g1_dp_2s_smoke_floor1e2_lr3e4
+```
+
+该 smoke 的恢复 eval 通过：
+
+```bash
+scripts/flip_run.sh h2r_diffusion_policy --cuda 1 -- eval \
+  --device cuda:0 \
+  --checkpoint tmp/g1_dp_2s_smoke_floor1e2_lr3e4/last_checkpoint.pt \
+  --output-dir tmp/g1_dp_2s_smoke_floor1e2_lr3e4/eval_last \
+  --eval-max-batches 1 \
+  --prediction-batches 1
+```
+
+旧 smoke 输出 `denoise_loss=0.960461`、`sampled_action_mse_norm=1.897220`，并写出
+`eval_summary.json` / `predictions.csv`。新增 action-space 指标后应重新跑 G1 小样本
+和长训；该 smoke 只证明链路可用，不代表推荐最终控制指标。
+
+2026-06-13 参数试验均已确认数据源为 `g1_2s_pair_manifest`、三任务 `10908` clips、
+state/action `48` 维，不再读取 H2R：
+
+| run | 样本 / step | 关键参数 | 结果摘要 |
+| --- | --- | --- | --- |
+| `tmp/g1_dp_2s_metric_smoke_g1_s16_h64_d2_diff8_lr3e4` | 64 train / 32 val，16 steps | h64 d2 diff8 lr3e-4 | 链路和新指标 smoke；step16 `sampled_action_mse_norm=2.0681`，`sampled_action_relative_l2_action=0.6631`。 |
+| `tmp/g1_dp_2s_tune_g1_s160_h128_d4_diff16_lr3e4` | 512 train / 128 val，160 steps | h128 d4 diff16 dropout0.05 lr3e-4 | diff16 小试不占优；step160 `mse_norm=2.7588`，relative L2 `0.6987`。 |
+| `tmp/g1_dp_2s_tune_g1_s160_h128_d4_diff8_drop0_lr3e4` | 512 train / 128 val，160 steps | h128 d4 diff8 dropout0 lr3e-4 | 明显优于 diff16；best around step80，`mse_norm=2.5156`，relative L2 `0.6605`。 |
+| `tmp/g1_dp_2s_tune_g1_s160_h128_d4_diff8_drop0_lr1e4_bestrel` | 512 train / 128 val，160 steps | h128 d4 diff8 dropout0 lr1e-4，`--best-metric sampled_action_relative_l2_action` | 低学习率没有明显收益；best step80 relative L2 `0.6607`，final relative L2 `0.6673`。 |
+| `tmp/g1_dp_2s_long_g1_s1000_h128_d4_diff8_drop0_lr3e4_m4096_norm5k` | 4096 train / 512 val，1000 steps | h128 d4 diff8 dropout0 lr3e-4，frame_stride4，norm 5000 frames | 加 step 后指标基本平台化；train summary final `mse_norm=2.5580`，`mse_action=0.12145`，relative L2 `0.66357`。 |
+
+1000-step run 的 `last_checkpoint.pt` 恢复 eval 已通过：
+
+```bash
+scripts/flip_run.sh h2r_diffusion_policy --cuda 1 -- eval \
+  --device cuda:0 \
+  --checkpoint tmp/g1_dp_2s_long_g1_s1000_h128_d4_diff8_drop0_lr3e4_m4096_norm5k/last_checkpoint.pt \
+  --output-dir tmp/g1_dp_2s_long_g1_s1000_h128_d4_diff8_drop0_lr3e4_m4096_norm5k/eval_seed_c \
+  --eval-max-batches 4 \
+  --prediction-batches 2 \
+  --eval-sample-seed 12345
+```
+
+同一 checkpoint / seed 连跑两次 eval 指标一致：`denoise_loss=1.003447`、
+`sampled_action_mse_norm=2.788211`、`sampled_action_relative_l2_action=0.682433`。
+`predictions.csv` 已包含 `mse_norm`、`mse_action`、`relative_l2_action` 和 `source_id`。
+
 ### H2R SAM3 blur_r2r 外观训练复现
 
 当前 H2R 三阶段复现只覆盖前两步：

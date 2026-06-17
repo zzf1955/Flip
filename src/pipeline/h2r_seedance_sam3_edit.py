@@ -49,8 +49,24 @@ DEFAULT_PROMPT_TEMPLATE = (
     "人类手臂{task_name}"
 )
 DEFAULT_TASK_NAMES = {
-    "grab_both_cubes_v1": "抓起物块。",
+    "grab_both_cubes_v1": "抓起两个方块。",
+    "grab_cube2_v1": "抓起方块。",
     "grab_cup_v1": "抓起杯子。",
+    "grab_pencil1_v1": "抓起铅笔。",
+    "grab_pencil2_v1": "抓起铅笔。",
+    "grab_pencil_v1": "抓起铅笔。",
+    "grab_to_plate1_and_back_v1": "把物体放到盘子上再移回。",
+    "grab_to_plate1_v1": "把物体放到盘子上。",
+    "grab_to_plate2_and_back_v1": "把物体放到盘子上再移回。",
+    "grab_to_plate2_and_pull_v1": "把物体放到盘子上并拉动盘子。",
+    "grab_to_plate2_v1": "把物体放到盘子上。",
+    "grab_two_cubes2_v1": "抓起两个方块。",
+    "pull_plate_grab_cube": "拉动盘子并抓起方块。",
+    "pull_plate_v1": "拉动盘子。",
+    "push_box_common_v1": "推动盒子。",
+    "push_box_random_v1": "推动盒子。",
+    "push_box_two_v1": "推动两个盒子。",
+    "push_plate_v1": "推动盘子。",
     "roll": "滚动物体。",
 }
 RED_RGB = np.array([255, 0, 0], dtype=np.float32)

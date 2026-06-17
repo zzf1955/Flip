@@ -174,6 +174,7 @@ def clip_indices(start_frame: int, fps: float, clip_seconds: float) -> tuple[int
 
 
 def build_episode_clips(args: argparse.Namespace, episode: EpisodeInfo) -> list[ClipInfo]:
+    explicit_starts = getattr(args, "clip_starts_by_episode", None)
     stride_frames = int(round(args.clip_stride * episode.fps))
     if stride_frames <= 0:
         raise ValueError(f"--clip-stride is too small for fps={episode.fps}")
@@ -181,6 +182,37 @@ def build_episode_clips(args: argparse.Namespace, episode: EpisodeInfo) -> list[
     last_start = episode.frame_count - int(round(clip_seconds * episode.fps)) - 1
     if last_start < 0:
         return []
+
+    if explicit_starts is not None:
+        task_starts = explicit_starts.get(episode.task, {})
+        starts = task_starts.get(episode.episode)
+        if starts is None and episode.episode.startswith("episode_"):
+            starts = task_starts.get(episode.episode.removeprefix("episode_"))
+        if starts is None:
+            return []
+
+        clips = []
+        for clip_index, start_frame in enumerate(starts):
+            if start_frame < 0 or start_frame > last_start:
+                raise ValueError(
+                    f"explicit clip start {start_frame} is outside [0, {last_start}] "
+                    f"for {episode.task}/{episode.episode}"
+                )
+            indices = clip_indices(start_frame, episode.fps, clip_seconds)
+            if max(indices) >= episode.frame_count:
+                raise ValueError(
+                    f"explicit clip start {start_frame} produces source index "
+                    f"{max(indices)} >= frame_count {episode.frame_count} "
+                    f"for {episode.task}/{episode.episode}"
+                )
+            clips.append(
+                ClipInfo(
+                    clip_index=clip_index,
+                    start_frame=start_frame,
+                    source_indices=indices,
+                )
+            )
+        return clips
 
     clips = []
     for clip_index, start_frame in enumerate(range(0, last_start + 1, stride_frames)):
@@ -196,6 +228,42 @@ def build_episode_clips(args: argparse.Namespace, episode: EpisodeInfo) -> list[
     if args.max_clips_per_episode > 0:
         clips = clips[: args.max_clips_per_episode]
     return clips
+
+
+def load_clip_starts_file(path: Path) -> dict[str, dict[str, list[int]]]:
+    if not path.is_file():
+        raise FileNotFoundError(f"clip starts file not found: {path}")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"clip starts file must be a JSON object: {path}")
+    out: dict[str, dict[str, list[int]]] = {}
+    for task, task_payload in payload.items():
+        if not isinstance(task, str) or not task:
+            raise ValueError(f"clip starts task key must be a non-empty string: {path}")
+        if not isinstance(task_payload, dict):
+            raise ValueError(f"clip starts for task {task!r} must be an object: {path}")
+        episode_map: dict[str, list[int]] = {}
+        for episode, starts_payload in task_payload.items():
+            if not isinstance(episode, str) or not episode:
+                raise ValueError(
+                    f"clip starts episode key for task {task!r} must be a non-empty string: {path}"
+                )
+            if not isinstance(starts_payload, list) or not starts_payload:
+                raise ValueError(
+                    f"clip starts for {task}/{episode} must be a non-empty list: {path}"
+                )
+            starts: list[int] = []
+            for value in starts_payload:
+                if not isinstance(value, int):
+                    raise ValueError(
+                        f"clip start for {task}/{episode} must be an integer, got {value!r}"
+                    )
+                starts.append(value)
+            if len(set(starts)) != len(starts):
+                raise ValueError(f"duplicate clip starts for {task}/{episode}: {starts}")
+            episode_map[episode] = starts
+        out[task] = episode_map
+    return out
 
 
 def extract_clip_frames(
@@ -552,6 +620,16 @@ def main() -> None:
     parser.add_argument("--output-prob-thresh", type=float, default=0.5)
     parser.add_argument("--clip-seconds", type=float, default=1.0)
     parser.add_argument("--clip-stride", type=float, default=1.0)
+    parser.add_argument(
+        "--clip-starts-file",
+        type=Path,
+        default=None,
+        help=(
+            "optional JSON mapping task -> episode -> explicit 1s clip start frames; "
+            "used for tail-aligned Seedance batches that need mask coverage outside "
+            "the regular clip stride"
+        ),
+    )
     parser.add_argument("--max-episodes-per-task", type=int, default=0)
     parser.add_argument("--max-clips-per-episode", type=int, default=0)
     parser.add_argument("--max-episodes", type=int, default=0)
@@ -568,8 +646,19 @@ def main() -> None:
         raise ValueError(f"--max-num-objects must be positive, got {args.max_num_objects}")
     if args.multiplex_count <= 0:
         raise ValueError(f"--multiplex-count must be positive, got {args.multiplex_count}")
+    if args.clip_starts_file is not None:
+        args.clip_starts_file = (
+            args.clip_starts_file
+            if args.clip_starts_file.is_absolute()
+            else Path(MAIN_ROOT) / args.clip_starts_file
+        )
+        args.clip_starts_by_episode = load_clip_starts_file(args.clip_starts_file)
+    else:
+        args.clip_starts_by_episode = None
 
     episodes = discover_episodes(args)
+    if args.clip_starts_by_episode is not None:
+        episodes = [episode for episode in episodes if build_episode_clips(args, episode)]
     if args.max_episodes > 0:
         episodes = episodes[: args.max_episodes]
     planned = []
@@ -596,6 +685,8 @@ def main() -> None:
     print(f"  prompt:   {args.prompt}")
     print(f"  backup:   {args.backup_prompt or '<none>'}")
     print(f"  prompt frame: {args.prompt_frame_position}")
+    if args.clip_starts_file is not None:
+        print(f"  explicit starts: {args.clip_starts_file}")
     if args.dry_run:
         by_task: dict[str, int] = {}
         for row in planned:
@@ -621,6 +712,7 @@ def main() -> None:
             "prompt": args.prompt,
             "backup_prompt": args.backup_prompt,
             "prompt_frame_position": args.prompt_frame_position,
+            "clip_starts_file": str(args.clip_starts_file) if args.clip_starts_file else "",
             "target_fps": TARGET_FPS,
             "clip_seconds": args.clip_seconds,
             "clip_stride": args.clip_stride,

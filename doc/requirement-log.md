@@ -2214,3 +2214,61 @@
 **直接修改：**
 - 更新 `实验计划.md`：补齐三阶段外观编辑训练的通用参数、W&B 参数、eval video 参数、LoRA target modules、stage 间 `merge-lora` 连接方式和第一阶段已完成 ckpt 路径。
 - 第二阶段计划使用空闲单卡、`batch size: 2`、`eval-video step: 50`、W&B 视频上传开启，并显式关闭 Frechet 在线指标以降低 2s/rank256 训练的显存风险。
+
+## 2026-06-14
+
+**用户原始需求：**
+> 训练完了；之后训练 eval 时候加上 FID FVD；先测一下刚才训练的 FID FVD。
+
+**直接修改：**
+- 更新 `实验计划.md`：将通用 `eval-video-frechet-metrics` 改为 `true`，后续三阶段训练 eval video 默认开启 FID/FVD。
+- 标注第二阶段已完成 run 的 FID/FVD 需要用离线方式补算，避免误认为本次训练时已在线记录 Frechet 指标。
+
+**运行结果：**
+- 用 CPU 离线补算第二阶段 run 的 `step-2000` 全局 FID/FVD，输出到
+  `training_data/log/appearance_edit_2s_s2_blur_bs2-blur_r2r_2s61f30_slide-8972d_r256_self_qkvo_ffn_2000s_0613_223130/eval_metrics_fid_fvd_step2000_cpu.csv`。
+- `in_task`: `FID=35.03`、`FVD=16.12`、`n_samples=4`。
+- `ood`: `FID=79.30`、`FVD=37.17`、`n_samples=2`。
+
+**用户原始需求：**
+> 先只跑前四个任务，dryrun 确定没问题之后，调用 API 跑一下，输出到 tmp/。
+
+**直接修改：**
+- `src.pipeline.h2r_sam3_precompute` 新增 `--clip-starts-file`，支持显式指定 1s SAM3
+  clip start frames，用于 H2R Seedance 4s 分段和末尾倒数 4s 片段的 mask 覆盖。
+- `src.pipeline.h2r_seedance_sam3_edit` 补齐 H2R 19 个 task 的中文动作短语，避免批量
+  Seedance 运行时 task-specific prompt 因缺少 `{task_name}` 直接失败。
+- 新增 `tmp/h2r_seedance_batch4_clip_starts.json`，记录本轮前四个任务、每任务一个 episode
+  的 4s/tail-aligned Seedance 批量输入所需的最小 1s SAM3 clip starts。
+- 更新 `doc/scripts_inventory.md` 记录该参数用途。
+
+## 2026-06-14
+
+**用户原始需求：**
+> 合并前两阶段的 LoRA，跑外观编辑训练；训练 eval 带 FID/FVD，in-task/OOD eval 样本数量都是 8；先确定训练参数、指令、数据集和 train/eval 划分。
+
+**直接修改：**
+- 更新 `实验计划.md`：第三阶段 `h2r_2s61f30_slide` 将 `in task video` 和 `ood task video` 都设为 `8`，保证在线 FID/FVD 使用 8 条 in-task 视频和 8 条 OOD 视频计算。
+- 记录本轮第三阶段训练的实际 runtime split：`train=187`、`in_task_eval=8`、`ood_eval=8`，其中 in-task eval 分配为 `Collect=2`、`Washing=6`，OOD eval 为 `Pickup_Pillow=8`。
+
+**运行结果：**
+- 已在空闲 GPU 1 启动第三阶段训练，run 为
+  `training_data/log/appearance_edit_2s_s3_h2r_bs2-h2r_2s61f30_slide-187d_r96_self_qkvo_ffn_2000s_0614_162834`，W&B run id 为 `5d9p942j`。
+- 训练参数确认：`batch-size=2`、`rank=96`、`max-steps=2000`、`save/eval/eval-video=50`、合并 identity `step-0500` 与 blur `step-2000` 两个 LoRA，在线 `eval-video-frechet-metrics=True`。
+- step=1 已完整跑过 8 条 in-task 和 8 条 OOD eval video，并写入 FID/FVD：in-task `FID=198.6684`、`FVD=141.1637`；OOD `FID=171.7567`、`FVD=146.1568`。
+- Frechet 指标阶段观察到 GPU 1 显存约 `23304 MiB / 24564 MiB`，训练随后继续到后续 step，未在 step=1 OOM。
+
+## 2026-06-15
+
+**用户原始需求：**
+> 看一下 Mitty 的训练，直接使用 2s 的数据 + 96 LoRA 训练，不分三阶段；eval 间隔调成 200 step。
+
+**直接修改：**
+- 更新 `实验计划.md`：新增 `direct Mitty` baseline，使用 `h2r_2s61f30_slide`、fresh rank96 LoRA、无 `merge-lora`、`batch-size=2`、`max-steps=2000`，并将 `save/eval/eval-video` 间隔统一设为 `200`。
+- 该 baseline 沿用当前 2s h2r runtime split：`train=187`、`in_task_eval=8`、`ood_eval=8`，eval video 也是 `8/8`，训练时继续开启 FID/FVD。
+
+**运行结果：**
+- 已在空闲 GPU 1 启动单阶段 direct Mitty 训练，run 为
+  `training_data/log/appearance_edit_2s_mitty_direct_h2r_bs2-h2r_2s61f30_slide-187d_r96_self_qkvo_ffn_2000s_0615_184419`，W&B run id 为 `e730tnj6`。
+- 启动参数确认：`merge_lora=None`、fresh rank96 LoRA、`save/eval/eval-video=200`、`eval_video_frechet_metrics=True`。
+- step=1 普通训练已跑通，`train_loss=0.6571`；训练脚本会固定在 step=1 做一次初始 eval/video，之后按 200 step 间隔评估。
