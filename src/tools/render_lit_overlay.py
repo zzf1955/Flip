@@ -5,9 +5,9 @@ Applies PSO-optimized camera params + fixed joint angle offsets to verify
 whether joint errors are systematic across the entire episode.
 
 Usage:
-  python scripts/render_lit_overlay.py
-  python scripts/render_lit_overlay.py --duration 10 --episode 0
-  python scripts/render_lit_overlay.py --no-joint-offsets  # camera only, no joint correction
+  python -m src.tools.render_lit_overlay
+  python -m src.tools.render_lit_overlay --duration 10 --episode 0
+  python -m src.tools.render_lit_overlay --no-joint-offsets  # camera only, no joint correction
 """
 
 import sys

@@ -1,4 +1,4 @@
-"""Precompute SAM3/SAM3.1 robot-arm masks for raw H2R robot-camera videos.
+"""Precompute SAM3/SAM3.1 robot-arm masks for human2robot robot-camera videos.
 
 The output is intentionally simple and directly consumable by
 ``src.pipeline.h2r_sam3_blur_pair``:

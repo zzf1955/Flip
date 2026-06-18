@@ -244,7 +244,7 @@ def compute_clip_weight_map(hand_df: pd.DataFrame,
                             clip_start_frame: int, clip_frames: int,
                             hand_weight: float) -> torch.Tensor | None:
     """Slice per-frame bboxes for clip window, union, convert to latent weight map."""
-    from src.pipeline.hand_patch import (
+    from src.pipeline.archive.patch.hand_patch import (
         LATENT_F, LATENT_H, LATENT_W, VAE_SPATIAL,
         pixel_bbox_to_latent, build_weight_map,
     )

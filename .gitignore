@@ -67,6 +67,7 @@ wandb/
 cmd.sh
 draft.md
 *.log
+seedance_workspace
 
 # === 含敏感 token 的本地配置 ===
 .env

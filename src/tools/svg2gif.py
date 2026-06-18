@@ -1,10 +1,10 @@
 """Convert animated SVG files to high-quality GIFs using Playwright.
 
 Usage:
-    python scripts/svg2gif.py                          # convert all SVGs in clawd dir
-    python scripts/svg2gif.py path/to/file.svg         # convert single file
-    python scripts/svg2gif.py --size 512 --fps 30      # custom size and fps
-    python scripts/svg2gif.py --workers 8              # parallel conversion
+    python -m src.tools.svg2gif                          # convert all SVGs in clawd dir
+    python -m src.tools.svg2gif path/to/file.svg         # convert single file
+    python -m src.tools.svg2gif --size 512 --fps 30      # custom size and fps
+    python -m src.tools.svg2gif --workers 8              # parallel conversion
 """
 
 import asyncio

@@ -5,9 +5,9 @@ Shows side-by-side comparison:
   Original | G1 Robot Overlay | SMPLH IK Human Overlay
 
 Usage:
-  python scripts/render_smplh_ik.py --episode 0 --frame 30
-  python scripts/render_smplh_ik.py --episode 4 --frame 153 --beta 2.0 -1.0
-  python scripts/render_smplh_ik.py --episode 0 --start 5 --duration 2
+  python -m src.tools.render_smplh_ik --episode 0 --frame 30
+  python -m src.tools.render_smplh_ik --episode 4 --frame 153 --beta 2.0 -1.0
+  python -m src.tools.render_smplh_ik --episode 0 --start 5 --duration 2
 """
 
 import sys

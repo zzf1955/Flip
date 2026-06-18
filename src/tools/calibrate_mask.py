@@ -6,9 +6,9 @@ maximizing F1 overlap between FK-rendered mask and a GT RGBA mask.
 Uses convex-hull per-link rendering for fast evaluation.
 
 Usage:
-  python scripts/auto_calibrate_mask.py --camera-model pinhole --joint-dof 10
-  python scripts/auto_calibrate_mask.py --camera-model pinhole --joint-dof 10 --joint-reg 0.001
-  python scripts/auto_calibrate_mask.py --joint-dof 0  # camera-only mode
+  python -m src.tools.calibrate_mask --camera-model pinhole --joint-dof 10
+  python -m src.tools.calibrate_mask --camera-model pinhole --joint-dof 10 --joint-reg 0.001
+  python -m src.tools.calibrate_mask --joint-dof 0  # camera-only mode
 """
 
 import sys

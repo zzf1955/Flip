@@ -5,8 +5,8 @@ Uses PSO-optimized parameters from output/calibration/kp_optim/best_params.json.
 Outputs short MP4 clips with FK mesh overlay.
 
 Usage:
-  python scripts/render_overlay_check.py
-  python scripts/render_overlay_check.py --duration 3 --device cuda:2
+  python -m src.tools.render_overlay_check
+  python -m src.tools.render_overlay_check --duration 3 --device cuda:2
 """
 
 import sys

@@ -3,8 +3,8 @@ Third-person debug view: G1 robot mesh + SMPLH human mesh side-by-side.
 Shows alignment of contact points (toe tips, thumb tips, pelvis).
 
 Usage:
-  python scripts/render_ik_debug.py --episode 0 --frame 30
-  python scripts/render_ik_debug.py --episode 0 --frame 30 --beta 3.0
+  python -m src.tools.render_ik_debug --episode 0 --frame 30
+  python -m src.tools.render_ik_debug --episode 0 --frame 30 --beta 3.0
 """
 
 import sys

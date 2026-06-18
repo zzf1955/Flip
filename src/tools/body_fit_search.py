@@ -24,7 +24,7 @@ from src.core.retarget import (
     compute_g1_rest_transforms, refine_arms, retarget_frame, scale_hands,
 )
 from src.core.smplh import R_SMPLH_TO_G1_NP, SMPLHForIK, extract_g1_targets
-from src.pipeline.segment_pipeline import BODY_PARTS, match_links, render_mask_for_links
+from src.pipeline.archive.inpaint_retarget.segment_pipeline import BODY_PARTS, match_links, render_mask_for_links
 
 
 @dataclass(frozen=True)

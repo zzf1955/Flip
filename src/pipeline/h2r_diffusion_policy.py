@@ -1,7 +1,7 @@
-"""H2R HDF5 Diffusion Policy behavior cloning.
+"""human2robot HDF5 Diffusion Policy behavior cloning.
 
-The downloaded HumanAndRobot / H2R data is not in LeRobot parquet layout.  This
-entry reads the HDF5 layout directly:
+The downloaded human2robot data is not in LeRobot parquet layout. The local
+legacy path is ``data/h2r/v1``. This entry reads the HDF5 layout directly:
 
 - ``data/<task>/episode_<id>.hdf5`` contains ``cam_data/robot_camera``,
   ``qpos``, ``qvel``, ``end_position``, ``gripper_state`` and ``action``.

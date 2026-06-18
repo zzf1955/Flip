@@ -1,6 +1,7 @@
-"""Build blur_r2r pair data from H2R robot-camera videos and SAM3 masks.
+"""Build blur_r2r pair data from human2robot robot-camera videos and SAM3 masks.
 
-This converts the raw HumanAndRobot / H2R video layout:
+This converts the raw human2robot video layout. The historical local data path
+is still ``data/h2r/v1``:
 
   data/h2r/v1/video/<task>/episode_<id>/robot_camera.mp4
 

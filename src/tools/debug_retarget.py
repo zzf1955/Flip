@@ -12,10 +12,10 @@ Three groups of points drawn on the same frame:
   - Green cross       : SMPLH predicted keypoint projection (after retarget+IK)
 
 Usage:
-  python scripts/debug_retarget_points.py
-  python scripts/debug_retarget_points.py --png data/4points/f015.png
-  python scripts/debug_retarget_points.py --base-offset 0
-  python scripts/debug_retarget_points.py --no-refine
+  python -m src.tools.debug_retarget
+  python -m src.tools.debug_retarget --png data/4points/f015.png
+  python -m src.tools.debug_retarget --base-offset 0
+  python -m src.tools.debug_retarget --no-refine
 """
 
 import sys

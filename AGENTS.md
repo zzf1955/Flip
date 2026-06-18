@@ -29,6 +29,12 @@ FLIP 是第一人称人形机器人视频生成研究项目：在真实 G1 机�
 4. Human 渲染 / 重绘：SMPLH mesh → ControlNet 或视频生成模型。
 5. 训练：`(human, robot)` 配对数据 → Wan 2.2 / Mitty-style / LoRA。
 
+## 数据命名
+
+- 外部原始配对数据集统一称为 `human2robot`；历史本地目录仍是 `data/h2r/v1`，文档中只把它作为 legacy path 描述。
+- `h2r` / `r2h` 是 FLIP 内部任务或数据方向名：`h2r` 表示 human → robot，`r2h` 表示 robot → human。
+- 已有任务名、preset 和 data_type 中的 `h2r` 保留原命名；新的 human2robot 派生 duration / cache 名不要再用 `*_h2r_v1`，使用例如 `2s61f30_human2robot_v1`。
+
 ## 常用环境
 
 - Conda 环境：`flip`。
@@ -58,7 +64,8 @@ scripts/flip_run.sh nvidia-smi
 - `src/core/`：基础库模块，不直接作为主入口运行。
 - `src/pipeline/`：可执行 pipeline 与训练脚本。
 - `src/tools/`：标定、调试、可视化、日志转换等工具。
-- `scripts/`：旧脚本和归档脚本，优先使用 `src/` 下的新结构。
+- `scripts/`：现役 shell/Python launcher、实验批处理、cache/backfill/migration/eval 辅助脚本；优先通过这里的统一入口启动 GPU/训练命令。
+- `scripts/archive/`：旧版 IK、camera calibration、render/debug、segmentation/inpaint、dataset utility 脚本，按子目录归档；新工作优先使用 `src/` 下的新结构。
 - `doc/`：设计、实验、进度和任务文档。
 - `paper/`：相关论文资料。
 

@@ -6,10 +6,10 @@ optimizes camera parameters to minimize reprojection error.
 Periodically outputs diagnostic overlay images.
 
 Usage:
-  python scripts/optimize_keypoints.py --manifest data/5point/manifest.json
-  python scripts/optimize_keypoints.py --optimizer pso --particles 100 --pso-iters 500
-  python scripts/optimize_keypoints.py --optimizer adam --steps 2000
-  python scripts/optimize_keypoints.py --keypoints L_thumb,L_toe,R_toe,R_thumb
+  python -m src.tools.calibrate_keypoints --manifest data/5point/manifest.json
+  python -m src.tools.calibrate_keypoints --optimizer pso --particles 100 --pso-iters 500
+  python -m src.tools.calibrate_keypoints --optimizer adam --steps 2000
+  python -m src.tools.calibrate_keypoints --keypoints L_thumb,L_toe,R_toe,R_thumb
 """
 
 import sys

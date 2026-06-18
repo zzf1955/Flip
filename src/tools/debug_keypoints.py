@@ -10,7 +10,7 @@ For each annotated frame, generates a 6-panel row:
   6. Top mesh view (orthographic, from above)
 
 Usage:
-  python scripts/debug_keypoints.py --manifest data/4points/manifest.json
+  python -m src.tools.debug_keypoints --manifest data/4points/manifest.json
 """
 
 import sys, os, json, argparse, time

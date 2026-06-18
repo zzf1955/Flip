@@ -14,7 +14,7 @@ No IK, no optimization. Algorithm:
 Then render 3-view debug (G1 mesh + SMPLH mesh + keypoints).
 
 Usage:
-  python scripts/retarget_copy.py --episode 0 --frame 30
+  python -m src.tools.retarget_diag --episode 0 --frame 30
 """
 
 import sys

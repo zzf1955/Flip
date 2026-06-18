@@ -158,7 +158,7 @@
 - `scripts/run_final_ours_three_stage.sh` 默认改为：
   - step1 只复用已有 identity checkpoint；
   - step2 运行 H2R SAM3 blur_r2r 外观训练；
-  - step3 默认 `RUN_STAGE3=0`，不在缺少 H2R 配对数据时启动。
+  - step3 默认 `RUN_STAGE3=0`，不在缺少 human2robot 配对数据时启动。
 - 更新 `doc/step_5_training_infra.md` 与 `doc/scripts_inventory.md`，记录 H2R SAM3 mask
   artifact 格式、pair/cache 生成命令和 stage2 launcher 用法。
 
@@ -1703,7 +1703,7 @@
 - 小规模真实准备：四个任务各生成 1 个 mask、1 个 `blur_r2r` pair、1 个 VAE cache；重建后 cache latent shape 均为 `(1,48,5,14,26)`。
 - stage2 训练冒烟：`MAX_STEPS=1 SAVE_STEPS=1 EVAL_STEPS=999 EVAL_VIDEO_STEPS=0`、`WANDB_MODE=offline` 跑通，成功 merge step1 LoRA、训练 1 step、保存 `training_data/log/final_ours_h2r_sam3_step2_0603_211422-blur_r2r_1s-2d_r256_self_qkvo_ffn_1s_0603_211429/ckpt/step-0001.safetensors`；step3 保持禁用。
 - 全量准备完成：SAM3 mask index 为 40 episodes / 353 clips；`blur_r2r/1s` pair 和 VAE cache 行数为 `grab_cup_v1=57`、`grab_cube2_v1=90`、`push_box_random_v1=64`、`roll=142`，cache 抽样 `human_latent` / `robot_latent` shape 均为 `(1,48,5,14,26)`。
-- stage2 正式复现完成：`BATCH_SIZE=1 IN_TASK_EVAL_SIZE=4 OOD_EVAL_SIZE=4 IN_TASK_VIDEO_SIZE=0 OOD_VIDEO_SIZE=0 EVAL_VIDEO_STEPS=0` 跑满 1000 steps，复用 step1 checkpoint 并 merge 180 个 rank-32 LoRA pair，stage2 训练 rank-256 `self_qkvo_ffn` LoRA；最终 checkpoint 为 `training_data/log/final_ours_h2r_sam3_step2_0603_220432-blur_r2r_1s-207d_r256_self_qkvo_ffn_1000s_0603_220442/ckpt/step-1000.safetensors`，最终 eval 为 `eval_loss_in_task=0.1478`、`eval_loss_ood=0.1658`。stage3 未启动，因为仍缺少 H2R 配对数据。
+- stage2 正式复现完成：`BATCH_SIZE=1 IN_TASK_EVAL_SIZE=4 OOD_EVAL_SIZE=4 IN_TASK_VIDEO_SIZE=0 OOD_VIDEO_SIZE=0 EVAL_VIDEO_STEPS=0` 跑满 1000 steps，复用 step1 checkpoint 并 merge 180 个 rank-32 LoRA pair，stage2 训练 rank-256 `self_qkvo_ffn` LoRA；最终 checkpoint 为 `training_data/log/final_ours_h2r_sam3_step2_0603_220432-blur_r2r_1s-207d_r256_self_qkvo_ffn_1000s_0603_220442/ckpt/step-1000.safetensors`，最终 eval 为 `eval_loss_in_task=0.1478`、`eval_loss_ood=0.1658`。stage3 未启动，因为仍缺少 human2robot 配对数据。
 
 ## 2026-06-03 — task067 标题术语修正
 
@@ -2377,12 +2377,12 @@
 > 30fps、不需要滑动窗口，并行处理。
 
 **创建的任务：**
-- [082] H2R 原始配对数据构造 r2h 2s30fps cache
+- [082] human2robot 原始配对数据构造 r2h 2s30fps cache
 
 **当前设计结论：**
 - 新数据不复用 G1 `2s61f30_slide` 反向 cache；单独写入
-  `training_data/pair/r2h/2s61f30_h2r_v1` 和
-  `training_data/cache/vae/r2h/2s61f30_h2r_v1`。
+  `training_data/pair/r2h/2s61f30_human2robot_v1` 和
+  `training_data/cache/vae/r2h/2s61f30_human2robot_v1`。
 - 2s30fps 使用 61 帧 `0..60`，每个 episode 默认只取首个窗口，不做滑窗。
 - MP4 源当前 210 个 episode 中 1 个只有 8 帧，首窗口 2s61f30 可用 209 条。
 - HDF5 全量当前 1312 个 episode 中 2 个短于 61 帧，首窗口 2s61f30 可用 1310 条。
@@ -2394,22 +2394,172 @@
 - 接入 `scripts/flip_run.sh h2r_r2h_pair`，支持 `--tasks all`、`--workers`、
   `--clean`、`--resume`、`--dry-run`、`--max-episodes-per-task` 等参数。
 - 更新 `.worktrees/t082/doc/step_5_training_infra.md`，记录
-  `training_data/pair/r2h/2s61f30_h2r_v1` 与
-  `training_data/cache/vae/r2h/2s61f30_h2r_v1` 的 layout、字段语义和运行命令。
+  `training_data/pair/r2h/2s61f30_human2robot_v1` 与
+  `training_data/cache/vae/r2h/2s61f30_human2robot_v1` 的 layout、字段语义和运行命令。
 
 **运行结果：**
 - dry-run：`--tasks all` 得到 `pairs=209`、`short skipped=1`。
-- 正式 pair 已生成到 `training_data/pair/r2h/2s61f30_h2r_v1`：
+- 正式 pair 已生成到 `training_data/pair/r2h/2s61f30_human2robot_v1`：
   - `index.jsonl` 209 行；
   - 209 个 human target 视频和 209 个 robot control 视频；
   - 全量校验均为 61 帧、30fps、416x224；
   - `summary.json` 记录跳过 `push_box_two_v1/episode_5`，因为该 episode 只有 8 帧。
 - VAE/T5 cache 已生成：
-  - `training_data/cache/vae/r2h/2s61f30_h2r_v1`：209 个 `.pth`，22 个 task manifest；
-  - `training_data/cache/t5/r2h/2s61f30_h2r_v1`：`prompt_3c4c5fbd.pth` 和 `negative.pth`。
-- Runtime split 校验通过：`data_type=r2h`、`duration=2s61f30_h2r_v1` 下
+  - `training_data/cache/vae/r2h/2s61f30_human2robot_v1`：209 个 `.pth`，22 个 task manifest；
+  - `training_data/cache/t5/r2h/2s61f30_human2robot_v1`：`prompt_3c4c5fbd.pth` 和 `negative.pth`。
+- Runtime split 校验通过：`data_type=r2h`、`duration=2s61f30_human2robot_v1` 下
   209 个 cache 默认切分为 `train=189`、`in_task_eval=20`、`ood=0`，并写出 22 个
   `pair_order.jsonl`。
 - 代码检查通过：
   - `python -m compileall -q src/pipeline/h2r_r2h_pair.py`；
   - `PYTHONPATH=. python tests/test_runtime_data.py`。
+
+## 2026-06-18
+
+**用户原始需求：**
+> 好的, 先提交一次, 然后先更新文档。统一 human2robot 数据集的命名，名字统一改为 human2robot，另一个任务 h2r 保留原命名；scripts 中把脚本归类，ik/camera/render_debug 之类分门别类放到 archive 中，保持 scripts/ 中干净。
+
+**直接修改：**
+- 先提交当前 main 工作区已有文档和 `scripts/build_reverse_r2h_cache.py`，commit 为
+  `e9cf316 docs: record h2r r2h cache work`；未把 `seedance_workspace/` 实验输出目录纳入提交。
+- 统一 human2robot 命名规则：
+  - 外部原始配对数据集统一称为 `human2robot`；
+  - `h2r` / `r2h` 保留为 FLIP 内部任务或数据方向名；
+  - human2robot 派生 duration 使用 `2s61f30_human2robot_v1`。
+- 将已生成的本地数据目录从 `2s61f30_h2r_v1` 改名为
+  `2s61f30_human2robot_v1`：
+  - `training_data/pair/r2h/2s61f30_human2robot_v1`；
+  - `training_data/cache/vae/r2h/2s61f30_human2robot_v1`；
+  - `training_data/cache/t5/r2h/2s61f30_human2robot_v1`。
+- 同步更新上述 pair/cache 的 JSONL、summary 和 209 个 `.pth` metadata：`duration` 改为
+  `2s61f30_human2robot_v1`，并增加 `dataset_name=human2robot` 与
+  `dataset_legacy_root=data/h2r/v1`。
+- 更新 `AGENTS.md`、`doc/step_5_training_infra.md`、`doc/scripts_inventory.md` 和
+  `doc/tasks/active/082.md`，明确 human2robot 与 `h2r`/`r2h` 的边界。
+- 整理 `scripts/`：
+  - 顶层保留现役统一入口、通用训练 wrapper、R2H 队列/分析脚本和 smoke 脚本；
+  - 旧 camera calibration 脚本移到 `scripts/archive/camera_calibration/`；
+  - 旧 IK/retarget 脚本移到 `scripts/archive/retarget_ik/`；
+  - 旧 render/debug/svg2gif 脚本移到 `scripts/archive/render_debug/`；
+  - 旧 SAM2/inpaint 脚本移到 `scripts/archive/segmentation_inpaint/`；
+  - 旧 dataset utility、一次性 cache/backfill/migration/eval helper、临时训练 shell
+    和 one-off smoke 脚本移到 `scripts/archive/` 的分类子目录；
+  - 删除 `scripts/__pycache__/` 和 `scripts/archive/__pycache__/` 生成目录。
+- 更新 `src.tools` / `src.pipeline.retarget_video` 的 docstring 示例入口，从旧
+  `python scripts/*.py` 改为当前 `python -m src...` 入口。
+
+**验证：**
+- `python -m compileall -q` 检查本轮改过的 `src/pipeline` 与 `src/tools` 文件通过。
+- `git diff --check` 通过。
+- 用 `data_type=r2h`、`duration=2s61f30_human2robot_v1` 对新 pair/cache 运行
+  `runtime_data.build_runtime_split` 校验通过：22 个 task，`train=189`、`eval=20`、
+  `ood=0`。
+- `PYTHONPATH=. python tests/test_runtime_data.py` 通过，3 个测试。
+
+**用户原始需求：**
+> 先做 HDF5 这部分的 Cache。
+
+**直接修改：**
+- 在任务 worktree `.worktrees/t082` 扩展 `src.pipeline.h2r_r2h_pair`：
+  - 新增 `--source hdf5`，读取 `data/h2r/v1/data/**/episode_*.hdf5`；
+  - 从 `cam_data/robot_camera` 构造 robot input，从 `cam_data/human_camera`
+    构造 human target；
+  - 默认 HDF5 duration 使用 `2s61f30_human2robot_hdf5_v1`；
+  - manifest/summary/cache metadata 写入 `dataset_name=human2robot` 和
+    `dataset_legacy_root=data/h2r/v1`。
+- 在 `.worktrees/t082/scripts/flip_run.sh` 增加 `human2robot_r2h_pair` 子命令，
+  `h2r_r2h_pair` 保留为 legacy alias。
+- 更新 `doc/step_5_training_infra.md` 和 `doc/tasks/active/082.md`，记录 HDF5 源
+  pair/cache layout、命令、数量和 split 结果。
+
+**运行结果：**
+- HDF5 dry-run：1312 个 `episode_*.hdf5` 中 2 个短于 61 帧，首窗口可用 1310 条。
+- 跳过短样本：
+  - `grab_pencil_v1/episode_50.hdf5`：2 帧；
+  - `push_box_two_v1/episode_5.hdf5`：8 帧。
+- 正式 HDF5 pair 已生成到
+  `training_data/pair/r2h/2s61f30_human2robot_hdf5_v1`：
+  - `index.jsonl` 1310 行；
+  - 32 个 task manifest；
+  - 2620 个 mp4 pair 文件；
+  - 全量校验均为 61 帧、30fps、416x224。
+- VAE/T5 cache 已生成：
+  - `training_data/cache/vae/r2h/2s61f30_human2robot_hdf5_v1`：
+    1310 个 `.pth`，32 个 task manifest，约 1.4G；
+  - `training_data/cache/t5/r2h/2s61f30_human2robot_hdf5_v1`：
+    `prompt_3c4c5fbd.pth` 和 `negative.pth`，约 8.1M。
+- Runtime split 校验通过：`data_type=r2h`、`duration=2s61f30_human2robot_hdf5_v1`
+  下 1310 个 cache 默认切分为 `train=1179`、`in_task_eval=131`、`ood=0`，
+  并写出 32 个 `pair_order.jsonl`。
+- 代码检查通过：
+  - `python -m compileall -q src/pipeline/h2r_r2h_pair.py`；
+  - `scripts/flip_run.sh human2robot_r2h_pair -- --source hdf5 --tasks grab_cup_v1 --max-episodes-per-task 1 --dry-run`；
+  - `PYTHONPATH=. python tests/test_runtime_data.py`。
+
+**用户原始需求：**
+> 好的,归档一下。
+
+**直接修改：**
+- 将旧 1s/H2R/final/SAM3 stage shell 训练启动器归档到
+  `scripts/archive/training_launchers/`，顶层只保留 `train_lora_grid.py` 和
+  `train_three_stage_single_lora.py` 这两个通用 wrapper。
+- 将一次性数据/cache/backfill/reverse 脚本归档到 `scripts/archive/dataset_utils/`，
+  将旧 layout 迁移脚本归档到 `scripts/archive/migration/`。
+- 将旧 final eval 补跑和背景 Patch FID helper 归档到
+  `scripts/archive/eval_analysis/`。
+- 将 `smoke_wan22_ti2v5b.py` 归档到 `scripts/archive/smoke/`，顶层保留通用
+  `smoke_test.py`、`smoke_test_light.py` 和 `smoke_test_gpu.py`。
+- 更新归档后脚本中的项目根目录计算，避免从 archive 复现实验时错误定位到
+  `scripts/archive`。
+- 更新 `doc/scripts_inventory.md`、`doc/step_5_training_infra.md`、
+  `doc/step_5_wan22_ti2v5b.md` 和 `scripts/archive/README.md`，同步当前
+  `scripts/` 顶层边界与 archive 分类。
+
+**用户原始需求：**
+> 分类建议中, 后三类全部归档
+
+**直接修改：**
+- 将旧 inpaint / retarget / overlay pipeline 归档到
+  `src/pipeline/archive/inpaint_retarget/`。
+- 将旧 robot patch / hand patch 数据工具归档到 `src/pipeline/archive/patch/`。
+- 将旧 ComfyUI Wan / Cosmos 本地重绘实验归档到
+  `src/pipeline/archive/comfyui_wan/`。
+- 将旧 Wan VAE / Pair / Humanoid Everyday / AdaWorld IDM 和 action mask 实验归档到
+  `src/pipeline/archive/idm/`。
+- 将旧 mixed h2r 训练入口归档到 `src/pipeline/archive/training_legacy/`。
+- 将旧 Masquerade-style baseline 归档到 `src/pipeline/archive/baseline/`。
+- 从 `scripts/flip_run.sh` / `scripts/flip_run_2.sh` 移除上述归档入口，只保留当前
+  SAM2/SAM3、R2H、Diffusion Policy、Mitty cache、正式 train/eval 等主线入口。
+- 更新 `scripts/smoke_test_light.py`、`doc/scripts_inventory.md`、
+  `doc/step_5_training_infra.md`、`doc/step_4_wan_vace_regen.md`、
+  `doc/step_5_robot_patch.md` 和 `src/pipeline/archive/README.md`，同步 active /
+  archive 边界。
+
+**验证：**
+- `python -m compileall -q src scripts/smoke_test_light.py scripts/smoke_test_gpu.py scripts/smoke_test.py`
+  通过。
+- `bash -n scripts/flip_run.sh scripts/flip_run_2.sh` 通过。
+- `python scripts/smoke_test_light.py --skip-help` 通过。
+- `git diff --check` 通过。
+
+**用户原始需求：**
+> 好的, 按照这个结构整理一下
+
+**直接修改：**
+- 新增 `doc/README.md` 作为当前文档索引。
+- 新增并整理 `doc/pipeline/`：
+  - `overview.md`、`data_slicing.md`、`data_synthesis.md`、`pair_data.md`、
+    `wan_r2h.md`、`blur_r2r.md`、`cache.md`、`three_stage_training.md`、
+    `sam2_sam3_masks.md`；
+  - 将 Seedance、SAM3 和训练基础设施文档移动到该目录。
+- 新增并整理 `doc/datasets/`：
+  - `g1.md`、`g1_camera.md`、`g1_hand_mapping.md`、`human2robot.md`、
+    `naming.md`、`layouts.md`。
+- 新增并整理 `doc/models/`：
+  - `wan22_mitty.md`、`wan22_architecture.md`、`diffusion_policy.md`、`wam.md`。
+- 新增并整理 `doc/infra/`：
+  - `code_structure.md`、`scripts.md`、`runtime.md`、`wandb.md`、`notices.md`。
+- 将旧 IDM、早期 progress/task、robot_patch、FFN LoRA、两阶段训练等文档移动到
+  `doc/archive/`，并新增 `doc/archive/README.md`。
+- 更新 active/pending task 中对当前文档路径的引用，避免继续指向旧
+  `doc/step_*` / `doc/scripts_inventory.md` 路径。

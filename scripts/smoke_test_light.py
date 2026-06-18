@@ -21,32 +21,29 @@ PYTHON = Path(sys.executable)
 SMOKE_DIR = ROOT / "tmp" / "smoke_test" / "light"
 
 MODULE_HELPS = [
-    # Data segmentation and robot removal
+    # Current data segmentation and mask precompute
     "src.pipeline.segment_episodes",
     "src.pipeline.sam2_precompute",
     "src.pipeline.batch_sam2_precompute",
     "src.pipeline.sam2_segment",
-    "src.pipeline.sam2_inpaint",
-    "src.pipeline.batch_inpaint",
-    "src.pipeline.video_inpaint",
-    "src.pipeline.segment_pipeline",
-    # Retarget / human rendering / pair construction
-    "src.pipeline.retarget_video",
-    "src.pipeline.human_overlay",
+    "src.pipeline.h2r_sam3_blur_pair",
+    # Current/recent pair and synthetic-data construction
     "src.pipeline.seedance_clip",
+    "src.pipeline.seedance_batch",
+    "src.pipeline.seedance_advance",
+    "src.pipeline.seedance_gen",
+    "src.pipeline.h2r_seedance_edit",
+    "src.pipeline.g1_2s_slice_data",
+    "src.pipeline.g1_2s_seedance_slide_data",
     "src.pipeline.make_pair",
     "src.pipeline.make_robot_pair",
-    "src.pipeline.robot_patch",
-    "src.pipeline.hand_patch",
-    "src.pipeline.hand_patch_4s",
-    # Local regeneration utilities kept outside the training mainline
-    "src.pipeline.cosmos_prepare",
-    "src.pipeline.cosmos_regen",
-    "src.pipeline.wan_regen",
+    "src.pipeline.r2h_synthesize",
     # Training mainline
     "src.pipeline.mitty_cache",
     "src.pipeline.train",
     "src.pipeline.train_mitty",
+    "src.pipeline.evaluate_mitty_models",
+    "src.pipeline.h2r_diffusion_policy",
     # Maintained tools used by training/eval
     "src.tools.train_log_to_csv",
     "src.tools.eval_metrics",
@@ -90,7 +87,6 @@ def write_log(name: str, text: str) -> Path:
 def check_compileall(results: list[dict]) -> None:
     cmd = [
         str(PYTHON), "-m", "compileall", "-q", "src",
-        "scripts/smoke_wan22_ti2v5b.py",
         "scripts/smoke_test.py",
         "scripts/smoke_test_light.py",
         "scripts/smoke_test_gpu.py",

@@ -12,7 +12,7 @@ we can compute X_cam, Y_cam, Z_cam for each keypoint, then solve for fx/fy.
 Also provides a multi-model comparison of all PSO calibration results.
 
 Usage:
-  python scripts/estimate_focal_length.py
+  python -m src.tools.estimate_focal
 """
 
 import sys
