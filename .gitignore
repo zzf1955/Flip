@@ -76,3 +76,5 @@ seedance_workspace
 notion_mcp_config.json
 
 tmp/
+
+doc/requirement-log.md

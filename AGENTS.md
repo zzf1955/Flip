@@ -19,20 +19,28 @@
 
 ## 项目背景
 
-FLIP 是第一人称人形机器人视频生成研究项目：在真实 G1 机器人视频上合成人体，构造 `(synthetic human, real robot)` 配对数据，用于微调 video-to-video 模型（Wan 2.2 + LoRA）。
+revert 是第一人称人形机器人视频生成 / 视频编辑研究项目。当前主线围绕真实 G1
+机器人视频和 human2robot 原始配对数据构造可训练的 robot / human 视频 pair，
+并微调 Wan 2.2 + Mitty LoRA，使模型学习机器人外观恢复与 human ↔ robot
+跨域编辑。下游还包含 action-only Diffusion Policy 与 robot-only WAM 方向。
 
-主流程：
+当前主流程：
 
-1. G1 pose 获取：关节编码器 / 本体感知。
-2. Robot 分割与去除：FK → mesh → SAM2 mask → 背景 inpaint。
-3. Robot-to-human retarget：G1 pose → SMPLH pose。
-4. Human 渲染 / 重绘：SMPLH mesh → ControlNet 或视频生成模型。
-5. 训练：`(human, robot)` 配对数据 → Wan 2.2 / Mitty-style / LoRA。
+1. 数据切片：从 G1 segment 或 human2robot episode 生成 2s/30fps、61 帧样本。
+2. 数据合成：使用 Seedance 或训练好的 R2H Wan/Mitty 模型生成 human-side 数据。
+3. Mask / blur 数据：用 SAM2 或 SAM3/SAM3.1 预计算 robot mask，构造 `blur_r2r` 外观恢复数据。
+4. 配对数据构造：按 `identity_r2r`、`blur_r2r`、`h2r`、`r2h` 发布统一 pair layout。
+5. Cache：为 Wan/Mitty 训练预计算 VAE latent 和 T5 embedding。
+6. 三阶段训练：
+   - `identity_r2r`：清晰 robot → 清晰 robot，学习背景和基础重建。
+   - `blur_r2r`：模糊 robot → 清晰 robot，学习目标机器人的外观细节。
+   - `h2r` / `r2h`：human ↔ robot 跨域编辑。
+7. 下游策略学习：在 human2robot 或 G1 数据上训练 Diffusion Policy / WAM。
 
 ## 数据命名
 
 - 外部原始配对数据集统一称为 `human2robot`；历史本地目录仍是 `data/h2r/v1`，文档中只把它作为 legacy path 描述。
-- `h2r` / `r2h` 是 FLIP 内部任务或数据方向名：`h2r` 表示 human → robot，`r2h` 表示 robot → human。
+- `h2r` / `r2h` 是 revert 内部任务或数据方向名：`h2r` 表示 human → robot，`r2h` 表示 robot → human。
 - 已有任务名、preset 和 data_type 中的 `h2r` 保留原命名；新的 human2robot 派生 duration / cache 名不要再用 `*_h2r_v1`，使用例如 `2s61f30_human2robot_v1`。
 
 ## 常用环境
@@ -50,8 +58,6 @@ LD_PRELOAD=/home/leadtek/miniconda3/envs/flip/lib/libjpeg.so.8 \
   python -m src.pipeline.<script>
 ```
 
-- 需要 GPU / CUDA 的命令优先使用统一入口，便于 Codex 按子命令自动批准越权：
-
 ```bash
 scripts/flip_run.sh train --cuda 2,3 --nproc 2 -- <train args>
 scripts/flip_run.sh mitty_cache --cuda 0 -- <mitty_cache args>
@@ -62,11 +68,13 @@ scripts/flip_run.sh nvidia-smi
 ## 代码结构
 
 - `src/core/`：基础库模块，不直接作为主入口运行。
-- `src/pipeline/`：可执行 pipeline 与训练脚本。
+- `src/pipeline/`：当前可执行 pipeline 与训练脚本；主线包括 SAM2/SAM3 mask、数据切片、pair/cache、Seedance/R2H 数据合成、Wan/Mitty 训练评估和 Diffusion Policy。
+- `src/pipeline/backbones/`、`src/pipeline/eval_mitty/`：Wan/Mitty 训练与离线评估的支撑模块。
+- `src/pipeline/archive/`：旧 inpaint/retarget、robot/hand patch、ComfyUI Wan/Cosmos、IDM、mixed h2r、Masquerade baseline 等归档 pipeline；不要作为新主线入口。
 - `src/tools/`：标定、调试、可视化、日志转换等工具。
-- `scripts/`：现役 shell/Python launcher、实验批处理、cache/backfill/migration/eval 辅助脚本；优先通过这里的统一入口启动 GPU/训练命令。
-- `scripts/archive/`：旧版 IK、camera calibration、render/debug、segmentation/inpaint、dataset utility 脚本，按子目录归档；新工作优先使用 `src/` 下的新结构。
-- `doc/`：设计、实验、进度和任务文档。
+- `scripts/`：现役统一 launcher、R2H 队列/分析脚本、通用训练 wrapper 和 smoke；GPU/训练命令优先通过 `scripts/flip_run.sh <subcommand>` 启动。
+- `scripts/archive/`：旧 camera、IK、render/debug、segmentation/inpaint、dataset utility、migration/eval helper、临时训练 shell 和 one-off smoke，按子目录归档。
+- `doc/`：当前文档按用途分为 `pipeline/`、`datasets/`、`models/`、`infra/`、`tasks/` 和 `archive/`；入口见 `doc/README.md`。
 - `paper/`：相关论文资料。
 
 ## 任务工作流
