@@ -2272,3 +2272,144 @@
   `training_data/log/appearance_edit_2s_mitty_direct_h2r_bs2-h2r_2s61f30_slide-187d_r96_self_qkvo_ffn_2000s_0615_184419`，W&B run id 为 `e730tnj6`。
 - 启动参数确认：`merge_lora=None`、fresh rank96 LoRA、`save/eval/eval-video=200`、`eval_video_frechet_metrics=True`。
 - step=1 普通训练已跑通，`train_loss=0.6571`；训练脚本会固定在 step=1 做一次初始 eval/video，之后按 200 step 间隔评估。
+
+## 2026-06-17
+
+**用户原始需求：**
+> 看一下 Mitty 的训练，把 LoRA 改成仅 QKV 的位置加 LoRA，再训练一个；其他参数和之前的 `training_data/log/appearance_edit_2s_mitty_direct_h2r_bs2-h2r_2s61f30_slide-187d_r96_self_qkvo_ffn_2000s_0615_184419` 保持一致。
+
+**直接修改：**
+- 更新 `实验计划.md`：新增 `direct Mitty QKV LoRA` 对照实验，明确只把 `LoRA target modules` 改为 `self_attn.q,self_attn.k,self_attn.v`，其余数据、rank、batch、step、eval、FID/FVD 与 direct Mitty baseline 保持一致。
+
+**运行结果：**
+- 启动前用 `scripts/flip_run.sh nvidia-smi` 确认 GPU 1/2/3 空闲，选择 GPU 1。
+- 已在 GPU 1 启动 QKV-only direct Mitty 训练，run 为
+  `training_data/log/appearance_edit_2s_mitty_direct_qkv_h2r_bs2-h2r_2s61f30_slide-187d_r96_self_qkv_2000s_0617_233623`，W&B run id 为 `yq5po4dq`。
+- 启动参数确认：`merge_lora=None`、fresh rank96 LoRA、`lora_target_modules=self_attn.q,self_attn.k,self_attn.v`、`save/eval/eval-video=200`、`eval_video_frechet_metrics=True`，split 仍为 `train=187`、`in_task_eval=8`、`ood_eval=8`。
+- 启动检查已跑通：`step=1` 的 `train_loss=0.1535`、`eval_loss_in_task=0.2268`、`eval_loss_ood=0.2508`；step=1 的 eval video/FID/FVD 后续继续在后台执行。
+
+## 2026-06-18
+
+**用户原始需求：**
+> `seedance_workspace/video/` 下的视频 R/B 通道反了，全部换一下；通道反转后再试一次 Seedance，请求和上一轮相比只有原视频不同。
+
+**直接修改：**
+- 对 `seedance_workspace/video/` 下普通 mp4 做 R/B channel swap，先在同目录保留
+  `*.before_rb_swap.mp4` 备份；本轮候选 26 个 mp4，其中 25 个完成覆盖修正，1 个此前已修正的人手
+  `human_camera.mp4` 被检测为已 swap 并跳过。
+- 生成修正记录 `seedance_workspace/video/rb_swap_manifest_20260618_003257.json`。
+- 复跑 Seedance `exp04`，沿用 `exp03` 的 prompt、参考图片 URL、模型、ratio、duration 和 resolution，
+  只把 `reference_video` 换成修正 R/B 后的 original robot 视频。
+
+**运行结果：**
+- `exp04` task id：`cgt-20260618003408-djbts`。
+- 输出视频：
+  `seedance_workspace/output/exp04/grab_both_cubes_v1_ep000001_f000000_seedance_raw.mp4`。
+- 输出规格：`864x496`、`24fps`、`4.041667s`；`metadata.json` 中已记录
+  `same_as_exp03_except_reference_video_url: true`。
+
+**用户原始需求：**
+> 看之前 SAM3 pipeline，把当前视频中的机械臂用黄色框标出来，黑色夹爪部分用红色标出来，输出到
+> `seedance_workspace/video/grab_both_cubes_v1_ep000001_f000000/input/yellow_bbox`。
+
+**直接修改：**
+- 基于 R/B 修正后的
+  `seedance_workspace/video/grab_both_cubes_v1_ep000001_f000000/input/grab_both_cubes_v1_ep000001_f000000_robot_camera_original_ref_864x480.mp4`
+  生成 SAM3 标注视频。
+- 复用 `tmp/h2r_seedance_exp04_prompt_ep1_sam3_mask/grab_both_cubes_v1/episode_1.npz`：
+  整臂 SAM3 mask 映射到 `864x480` 后画黄色 bbox，`SAM3 arm mask ∩ dark_threshold<=80`
+  的黑色夹爪区域用红色高亮。
+
+**运行结果：**
+- 输出标注视频：
+  `seedance_workspace/video/grab_both_cubes_v1_ep000001_f000000/input/yellow_bbox/grab_both_cubes_v1_ep000001_f000000_robot_camera_yellow_arm_bbox_red_gripper_ref_864x480.mp4`。
+- 同目录输出红色夹爪 mask 视频和 JSON metadata；标注视频规格为 `864x480`、`30fps`、`4.0s`，
+  整臂 mask 与红色夹爪 mask 都覆盖 120 帧。
+
+**用户原始需求：**
+> 去掉红色，只保留黄色框。
+
+**直接修改：**
+- 在同一目录新增黄色框-only 标注视频：
+  `seedance_workspace/video/grab_both_cubes_v1_ep000001_f000000/input/yellow_bbox/grab_both_cubes_v1_ep000001_f000000_robot_camera_yellow_arm_bbox_ref_864x480.mp4`。
+- 继续基于 R/B 修正后的 original robot 视频和同一个 SAM3 整臂 mask；不再叠加红色夹爪区域。
+
+**运行结果：**
+- 黄色框-only 视频规格为 `864x480`、`30fps`、`4.0s`，SAM3 整臂 mask 覆盖 120 帧。
+
+**用户原始需求：**
+> 看一下原视频，把原视频拼成 15s，试一口气转换；现在小片段效果不好。
+
+**直接修改：**
+- 使用 `seedance_workspace/video/grab_both_cubes_v1_ep000001_f000000` 的 R/B 修正后
+  original robot 4s 片段，拼接 `f000000`、`f000120`、`f000240`、`f000360` 四段后裁到前 15s。
+- 输出 15s Seedance 输入视频到
+  `seedance_workspace/video/grab_both_cubes_v1_ep000001_f000000/input/long_15s/`。
+
+**运行结果：**
+- 输出视频：
+  `seedance_workspace/video/grab_both_cubes_v1_ep000001_f000000/input/long_15s/grab_both_cubes_v1_ep000001_f000000_robot_camera_original_ref_864x480_15s.mp4`。
+- 规格：`864x480`、`30fps`、`450` 帧、`15.0s`，对应 episode_1 的前 15s。
+
+**用户原始需求：**
+> 生成一下反向的 Cache。
+
+**直接修改：**
+- 新增 `scripts/build_reverse_r2h_cache.py`，用于从现有 `h2r/2s61f30_slide` pair/cache
+  生成 `r2h/2s61f30_slide` 反向视图；视频和 T5 使用 hardlink，VAE `.pth` 重新写入并交换
+  `human_latent` / `robot_latent`。
+- 更新 `doc/step_5_training_infra.md`，记录反向 cache 的生成命令、字段语义和 `--resume`
+  行为。
+
+**运行结果：**
+- 已生成 `training_data/pair/r2h/2s61f30_slide`、
+  `training_data/cache/vae/r2h/2s61f30_slide` 和
+  `training_data/cache/t5/r2h/2s61f30_slide`。
+- 样本数量：`Inspire_Collect_Clothes_MainCamOnly=40`、
+  `Inspire_Put_Clothes_into_Washing_Machine=155`、
+  `Inspire_Pickup_Pillow_MainCamOnly=15`。
+- 运行时 split 校验通过：`train=187`、`in_task_eval=8`、`ood_eval=8`；
+  抽样校验确认新的 `human_latent` 等于源 H2R `robot_latent`，新的 `robot_latent` 等于源 H2R
+  `human_latent`，pair 视频和 T5 cache 均为 hardlink 复用。
+
+**用户原始需求：**
+> 从头做 human2robot / H2R 原始配对数据的 robot 视频到 human 视频编辑 cache：2s 数据、
+> 30fps、不需要滑动窗口，并行处理。
+
+**创建的任务：**
+- [082] H2R 原始配对数据构造 r2h 2s30fps cache
+
+**当前设计结论：**
+- 新数据不复用 G1 `2s61f30_slide` 反向 cache；单独写入
+  `training_data/pair/r2h/2s61f30_h2r_v1` 和
+  `training_data/cache/vae/r2h/2s61f30_h2r_v1`。
+- 2s30fps 使用 61 帧 `0..60`，每个 episode 默认只取首个窗口，不做滑窗。
+- MP4 源当前 210 个 episode 中 1 个只有 8 帧，首窗口 2s61f30 可用 209 条。
+- HDF5 全量当前 1312 个 episode 中 2 个短于 61 帧，首窗口 2s61f30 可用 1310 条。
+
+**直接修改：**
+- 在任务 worktree `.worktrees/t082` 新增 `src.pipeline.h2r_r2h_pair`，用于从
+  `data/h2r/v1/video/<task>/episode_*/{robot_camera,human_camera}.mp4`
+  直接构造 r2h Mitty pair。
+- 接入 `scripts/flip_run.sh h2r_r2h_pair`，支持 `--tasks all`、`--workers`、
+  `--clean`、`--resume`、`--dry-run`、`--max-episodes-per-task` 等参数。
+- 更新 `.worktrees/t082/doc/step_5_training_infra.md`，记录
+  `training_data/pair/r2h/2s61f30_h2r_v1` 与
+  `training_data/cache/vae/r2h/2s61f30_h2r_v1` 的 layout、字段语义和运行命令。
+
+**运行结果：**
+- dry-run：`--tasks all` 得到 `pairs=209`、`short skipped=1`。
+- 正式 pair 已生成到 `training_data/pair/r2h/2s61f30_h2r_v1`：
+  - `index.jsonl` 209 行；
+  - 209 个 human target 视频和 209 个 robot control 视频；
+  - 全量校验均为 61 帧、30fps、416x224；
+  - `summary.json` 记录跳过 `push_box_two_v1/episode_5`，因为该 episode 只有 8 帧。
+- VAE/T5 cache 已生成：
+  - `training_data/cache/vae/r2h/2s61f30_h2r_v1`：209 个 `.pth`，22 个 task manifest；
+  - `training_data/cache/t5/r2h/2s61f30_h2r_v1`：`prompt_3c4c5fbd.pth` 和 `negative.pth`。
+- Runtime split 校验通过：`data_type=r2h`、`duration=2s61f30_h2r_v1` 下
+  209 个 cache 默认切分为 `train=189`、`in_task_eval=20`、`ood=0`，并写出 22 个
+  `pair_order.jsonl`。
+- 代码检查通过：
+  - `python -m compileall -q src/pipeline/h2r_r2h_pair.py`；
+  - `PYTHONPATH=. python tests/test_runtime_data.py`。

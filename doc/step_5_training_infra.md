@@ -260,6 +260,33 @@ T5 embedding 不再重复嵌入每个样本文件。T5 cache 目录与数据类�
 也可用 CLI 覆盖 `--data-type`、`--duration`、`--train-tasks`、`--ood-tasks`
 以及各类 size。
 
+### 由 H2R Cache 生成 R2H 反向视图
+
+2s sliding-window 的 H2R cache 已同时包含 human / robot 两侧 latent。若需要训练
+robot→human，可以用 `scripts/build_reverse_r2h_cache.py` 生成 `r2h/2s61f30_slide`
+视图，而不必重新运行 VAE：
+
+```bash
+/home/leadtek/miniconda3/envs/flip/bin/python scripts/build_reverse_r2h_cache.py
+```
+
+该脚本会：
+
+- 从 `training_data/pair/h2r/2s61f30_slide` 生成
+  `training_data/pair/r2h/2s61f30_slide`，其中 `control_video/` hardlink 到原 H2R
+  的 robot target，`video/` hardlink 到原 H2R 的 human input。
+- 从 `training_data/cache/vae/h2r/2s61f30_slide` 生成
+  `training_data/cache/vae/r2h/2s61f30_slide`，其中新的 `human_latent` 来自原
+  `robot_latent`，新的 `robot_latent` 来自原 `human_latent`，从而复用当前 Mitty
+  trainer 的“`human_latent` 是 clean condition，`robot_latent` 是 denoise target”
+  约定。
+- 将 `input_role` / `target_role` 改为 `robot` / `human`，并 hardlink
+  `training_data/cache/t5/h2r/2s61f30_slide` 到
+  `training_data/cache/t5/r2h/2s61f30_slide`。
+
+默认目标文件已存在时会失败；如果只需跳过已有视频/cache 文件并重写 manifest，可加
+`--resume`。
+
 运行时 split 规则：
 
 - pair 顺序来自各 task pair 目录下的 `pair_order.jsonl`。如果文件不存在，
