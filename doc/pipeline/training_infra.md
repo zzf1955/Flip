@@ -377,20 +377,73 @@ scripts/flip_run.sh mitty_cache --cuda 0 -- \
 
 运行时 split 规则：
 
+- `--split-source runtime` 是旧的 task-level `pair_order.jsonl` 规则，适用于
+  split-free 的 G1 / legacy pair cache。
+- `--split-source explicit` 读取 `<pair-root>/<data-type>/<duration>/train.jsonl`、
+  `eval.jsonl`、`test.jsonl`，适用于已经离线固定 train/test/eval 的
+  human2robot 数据。显式 split 下训练只从 `train.jsonl` 抽样，eval 从
+  `eval.jsonl` 按 `eval_role=in_task/ood` 拆分，`test.jsonl` 写入 run 的
+  `data_split/test.jsonl` 供后续完整测试使用。
+- human2robot R2H 2s forward 数据使用 preset
+  `r2h_human2robot_2s61f30_forward`，默认开启 `--split-source explicit` 并指向
+  `training_data/pair/r2h/2s61f30_human2robot_r2h_forward_v1`。
+- 显式 split 下 `--train-size` 是全局训练样本数，按 train split 的 task
+  近似均匀分配；某个 task 容量不足时取满，剩余名额继续在其它 task 间均分。
 - pair 顺序来自各 task pair 目录下的 `pair_order.jsonl`。如果文件不存在，
   训练入口会按 `--data-seed` 从该 task 的 `manifest.jsonl` 生成一次；如果文件
   已存在，后续运行会复用该顺序并校验它与 manifest/cache 是否一致。
-- `--train-size` 是全局训练样本数；训练入口先按各 in-task task 在扣除 eval
-  尾部后的可用样本量做比例分配，再从每个 task 顺序表头部取对应数量。
-- `--in-task-eval-size` 为正数时表示全局 in-task eval 样本数，按 task 数据量
-  比例分配后从各 task 顺序表尾部取；`0/-1` 表示自动使用约 10% 的尾部样本，
-  并至少保留一个样本可用于训练。
-- `--ood-eval-size` 为正数时按 OOD task 数据量比例分配，并从各 OOD task
-  顺序表尾部取；`0/-1` 表示使用全部 OOD 样本。
+- runtime 模式下 `--train-size` 是全局训练样本数；训练入口先按各 in-task
+  task 在扣除 eval 尾部后的可用样本量做比例分配，再从每个 task 顺序表头部取
+  对应数量。
+- runtime 模式下 `--in-task-eval-size` 为正数时表示全局 in-task eval 样本数，
+  按 task 数据量比例分配后从各 task 顺序表尾部取；`0/-1` 表示自动使用约 10%
+  的尾部样本，并至少保留一个样本可用于训练。
+- runtime 模式下 `--ood-eval-size` 为正数时按 OOD task 数据量比例分配，并从
+  各 OOD task 顺序表尾部取；`0/-1` 表示使用全部 OOD 样本。
 - eval video 子采样不再随 step 改变，同一个 run 的不同 eval step 使用同一批
   eval video 样本，便于肉眼和指标对比。
 - 训练启动日志会打印每个 split 下各 task 的实际样本数，并在
   `data_split/config.json` 记录 `split_counts` 和 `pair_order_paths`。
+
+### human2robot R2H 2s forward 微调实验结果
+
+以下结果使用 `2s61f30_human2robot_r2h_forward_v1` 显式 split，离线测试口径固定为
+`test_id=100` 与 `test_ood=100`，采样方式为 `task_balanced`、`seed=42`。表中
+`in-task` 对应 `test_id`，`OOD` 对应 `test_ood`；FID/FVD 越低越好。
+
+| LoRA rank | train clips | train steps | run | in-task FID | in-task FVD | OOD FID | OOD FVD |
+|-----------|-------------|-------------|-----|-------------|-------------|---------|---------|
+| 256 | 200 | 2000 | `0621_003335` | 36.06 | 25.19 | 65.93 | 37.02 |
+| 256 | 400 | 2000 | `0621_003334` | 37.41 | 25.56 | 60.80 | 35.27 |
+| 256 | 800 | 1000 | `0621_212354` | 49.40 | 32.32 | 75.93 | 39.01 |
+| 256 | 800 | 2000 | `0621_003335` | 37.05 | 24.21 | 63.40 | 33.37 |
+| 256 | 800 | 2000 | `0621_212354` | 39.75 | 28.20 | 61.25 | 34.88 |
+| 256 | 800 | 4000 | `0621_212354` | 34.60 | 22.36 | 59.20 | 34.47 |
+| 512 | 200 | 2000 | `0621_132214` | 34.46 | 24.91 | 65.82 | 33.58 |
+| 512 | 400 | 2000 | `0621_132214` | 36.53 | 25.86 | 62.86 | 34.76 |
+| 512 | 800 | 2000 | `0621_132214` | 38.50 | 25.96 | 64.89 | 35.23 |
+| 512 | 800 | 4000 | `0622_090233` | 127.83 | 62.92 | 182.76 | 73.44 |
+| 512 | 800 | 4000 | `0622_090759` | 30.94 | 23.03 | 63.10 | 32.89 |
+| 512 | 800 | 8000 | `0622_090233` | 29.01 | 20.59 | 59.07 | 32.59 |
+
+当前已完成离线测试的最佳指标来自 `rank=512`、`train clips=800`、
+`train steps=8000`：in-task `FID/FVD=29.01/20.59`，OOD
+`FID/FVD=59.07/32.59`，平均 `FID/FVD=44.04/26.59`。作为成本更低的
+baseline，`rank=256`、`train clips=800`、`train steps=4000` 的 OOD FID
+几乎相同，为 `59.20`，平均 `FID/FVD=46.90/28.41`。
+
+本轮 ablation 的主要结论：
+
+- 单纯把 LoRA rank 从 256 提到 512 没有稳定收益；`rank=512, train clips=800,
+  steps=4000` 出现过一次明显坏点 `0622_090233`，同配置复跑 `0622_090759`
+  才恢复到正常水平。
+- `train clips=200 -> 400 -> 800` 在 2000 steps 下收益较小，OOD 指标波动
+  大于清晰的单调改善。
+- 增加训练 steps 是目前最稳定的收益来源：`rank=256, train clips=800` 从
+  1000 到 4000 steps 明显改善；`rank=512, train clips=800, 8000 steps`
+  是当前已完成离线测试中的最好结果。
+- `rank=256, train clips=2000, steps=4000` 训练已完成，但离线测试尚未产出
+  `summary.csv`，因此不纳入上表。
 
 ## 生成 Cache
 
@@ -1580,8 +1633,10 @@ scripts/train_lora_grid.py \
 | `--train-lora` | 可训练 LoRA checkpoint；不显式传 `--ranks` / `--layouts` 时会让训练入口自动检测 rank 与 target modules |
 | `--task-name` / `--data-type` / `--duration` | 数据 preset 与可选覆盖；默认 task 分配来自 `train_config.py` |
 | `--pair-root` | pair 数据根目录，默认 `MAIN_ROOT/training_data/pair`；其中每个 task 目录保存 `pair_order.jsonl` |
-| `--train-size` | 固定搜索用训练数据量；按各 train task 可用样本量比例分配，`0/-1` 使用扣除 eval 尾部后的全部训练样本 |
-| `--in-task-eval-size` | in-task eval 总样本数；正数按 task 比例分配并从顺序表尾部取，`0/-1` 自动使用约 10% 尾部样本 |
+| `--split-source` | `runtime` 使用 per-task `pair_order.jsonl`；`explicit` 使用根目录 `train/eval/test.jsonl` |
+| `--split-root` | 显式 split 根目录；默认 `<pair-root>/<data-type>/<duration>` |
+| `--train-size` | 固定搜索用训练数据量；runtime 模式按容量比例分配，explicit 模式按 task 近似均匀分配，`0/-1` 使用全部可训练样本 |
+| `--in-task-eval-size` | in-task eval 总样本数；runtime 模式从顺序表尾部取，explicit 模式从 `eval.jsonl` 的 `eval_role=in_task` 取 |
 | `--layouts` | layout 短名列表，支持 `self_qkv`、`self_qkvo`、`cross_qkv`、`cross_qkvo`、`self_qkv_cross_qkv`、`self_qkvo_cross_qkvo`、`ffn`、`self_qkv_ffn`、`self_qkvo_ffn`、`self_qkv_cross_qkv_ffn`、`self_qkvo_cross_qkvo_ffn` |
 | `--ranks` | 逗号分隔的 LoRA rank 列表 |
 | `--cuda` | 逗号分隔 CUDA id；展开后的实验按顺序轮转分配，并逐个等待完成 |

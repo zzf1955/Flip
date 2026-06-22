@@ -1,5 +1,24 @@
 # 注意事项
 
+## 2026-06-22 — 评估/Review MP4 不要直接交付 OpenCV mp4v
+
+OpenCV `VideoWriter` 默认常写出 `mpeg4 Simple Profile (mp4v)` MP4；虽然 OpenCV 自己能读，
+但浏览器、系统播放器或部分标注/ review 工具可能报解码错误。生成对比视频、contact sheet
+视频、评估 reel 等人工检查产物时，OpenCV 只用于读帧和拼帧，最终交付文件应再用 `ffmpeg`
+或 `imageio_ffmpeg` 的 ffmpeg 二进制转为：
+
+```bash
+ffmpeg -i input.mp4 -map 0:v:0 -an \
+  -c:v libx264 -pix_fmt yuv420p -movflags +faststart \
+  -crf 18 -preset veryfast output.mp4
+```
+
+交付前至少用以下命令做完整解码检查，而不是只看文件存在或 OpenCV 能读第一帧：
+
+```bash
+ffmpeg -v error -i output.mp4 -f null -
+```
+
 ## 2026-06-13 — H2R Seedance 直接 robot2human 暂不可作为训练数据来源
 
 `src.pipeline.h2r_seedance_edit` 已跑通 H2R 三段 robot-camera smoke、Seedance API 调用和

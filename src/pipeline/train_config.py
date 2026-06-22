@@ -35,6 +35,8 @@ class TrainTaskConfig:
     pair_root: str = ""
     t5_cache_dir: str = ""
     output_dir: str = ""
+    split_source: str = "runtime"
+    split_root: str = ""
     description: str = ""
 
 
@@ -107,6 +109,22 @@ TRAIN_TASKS: dict[str, TrainTaskConfig] = {
         "identity_r2r",
         duration="2s61f30_slide",
         description="G1 2s robot-to-robot identity cache matching the slide layout.",
+    ),
+    "r2h_human2robot_2s61f30_forward": TrainTaskConfig(
+        task_name="r2h_human2robot_2s61f30_forward",
+        data_type="r2h",
+        duration="2s61f30_human2robot_r2h_forward_v1",
+        train_tasks="",
+        ood_tasks="",
+        cache_root=_main("training_data", "cache", "vae"),
+        pair_root=_main("training_data", "pair"),
+        t5_cache_dir=_task_t5_cache("r2h", "2s61f30_human2robot_r2h_forward_v1"),
+        output_dir=os.path.join(TRAINING_DATA_ROOT, "log"),
+        split_source="explicit",
+        split_root=_main(
+            "training_data", "pair", "r2h", "2s61f30_human2robot_r2h_forward_v1",
+        ),
+        description="Robot-to-human human2robot 2s forward-window cache with explicit train/eval/test split.",
     ),
     # Compatibility aliases for existing commands; they now map to semantic data types.
     "pair_1s": _preset(
@@ -181,4 +199,6 @@ def apply_train_task_config(args) -> None:
     _apply_default(args, "pair_root", cfg.pair_root)
     _apply_default(args, "t5_cache_dir", cfg.t5_cache_dir)
     _apply_default(args, "output_dir", cfg.output_dir)
+    _apply_default(args, "split_source", cfg.split_source)
+    _apply_default(args, "split_root", cfg.split_root)
     args.task_description = cfg.description

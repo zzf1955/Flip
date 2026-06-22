@@ -30,6 +30,7 @@ MODULE_HELPS = [
     # Current/recent pair and synthetic-data construction
     "src.pipeline.seedance_clip",
     "src.pipeline.seedance_batch",
+    "src.pipeline.seedance_raw_batch",
     "src.pipeline.seedance_advance",
     "src.pipeline.seedance_gen",
     "src.pipeline.h2r_seedance_edit",

@@ -5,7 +5,7 @@
 ```
 src/
 ├── core/          12 个基础库模块（不可直接运行）
-├── pipeline/     27 个当前可执行 pipeline 入口
+├── pipeline/     28 个当前可执行 pipeline 入口
 │   └── archive/  23 个归档 pipeline 入口
 └── tools/        22 个实验/调试/可视化工具
 ```
@@ -99,6 +99,7 @@ eval_metrics.py    ← torch, skimage, transformers (CLIP)
 | `segment_episodes.py` | 原始 episode 切分为 4s segment | LeRobot 数据集 | `training_data/segment/` |
 | `seedance_gen.py` | Volcengine Seedance 2.0 API 生成人体视频；请求超时可用 `ARK_REQUEST_TIMEOUT` 配置，默认 120s | robot 视频 | `training_data/seedance_direct/4s/` |
 | `seedance_batch.py` | seedance_gen 的批量包装 | 多个 robot 视频 | 同上 |
+| `seedance_raw_batch.py` | WBT Seedance 扩展 CSV 专用 raw-only batch；只处理 `needs_seedance_api=true` 行，临时抽取或放大 4s API 输入，最终只保留 Seedance API 原始 mp4，不写默认 batch log 或 `.raw.mp4` side file | `tmp/...seedance_raw_new_generation.csv` + `training_data/segment/` 或 WBT raw episode mp4 | `training_data/seedance_raw/4s/<task>/<episode>/<clip>_human.mp4` |
 | `seedance_advance.py` | overlay 视频经 Seedance 增强；`--output-root` 可切到 `training_data/seedance_overlay/4s/` 做 prompt/输入源对比 | `training_data/overlay/4s/` | 默认 `training_data/seedance_advance/4s/` |
 | `h2r_seedance_edit.py` | human2robot HDF5 robot-camera → Seedance 人手编辑 smoke；已验证直接 robot2human 效果不好，仅保留为 API/尺寸/prompt 调试入口，不进入正式训练数据主线 | `data/h2r/v1/data/<task>/episode_*.hdf5` | `tmp/h2r_seedance_edit_*` |
 | `h2r_seedance_sam3_edit.py` | human2robot HDF5 robot-camera + SAM3 mask → marker 引导的 Seedance 人手编辑 smoke；支持 `full` 全臂 mask、`dark` 暗色夹爪过滤和实验性 `distal_dark` 远端暗色连通域过滤，支持红/紫/青/黄/绿/肤色 marker 与 fill/outline/bbox/fill_bbox/dual_bbox 标注；当前推荐仍是 `dark + yellow/magenta bbox`，`fill_bbox` 和 `dual_bbox` 已作为负例/探索项记录，仅作为显式 mask prompt 调试，不自动进入训练数据主线 | `data/h2r/v1/data/<task>/episode_*.hdf5` + `tmp/.../sam3_mask/<task>/episode_*.npz` 或同格式 mask root | `tmp/h2r_seedance_sam3_*` |

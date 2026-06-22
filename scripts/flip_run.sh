@@ -28,6 +28,8 @@ Subcommands:
   r2h_synthesize   Run python -m src.pipeline.r2h_synthesize.
   syn_error_analysis
                    Run scripts/run_syn_error_analysis.py.
+  unitree_wbt_download
+                   Run scripts/download_unitree_wbt.py.
   h2r_diffusion_policy
                    Run python -m src.pipeline.h2r_diffusion_policy.
   train            Run python -m torch.distributed.run -m src.pipeline.train.
@@ -47,6 +49,7 @@ Examples:
   scripts/flip_run.sh h2r_sam3_blur_pair -- --tasks grab_cup_v1 --dry-run
   scripts/flip_run.sh r2h_synthesize --cuda 0 -- --source-task Inspire_Collect_Clothes_MainCamOnly --duration 1s --run RUN --checkpoint latest --num-samples 1000 --resume-existing
   scripts/flip_run.sh syn_error_analysis --cuda 0 -- --run RUN --checkpoint latest
+  scripts/flip_run.sh unitree_wbt_download -- --background --workers 8
   scripts/flip_run.sh h2r_diffusion_policy --cuda 2 -- train --device cuda:0 --steps 1000
   scripts/flip_run.sh train --cuda 2,3 --nproc 2 -- --task-name pair_1s --max-steps 1000
   scripts/flip_run.sh eval_mitty --cuda 2 -- --device cuda:0 --eval-tail-percent 10
@@ -83,7 +86,7 @@ case "$subcommand" in
   nvidia-smi)
     exec nvidia-smi "$@"
     ;;
-  mitty_cache|sam2_precompute|h2r_sam3_precompute|h2r_seedance_sam3_eval|g1_sam3_precompute|h2r_sam3_blur_pair|r2h_synthesize|syn_error_analysis|h2r_diffusion_policy|train|eval_mitty)
+  mitty_cache|sam2_precompute|h2r_sam3_precompute|h2r_seedance_sam3_eval|g1_sam3_precompute|h2r_sam3_blur_pair|r2h_synthesize|syn_error_analysis|unitree_wbt_download|h2r_diffusion_policy|train|eval_mitty)
     ;;
   *)
     usage >&2
@@ -161,6 +164,9 @@ case "$subcommand" in
     ;;
   syn_error_analysis)
     exec "$PYTHON_BIN" scripts/run_syn_error_analysis.py "${script_args[@]}"
+    ;;
+  unitree_wbt_download)
+    exec "$PYTHON_BIN" scripts/download_unitree_wbt.py "${script_args[@]}"
     ;;
   h2r_diffusion_policy)
     exec "$PYTHON_BIN" -m src.pipeline.h2r_diffusion_policy "${script_args[@]}"

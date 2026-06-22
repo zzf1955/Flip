@@ -4,6 +4,7 @@
 
 - 默认用中文回答。
 - 除非用户明确要求，不要直接查看视频和图片；简单视觉任务优先用 Python/OpenCV 等代码处理。
+- 生成、拼接、转码评估或 review MP4 时，不要直接交付 OpenCV `mp4v` 输出；它常导致播放器/浏览器解码失败。OpenCV 可用于读帧和拼帧，最终视频必须用 `ffmpeg` 或 `imageio_ffmpeg` 转为 `libx264` + `yuv420p` + `+faststart`，并用 `ffmpeg -v error -i <video> -f null -` 做解码校验。
 - 修改代码时应更新对应模块文档；涉及架构、数据流、环境、配置或注意事项时，同步更新 `doc/` 下相关文档。
 - 代码中禁止用宽泛的 `try/except` 吞掉异常或 fallback 到旧行为；预期外行为应直接暴露并失败。
 - 修改应彻底升级到新行为，不做错误 fallback，也不为了兼容旧逻辑保留隐式分支。

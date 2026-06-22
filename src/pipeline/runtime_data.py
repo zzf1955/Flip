@@ -1,11 +1,10 @@
 """Runtime data selection for FLIP training.
 
-The on-disk data layout is split-free:
-  training_data/cache/vae/<data_type>/<duration>/<robot_task>/manifest.jsonl
+Two split sources are supported:
+  - runtime: split-free per-task manifests plus deterministic pair_order tails.
+  - explicit: root-level train/eval/test JSONL files, used by human2robot.
 
-In-task/OOD splits are experiment-time choices. This module builds deterministic
-train/eval/video pools from per-task manifests and writes the exact selection
-into each run directory.
+This module writes the exact train/eval/test selection into each run directory.
 """
 
 from __future__ import annotations
@@ -14,7 +13,7 @@ import json
 import os
 import random
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
@@ -34,6 +33,10 @@ class RuntimeSplit:
     ood_records: list[dict]
     split_counts: dict[str, dict[str, int]]
     order_paths: dict[str, str]
+    test_files: list[str] = field(default_factory=list)
+    test_records: list[dict] = field(default_factory=list)
+    split_source: str = "runtime"
+    split_root: str = ""
 
 
 def short_task_name(task: str) -> str:
@@ -311,11 +314,305 @@ def _allocate_counts(capacity_by_task: dict[str, int], size: int, label: str) ->
     return counts
 
 
+def _allocate_counts_balanced(
+    capacity_by_task: dict[str, int],
+    size: int,
+    label: str,
+    seed_key: str,
+) -> dict[str, int]:
+    total = sum(capacity_by_task.values())
+    if size < 0 or size == 0:
+        return dict(capacity_by_task)
+    if size > total:
+        raise ValueError(
+            f"Requested {label} size {size}, but only {total} samples are available"
+        )
+    if total == 0:
+        raise ValueError(f"No samples are available for {label}")
+
+    counts = {task: 0 for task in capacity_by_task}
+    tasks = sorted(capacity_by_task)
+    random.Random(seed_key).shuffle(tasks)
+    remaining = size
+    while remaining:
+        progressed = False
+        for task in tasks:
+            if remaining == 0:
+                break
+            if counts[task] >= capacity_by_task[task]:
+                continue
+            counts[task] += 1
+            remaining -= 1
+            progressed = True
+        if not progressed:
+            raise RuntimeError(f"Unable to allocate {remaining} {label} samples")
+    return counts
+
+
 def _task_counts(records: list[dict]) -> dict[str, int]:
     return dict(sorted(Counter(record["robot_task"] for record in records).items()))
 
 
+def _split_row_task(row: dict, split_path: Path) -> str:
+    raw_task = row.get("robot_task", row.get("task", ""))
+    task = short_task_name(str(raw_task))
+    if not task:
+        raise ValueError(f"Explicit split row missing robot_task/task in {split_path}")
+    return task
+
+
+def _split_row_pair_id(row: dict, split_path: Path) -> str:
+    pair_id = str(row.get("pair_id", "")).strip()
+    if pair_id:
+        return pair_id
+    raw_path = row.get("video") or row.get("cache_path")
+    if not raw_path:
+        raise ValueError(f"Explicit split row missing pair_id/video in {split_path}")
+    return _pair_id_from_path(str(raw_path))
+
+
+def _validate_split_row(
+    row: dict,
+    split_path: Path,
+    expected_split: str,
+    data_type: str,
+    duration: str,
+) -> tuple[str, str]:
+    record_split = row.get("split", expected_split)
+    if record_split != expected_split:
+        raise ValueError(
+            f"Explicit split mismatch in {split_path}: {record_split} != {expected_split}"
+        )
+    record_data_type = row.get("data_type", data_type)
+    record_duration = row.get("duration", duration)
+    if record_data_type != data_type:
+        raise ValueError(
+            f"Explicit split data_type mismatch in {split_path}: "
+            f"{record_data_type} != {data_type}"
+        )
+    if record_duration != duration:
+        raise ValueError(
+            f"Explicit split duration mismatch in {split_path}: "
+            f"{record_duration} != {duration}"
+        )
+    return _split_row_task(row, split_path), _split_row_pair_id(row, split_path)
+
+
+def _resolve_split_root(args, pair_root_path: Path, data_type: str, duration: str) -> Path:
+    raw_root = getattr(args, "split_root", "")
+    if raw_root:
+        return Path(raw_root)
+    return pair_root_path / data_type / duration
+
+
+def _load_explicit_split_rows(
+    split_root: Path,
+    split_name: str,
+    data_type: str,
+    duration: str,
+) -> list[dict]:
+    split_path = split_root / f"{split_name}.jsonl"
+    rows = _read_jsonl(split_path)
+    seen: set[tuple[str, str]] = set()
+    out = []
+    for row in rows:
+        record = dict(row)
+        task, pair_id = _validate_split_row(
+            record, split_path, split_name, data_type, duration,
+        )
+        key = (task, pair_id)
+        if key in seen:
+            raise ValueError(
+                f"Duplicate explicit split pair in {split_path}: {task}/{pair_id}"
+            )
+        seen.add(key)
+        record["data_type"] = data_type
+        record["duration"] = duration
+        record["robot_task"] = task
+        record["pair_id"] = pair_id
+        record["split"] = split_name
+        record.setdefault("source_segment_id", record.get("source_id", pair_id))
+        out.append(record)
+    return out
+
+
+def _load_cache_records_for_split(
+    cache_task_root: Path,
+    data_type: str,
+    duration: str,
+    tasks: Iterable[str],
+) -> dict[tuple[str, str], dict]:
+    cache_by_key: dict[tuple[str, str], dict] = {}
+    for task in sorted(set(tasks)):
+        task_records = _load_cache_task_records(cache_task_root, data_type, duration, task)
+        for record in task_records:
+            key = (task, record["pair_id"])
+            if key in cache_by_key:
+                raise ValueError(f"Duplicate cache pair for explicit split: {task}/{record['pair_id']}")
+            cache_by_key[key] = record
+    return cache_by_key
+
+
+def _attach_cache_records(
+    rows: list[dict],
+    cache_by_key: dict[tuple[str, str], dict],
+    split_name: str,
+    split_root: Path,
+) -> list[dict]:
+    records = []
+    for row in rows:
+        key = (row["robot_task"], row["pair_id"])
+        if key not in cache_by_key:
+            raise FileNotFoundError(
+                f"Explicit {split_name} split references uncached pair "
+                f"{row['robot_task']}/{row['pair_id']} under {split_root}"
+            )
+        cache_record = cache_by_key[key]
+        cache_split = cache_record.get("split")
+        if cache_split and cache_split != split_name:
+            raise ValueError(
+                f"Cache split mismatch for {row['robot_task']}/{row['pair_id']}: "
+                f"{cache_split} != {split_name}"
+            )
+        record = dict(cache_record)
+        for field_name, value in row.items():
+            if field_name != "cache_path":
+                record[field_name] = value
+        record["cache_path"] = cache_record["cache_path"]
+        records.append(record)
+    return records
+
+
+def _records_by_task(records: list[dict]) -> dict[str, list[dict]]:
+    out: dict[str, list[dict]] = {}
+    for record in records:
+        out.setdefault(record["robot_task"], []).append(record)
+    return dict(sorted(out.items()))
+
+
+def _select_balanced_records(
+    records: list[dict],
+    size: int,
+    label: str,
+    seed_key: str,
+) -> list[dict]:
+    records_by_task = _records_by_task(records)
+    capacities = {task: len(task_records) for task, task_records in records_by_task.items()}
+    counts = _allocate_counts_balanced(capacities, size, label, seed_key)
+    selected = []
+    for task, task_records in records_by_task.items():
+        count = counts[task]
+        if not count:
+            continue
+        shuffled = list(task_records)
+        random.Random(f"{seed_key}:{task}").shuffle(shuffled)
+        selected.extend(shuffled[:count])
+    return selected
+
+
+def build_explicit_runtime_split(args) -> RuntimeSplit:
+    data_type = args.data_type
+    duration = args.duration
+    if data_type not in DATA_TYPES:
+        raise ValueError(f"Unknown data type '{data_type}'. Available: {sorted(DATA_TYPES)}")
+
+    cache_root = getattr(args, "cache_root", "") or str(
+        Path(MAIN_ROOT) / "training_data" / "cache" / "vae"
+    )
+    pair_root = getattr(args, "pair_root", "") or str(
+        Path(MAIN_ROOT) / "training_data" / "pair"
+    )
+    cache_task_root = Path(cache_root) / data_type / duration
+    pair_root_path = Path(pair_root)
+    split_root = _resolve_split_root(args, pair_root_path, data_type, duration)
+
+    train_rows = _load_explicit_split_rows(split_root, "train", data_type, duration)
+    eval_rows = _load_explicit_split_rows(split_root, "eval", data_type, duration)
+    test_rows = _load_explicit_split_rows(split_root, "test", data_type, duration)
+
+    all_rows = [*train_rows, *eval_rows, *test_rows]
+    row_keys = [(row["robot_task"], row["pair_id"]) for row in all_rows]
+    duplicate_keys = [
+        key for key, count in Counter(row_keys).items()
+        if count > 1
+    ]
+    if duplicate_keys:
+        first = duplicate_keys[0]
+        raise ValueError(
+            f"Explicit train/eval/test splits overlap at {first[0]}/{first[1]}"
+        )
+
+    tasks = [row["robot_task"] for row in all_rows]
+    cache_by_key = _load_cache_records_for_split(
+        cache_task_root, data_type, duration, tasks,
+    )
+    train_pool = _attach_cache_records(train_rows, cache_by_key, "train", split_root)
+    eval_pool = _attach_cache_records(eval_rows, cache_by_key, "eval", split_root)
+    test_records = _attach_cache_records(test_rows, cache_by_key, "test", split_root)
+
+    train_records = _select_balanced_records(
+        train_pool,
+        args.train_size,
+        "explicit train",
+        f"{args.data_seed}:explicit_train:{data_type}:{duration}",
+    )
+
+    eval_records = []
+    ood_records = []
+    for record in eval_pool:
+        eval_role = str(record.get("eval_role", "")).strip()
+        domain = str(record.get("domain", "")).strip()
+        if eval_role == "ood" or domain == "ood":
+            ood_records.append(record)
+        elif eval_role == "in_task" or domain == "id":
+            eval_records.append(record)
+        else:
+            raise ValueError(
+                f"Explicit eval row must set eval_role=in_task/ood or domain=id/ood: "
+                f"{record['robot_task']}/{record['pair_id']}"
+            )
+
+    eval_records = _select_balanced_records(
+        eval_records,
+        args.in_task_eval_size,
+        "explicit in-task eval",
+        f"{args.data_seed}:explicit_eval_in_task:{data_type}:{duration}",
+    )
+    ood_records = _select_balanced_records(
+        ood_records,
+        args.ood_eval_size,
+        "explicit OOD eval",
+        f"{args.data_seed}:explicit_eval_ood:{data_type}:{duration}",
+    )
+
+    return RuntimeSplit(
+        train_files=[record["cache_path"] for record in train_records],
+        eval_files=[record["cache_path"] for record in eval_records],
+        ood_files=[record["cache_path"] for record in ood_records],
+        train_records=train_records,
+        eval_records=eval_records,
+        ood_records=ood_records,
+        test_files=[record["cache_path"] for record in test_records],
+        test_records=test_records,
+        split_counts={
+            "train": _task_counts(train_records),
+            "in_task_eval": _task_counts(eval_records),
+            "ood_eval": _task_counts(ood_records),
+            "test": _task_counts(test_records),
+        },
+        order_paths={},
+        split_source="explicit",
+        split_root=str(split_root),
+    )
+
+
 def build_runtime_split(args) -> RuntimeSplit:
+    split_source = getattr(args, "split_source", "") or "runtime"
+    if split_source == "explicit":
+        return build_explicit_runtime_split(args)
+    if split_source != "runtime":
+        raise ValueError(f"Unknown split source '{split_source}'")
+
     data_type = args.data_type
     duration = args.duration
     if data_type not in DATA_TYPES:
@@ -602,6 +899,8 @@ def write_runtime_split(run_dir: Path, args, split: RuntimeSplit) -> None:
         "in_task_eval.jsonl": split.eval_records,
         "ood_eval.jsonl": split.ood_records,
     }
+    if split.test_records:
+        payloads["test.jsonl"] = split.test_records
     for name, records in payloads.items():
         with (out_dir / name).open("w") as fh:
             for record in records:
@@ -609,8 +908,16 @@ def write_runtime_split(run_dir: Path, args, split: RuntimeSplit) -> None:
     config = {
         "data_type": args.data_type,
         "duration": args.duration,
-        "train_tasks": parse_task_list(args.train_tasks),
-        "ood_tasks": parse_task_list(args.ood_tasks, allow_empty=True),
+        "train_tasks": (
+            sorted(split.split_counts.get("train", {}))
+            if split.split_source == "explicit"
+            else parse_task_list(args.train_tasks)
+        ),
+        "ood_tasks": (
+            sorted(split.split_counts.get("ood_eval", {}))
+            if split.split_source == "explicit"
+            else parse_task_list(args.ood_tasks, allow_empty=True)
+        ),
         "train_size": args.train_size,
         "in_task_eval_size": args.in_task_eval_size,
         "in_task_video_size": args.in_task_video_size,
@@ -618,6 +925,8 @@ def write_runtime_split(run_dir: Path, args, split: RuntimeSplit) -> None:
         "ood_video_size": args.ood_video_size,
         "data_seed": args.data_seed,
         "pair_root": getattr(args, "pair_root", ""),
+        "split_source": split.split_source,
+        "split_root": split.split_root,
         "split_counts": split.split_counts,
         "pair_order_paths": split.order_paths,
     }

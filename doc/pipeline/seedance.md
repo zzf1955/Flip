@@ -115,6 +115,57 @@ python -m src.pipeline.seedance_gen \
 
 详见 `src/pipeline/seedance_gen.py`。
 
+### G1 WBT 4s raw-only batch
+
+`src.pipeline.seedance_raw_batch` 是 WBT Seedance 扩展列表的专用入口。它只读取
+CSV 中 `needs_seedance_api=true` 的行，并强制把最终输出写入：
+
+```text
+training_data/seedance_raw/4s/<task>/<episode>/<clip>_human.mp4
+```
+
+该目录沿用 `seedance_direct/4s` 的 task / episode / clip 布局，但内容含义不同：
+
+- `seedance_raw/4s`：Seedance API 返回的原始 mp4，不 resize，不重采样，不再额外写
+  `<output>.raw.mp4`。
+- `seedance_direct/4s`：历史直接训练目录，当前 `seedance_batch.py` 会把 API 输出后处理到
+  `640x480` 并写 `batch_log.json`。
+
+因此 WBT 扩展列表需要保留 API 原始输出时，应使用 `seedance_raw_batch.py`，不要用
+`seedance_batch.py`。
+
+CSV 约定：
+
+- `planned_seedance_output` 必须位于 `training_data/seedance_raw/4s/` 下，否则入口直接失败。
+- `needs_clip_extract=false`：直接读取 `input_video` 指向的 4s segment；若像素数不足
+  Seedance 最小要求，只在临时目录转成 `800x600` API 输入。
+- `needs_clip_extract=true`：从 `input_video` 按 `clip_start_sec` 到 `clip_end_sec`
+  精确抽取 4s 窗口，临时转成 `800x600` API 输入。正式 WBT raw 列表应按 episode 内
+  `0s, 4s, 8s, ...` 顺序扩展，而不是随机或居中截取。
+- 准备好的 API 输入只存在于临时目录；默认也不写 batch log。需要审计记录时显式传
+  `--log <path>`。
+
+dry-run 检查前三条：
+
+```bash
+python -m src.pipeline.seedance_raw_batch \
+  --list tmp/seedance_wbt_inventory_20260619/inspire_seedance_4s_target8_sequential_4s_seedance_raw_new_generation.csv \
+  --resume \
+  --limit 3 \
+  --dry-run
+```
+
+实际 smoke / full run 去掉 `--dry-run`，保留 `--resume`。例如先跑前三条：
+
+```bash
+ARK_API_KEY="ark-xxx" python -m src.pipeline.seedance_raw_batch \
+  --list tmp/seedance_wbt_inventory_20260619/inspire_seedance_4s_target8_sequential_4s_seedance_raw_new_generation.csv \
+  --resume \
+  --limit 3 \
+  --workers 3 \
+  --fast
+```
+
 ### H2R 机械臂 → 人手 smoke
 
 `src.pipeline.h2r_seedance_edit` 是 H2R HDF5 专用 smoke 入口，不复用

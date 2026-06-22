@@ -273,10 +273,16 @@ def train(args, spec: MethodSpec):
     info(f"Run: {run_dir}")
     info(f"Args: {vars(args)}")
     info(f"DDP: rank={rank}, world_size={world_size}, device={args.device}")
-    info(f"Data: train={len(train_files)} eval={len(eval_files)} ood={len(ood_files)}")
+    test_files = runtime_split.test_files
+    if test_files:
+        info(f"Data: train={len(train_files)} eval={len(eval_files)} "
+             f"ood={len(ood_files)} test={len(test_files)}")
+    else:
+        info(f"Data: train={len(train_files)} eval={len(eval_files)} ood={len(ood_files)}")
     info(f"Data config: type={args.data_type} duration={args.duration} "
          f"train_tasks={args.train_tasks} ood_tasks={args.ood_tasks} "
-         f"data_seed={args.data_seed}")
+         f"split_source={args.split_source or 'runtime'} "
+         f"split_root={args.split_root or '<default>'} data_seed={args.data_seed}")
     for split_name, counts in runtime_split.split_counts.items():
         if counts:
             summary = ", ".join(f"{task}={count}" for task, count in counts.items())
@@ -623,6 +629,14 @@ def main():
                     help="OOD eval videos per trigger (0/-1=all)")
     ap.add_argument("--data-seed", type=int, default=42,
                     help="seed for runtime train/eval/video data sampling")
+    ap.add_argument("--split-source", default="",
+                    choices=["", "runtime", "explicit"],
+                    help="runtime uses per-task pair_order tails; explicit reads "
+                         "train/eval/test jsonl from --split-root or "
+                         "<pair-root>/<data-type>/<duration>")
+    ap.add_argument("--split-root", default="",
+                    help="directory containing explicit train.jsonl, eval.jsonl, "
+                         "and test.jsonl; default is <pair-root>/<data-type>/<duration>")
 
     # Model paths
     ap.add_argument("--dit-dir", default=DEFAULT_DIT_DIR)
